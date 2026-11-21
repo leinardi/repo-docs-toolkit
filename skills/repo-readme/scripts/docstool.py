@@ -49,10 +49,12 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
 import tempfile
+import textwrap
 import unicodedata
 from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable
@@ -1862,7 +1864,17 @@ def scan_couplings(corpus: Corpus, report: Report) -> list[dict[str, Any]]:
             seen.add(key)
             found.append(entry)
 
+    # a restructure's own artifacts (baselines, logs, receipts, the report) name every old path on
+    # purpose: they are records of the move, not references that must keep resolving
+    artifact_dirs = {
+        str(PurePosixPath(rel).parent)
+        for rel in repo.files
+        if PurePosixPath(rel).name == "plan.toml" and f"{PurePosixPath(rel).parent}/blocks.json" in repo.file_set
+    }
     for rel in repo.files:
+        if str(PurePosixPath(rel).parent) in artifact_dirs:
+            excluded += 1
+            continue
         text, status = repo.text(rel)
         if text is None:
             if status == "binary":
@@ -3212,11 +3224,11 @@ def readme_facts(doc: MarkdownDoc, text: str) -> dict[str, Any]:
     body = without_fences(text).split("\n")
     first_h2 = next((h.line for h in doc.headings if h.level == 2), len(body) + 1)
     tagline = None
-    for line in body[: first_h2 - 1]:
-        strong = re.search(r"<strong>(.+?)</strong>", line) or re.match(r"^[ \t]*(?:\*\*|__)(.+?)(?:\*\*|__)[ \t]*$", line)
-        if strong:
-            tagline = _strip_inline(strong.group(1))
-            break
+    header = "\n".join(body[: first_h2 - 1])
+    # a <strong> tagline may wrap over several lines in a repository with a line-length rule
+    strong = re.search(r"<strong>(.+?)</strong>", header, re.DOTALL) or re.search(r"(?m)^[ \t]*(?:\*\*|__)(.+?)(?:\*\*|__)[ \t]*$", header)
+    if strong:
+        tagline = _strip_inline(" ".join(strong.group(1).split()))
     features: list[str] = []
     install = None
     sections = [(h, i) for i, h in enumerate(doc.headings) if h.level == 2]
@@ -5815,6 +5827,29 @@ def _check_inbound(
         sections[source] = ({h.text.casefold() for h in inside}, {h.number for h in inside if h.number}, {h.gh_slug for h in inside})
     deleted = {str(e.get("path", "")) for e in context.plan.entries("delete")}
     own = context.plan.directory + "/"
+
+    def follows(entry: dict[str, Any]) -> bool:
+        """A relative path citation that still names its target after both files moved."""
+        source, detail = entry["source"], str(entry["detail"])
+        if entry["ref"] != "path" or source not in moved or entry["target"] not in moved or detail.startswith("/"):
+            return False
+        return normalize_path(str(PurePosixPath(moved[source]).parent), unquote(detail.split("#", 1)[0])) == moved[entry["target"]]
+
+    # a heading, section or anchor cited next to a path that follows its move is still right:
+    # moves keep every heading
+    followed = {(e["source"], e["line"], e["target"]) for e in couplings if follows(e)}
+    # ...unless an [[anchor]] entry renames the cited heading in that target
+    renamed = {
+        (path, str(a.get("from", "")).lower())
+        for a in context.plan.entries("anchor")
+        for path in (str(a.get("file", "")), moved.get(str(a.get("file", "")), ""))
+    }
+
+    def renamed_heading(entry: dict[str, Any]) -> bool:
+        detail = str(entry["detail"])
+        slug = detail.lstrip("#").lower() if entry["ref"] == "anchor" else github_slug_base(heading_plain_text(detail).rstrip(":. "))
+        return any((path, slug) in renamed for path in (entry["target"], moved.get(entry["target"], "")))
+
     for entry in couplings:
         target = entry["target"]
         if entry["source"].startswith(own):
@@ -5837,7 +5872,9 @@ def _check_inbound(
         if doc is not None and entry["ref"] in ("path", "anchor"):
             base = str(PurePosixPath(source).parent)
             linked = any(
-                link.line == line and normalize_path(base, unquote(link.target.split("#", 1)[0])) == target
+                # a link whose text wraps starts on an earlier line than its destination
+                (link.line == line or (link.line < line and f"]({link.target}" in doc.lines[line - 1]))
+                and normalize_path(base, unquote(link.target.split("#", 1)[0])) == target
                 for link in doc.links
                 if not SCHEME_RE.match(link.target)
             )
@@ -5852,7 +5889,15 @@ def _check_inbound(
                     f"add {source!r} = <its sha256> to [meta.sources] (gate G10), or a [[reference]] edit for that line",
                 )
                 continue
-        if (source, line) in references:
+        if (source, line) in references or follows(entry):
+            continue
+        if (
+            entry["ref"] != "path"
+            and target not in sections
+            and target not in deleted
+            and (source, line, target) in followed
+            and not renamed_heading(entry)
+        ):
             continue
         if target in stubs and entry["ref"] in ("path", "blob") and target not in deleted:
             continue
@@ -5876,6 +5921,8 @@ class VirtualTree:
         self.root = root
         self.changed: dict[str, bytes | None] = {}
         self.original: dict[str, bytes | None] = {}
+        # a moved file keeps its source's permission bits (an executable script stays executable)
+        self.mode_from: dict[str, str] = {}
 
     def read(self, rel: str) -> bytes | None:
         if rel in self.changed:
@@ -5888,9 +5935,15 @@ class VirtualTree:
             self.original[rel] = path.read_bytes() if path.is_file() and not path.is_symlink() else None
         return self.original[rel]
 
-    def write(self, rel: str, data: bytes | None) -> None:
+    def write(self, rel: str, data: bytes | None, mode_from: str | None = None) -> None:
         self._disk(rel)
         self.changed[rel] = data
+        if mode_from is not None:
+            self.mode_from[rel] = mode_from
+
+    def mode(self, rel: str) -> int | None:
+        path = self.root / rel
+        return stat.S_IMODE(path.stat().st_mode) if path.is_file() and not path.is_symlink() else None
 
     def text(self, rel: str) -> str:
         data = self.read(rel)
@@ -5901,7 +5954,11 @@ class VirtualTree:
         for rel in sorted(self.changed):
             pre, post = self.original.get(rel), self.changed[rel]
             if pre != post:
-                ops.append({"path": rel, "pre": _digest(pre), "post": _digest(post), "data": post, "old": pre})
+                pre_mode = self.mode(rel)
+                post_mode = None if post is None else (self.mode(self.mode_from[rel]) if rel in self.mode_from else pre_mode)
+                ops.append(
+                    {"path": rel, "pre": _digest(pre), "post": _digest(post), "data": post, "old": pre, "pre_mode": pre_mode, "mode": post_mode}
+                )
         return ops
 
 
@@ -5977,9 +6034,19 @@ def _rewrite_one(
     return prefix + rebuilt + ("#" + new_fragment if new_fragment else hash_mark)
 
 
-def _status_line(text: str, status: str) -> str:
+def _status_line(text: str, status: str, width: int = 100) -> str:
+    """The text with a status quote under its title, wrapped to the repository's line width."""
     lines = text.split("\n")
-    note = f"> **Status:** {status}"
+    # a wrapped line must not start like a list item, a heading or a quote: that would be structure
+    starts_block = re.compile(r"^(?:[-+*]\s|\d+[.)]\s|#|>|=+$|-+$)")
+    wrapped: list[str] = []
+    for target in range(max(width, 40) - 2, 20, -1):
+        wrapped = textwrap.wrap(f"**Status:** {status}", width=target, break_long_words=False, break_on_hyphens=False)
+        if not any(starts_block.match(part) for part in wrapped[1:]):
+            break
+    else:
+        wrapped = [f"**Status:** {status}"]
+    note = "\n".join(f"> {part}" for part in wrapped)
     for index, line in enumerate(lines):
         heading = ATX_RE.match(line)
         if heading and len(heading.group(1)) == 1:
@@ -6016,6 +6083,8 @@ def preflight(context: PlanContext) -> tuple[list[dict[str, Any]], list[tuple[st
     anchor_map: dict[tuple[str, str], tuple[str, str]] = {}
     redirects: list[tuple[str, str]] = []
     status_of: dict[str, str] = {}
+    # a status line wraps where the repository's Markdown lint does, else at its usual width
+    wrap_width = tooling_census(repo).get("markdown_wrap") or house_style(corpus)["wrap_p95"] or 100
     for kind in ("move", "archive"):
         for entry in plan.entries(kind):
             source, target = str(entry["from"]), str(entry["to"])
@@ -6039,6 +6108,13 @@ def preflight(context: PlanContext) -> tuple[list[dict[str, Any]], list[tuple[st
                 redirects.append((f"{site.docs_rel(source)}#{h.site_slug}", f"{site.docs_rel(target)}#{h.site_slug}"))
     for entry in plan.entries("anchor"):
         anchor_map[(str(entry["file"]), str(entry["from"]).lower())] = (path_map.get(str(entry["file"]), str(entry["file"])), str(entry["to"]))
+    # line edits first: their line numbers are the original file's, which a move, an archive's
+    # status line or a split would shift or take away
+    for entry in plan.entries("reference"):
+        rel = str(entry["file"])
+        lines = tree.text(rel).split("\n")
+        lines[int(entry["line"]) - 1] = lines[int(entry["line"]) - 1].replace(str(entry["old"]), str(entry["new"]), 1)
+        tree.write(rel, "\n".join(lines).encode())
     # structural edits, with every Markdown file's links re-pointed
     markdown = sorted(r for r in repo.files if r.endswith(MARKDOWN_EXTENSIONS))
     split_sources = {s[0]: s for s in splits}
@@ -6061,9 +6137,9 @@ def preflight(context: PlanContext) -> tuple[list[dict[str, Any]], list[tuple[st
             text = remaining
         rewritten = _rewrite_links(text, str(PurePosixPath(rel).parent), str(PurePosixPath(new_rel).parent), rel, new_rel, path_map, anchor_map)
         if rel in status_of:
-            rewritten = _status_line(rewritten, status_of[rel])
+            rewritten = _status_line(rewritten, status_of[rel], wrap_width)
         if new_rel != rel:
-            tree.write(new_rel, rewritten.encode())
+            tree.write(new_rel, rewritten.encode(), mode_from=rel)
             tree.write(rel, None)
         elif rewritten != text or rel in split_sources:
             tree.write(rel, rewritten.encode())
@@ -6073,11 +6149,6 @@ def preflight(context: PlanContext) -> tuple[list[dict[str, Any]], list[tuple[st
         tree.write(path, f"# {title}\n\nThis page moved to [{title}]({_relative(str(PurePosixPath(path).parent), target)}).\n".encode())
     for entry in plan.entries("delete"):
         tree.write(str(entry["path"]), None)
-    for entry in plan.entries("reference"):
-        rel = str(entry["file"])
-        lines = tree.text(rel).split("\n")
-        lines[int(entry["line"]) - 1] = lines[int(entry["line"]) - 1].replace(str(entry["old"]), str(entry["new"]), 1)
-        tree.write(rel, "\n".join(lines).encode())
     if redirects and site.config:
         tree.write(site.config, _append_redirects(tree.text(site.config), site, redirects).encode())
     return tree.operations(), redirects
@@ -6148,6 +6219,8 @@ def _restore(root: Path, art: Path, index: int, entry: dict[str, Any]) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.with_name(target.name + ".docstool-restore")
     shutil.copyfile(backup, temporary)
+    if entry.get("pre_mode") is not None:
+        os.chmod(temporary, entry["pre_mode"])
     os.replace(temporary, target)
 
 
@@ -6194,7 +6267,17 @@ def run_transaction(root: Path, art: Path, ops: list[dict[str, Any]], digest: st
         journal: dict[str, Any] = {
             "plan_sha256": digest,
             "new_dirs": _new_dirs(root, [op["path"] for op in ops if op["post"] is not None]),
-            "ops": [{"path": op["path"], "pre": op["pre"], "post": op["post"], "status": "planned"} for op in ops],
+            "ops": [
+                {
+                    "path": op["path"],
+                    "pre": op["pre"],
+                    "post": op["post"],
+                    "pre_mode": op.get("pre_mode"),
+                    "mode": op.get("mode"),
+                    "status": "planned",
+                }
+                for op in ops
+            ],
         }
         _write_journal(art, journal)
     except OSError as error:
@@ -6246,6 +6329,8 @@ def _apply_one(root: Path, art: Path, index: int, entry: dict[str, Any]) -> None
     else:
         target.parent.mkdir(parents=True, exist_ok=True)
         os.replace(art / STAGING_NAME / str(index), target)
+        if entry.get("mode") is not None:
+            os.chmod(target, entry["mode"])
     _crash_point("after-change", index)
 
 
@@ -6547,6 +6632,8 @@ def _verify(context: PlanContext, args: argparse.Namespace) -> list[str]:
         occurrences[digest].append(index)
     receipts = {r["id"]: r for r in (_read_json(context.repo.root / context.plan.artifact(RECEIPTS_NAME)) or {}).get("receipts", [])}
     excused: Counter[str] = Counter()
+    # a block a reviewed rewritten mapping sends to another page sits where the owner agreed
+    relocated: dict[str, str] = {}
     for entry in _load_mappings(context):
         receipt = receipts.get(entry.get("id"))
         if receipt is None:
@@ -6582,13 +6669,22 @@ def _verify(context: PlanContext, args: argparse.Namespace) -> list[str]:
             )
             continue
         excused.update(entry.get("blocks", []))
+        if entry["kind"] == "rewritten":
+            for digest in entry.get("blocks", []):
+                relocated[digest] = str(entry.get("to", ""))
+    expected = _reference_digests(context.plan, baseline)
     used: set[int] = set()
     matched: list[int | None] = []
-    for block in baseline:
+    for position, block in enumerate(baseline):
         digest = block["hash"]
         free = [i for i in occurrences.get(digest, []) if i not in used]
-        if free and _sensitive(block):
-            # of identical copies, the one still in its section is the one this block became
+        if not free and position in expected:
+            # the block as the plan's own [[reference]] edits left it
+            digest = expected[position]
+            free = [i for i in occurrences.get(digest, []) if i not in used]
+        if len(free) > 1:
+            # of identical copies (a table copied into a spike, a repeated warning), the one still
+            # in its section is the one this block became
             free.sort(key=lambda i: not _place_kept(context.plan, block, current[i][0], current[i][1].heading_path))
         if free:
             used.add(free[0])
@@ -6614,7 +6710,12 @@ def _verify(context: PlanContext, args: argparse.Namespace) -> list[str]:
     for block, found in zip(baseline, matched, strict=True):
         if found is not None and block["type"] in ("list-item", "table-row"):
             groups[(block["file"], tuple(block["heading_path"]), block["type"], block["depth"])].append(found)
-        if found is not None and _sensitive(block) and not _place_kept(context.plan, block, current[found][0], current[found][1].heading_path):
+        if (
+            found is not None
+            and _sensitive(block)
+            and relocated.get(block["hash"]) != current[found][0]
+            and not _place_kept(context.plan, block, current[found][0], current[found][1].heading_path)
+        ):
             report.add(
                 Finding(
                     "context-lost",
@@ -6651,6 +6752,32 @@ def _verify(context: PlanContext, args: argparse.Namespace) -> list[str]:
     else:
         report.coverage.append(CoverageRow("url_baseline", "not_applicable", "no site config: no URLs to preserve"))
     return required
+
+
+def _reference_digests(plan: Plan, baseline: list[dict[str, Any]]) -> dict[int, str]:
+    """Baseline position -> the digest of that block after the [[reference]] edits on its lines."""
+    edits: dict[str, list[tuple[int, str, str]]] = defaultdict(list)
+    for entry in plan.entries("reference"):
+        if isinstance(entry.get("line"), int) and isinstance(entry.get("old"), str) and isinstance(entry.get("new"), str):
+            edits[str(entry.get("file"))].append((entry["line"], entry["old"], entry["new"]))
+    starts: dict[str, list[int]] = defaultdict(list)
+    for block in baseline:
+        starts[str(block["file"])].append(int(block["line"]))
+    out: dict[int, str] = {}
+    for position, block in enumerate(baseline):
+        file, first = str(block["file"]), int(block["line"])
+        if file not in edits:
+            continue
+        after = [s for s in starts[file] if s > first]
+        end = min(after) if after else first + 10**9  # the file's last block runs to its end
+        text = str(block["text"])
+        touched = False
+        for line, old, new in sorted(edits[file]):
+            if first <= line < end and old in text:
+                text, touched = text.replace(old, new, 1), True
+        if touched:
+            out[position] = _block_hash(Block(type=str(block["type"]), text=text, line=first, heading_path=[], info=str(block.get("info", ""))))
+    return out
 
 
 def _place_kept(plan: Plan, block: dict[str, Any], now_file: str, now_path: list[str]) -> bool:
