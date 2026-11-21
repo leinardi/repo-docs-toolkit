@@ -47,11 +47,6 @@ updates:
     labels: ["dependencies", "ci"]
     cooldown:
       default-days: 7
-    # zensical-requirements.txt pins the Zensical the skills' claims were verified against
-    # (KNOWN_ZENSICAL); moving it is a deliberate upgrade with re-verification, not a routine bump.
-    ignore:
-      - dependency-name: "zensical"
-      - dependency-name: "zensical-ui"
 
   # requirements/a11y.txt: Playwright for the landing page accessibility tests (dev-only).
   - package-ecosystem: "pip"
@@ -61,3 +56,17 @@ updates:
     labels: ["dependencies", "ci"]
     cooldown:
       default-days: 7
+
+  # tools/docs/uv.lock: the Zensical that builds the site and runs the zensical, landing and a11y
+  # tests. Its own pull request, outside dev-tools: the skills' Zensical claims and KNOWN_ZENSICAL in
+  # docstool.py were checked against the pinned version, so merging a bump means re-checking them
+  # (skills/zensical-site/references/upgrade-and-audit.md).
+  - package-ecosystem: "uv"
+    directory: "/tools/docs"
+    schedule:
+      interval: "monthly"
+    cooldown:
+      default-days: 7
+    labels: ["dependencies", "ci"]
+    commit-message:
+      prefix: "chore(deps)"
