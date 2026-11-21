@@ -1,0 +1,19 @@
+/* The toolkit's brand colour, teal. Checked with: docstool contrast #0f766e --slate #5eead4 */
+
+:root > * {
+  --md-primary-fg-color: #0f766e;
+  --md-primary-fg-color--light: #0f766e;
+  --md-primary-fg-color--dark: #0f766e;
+  --md-accent-fg-color: #0f766e;
+  --md-typeset-a-color: #0f766e;
+}
+
+[data-md-color-scheme="slate"] {
+  --md-primary-fg-color: #5eead4;
+  --md-primary-fg-color--light: #5eead4;
+  --md-primary-fg-color--dark: #5eead4;
+  --md-primary-bg-color: #0b0c0f;
+  --md-accent-fg-color: #5eead4;
+  --md-accent-bg-color: #0b0c0f;
+  --md-typeset-a-color: #5eead4;
+}

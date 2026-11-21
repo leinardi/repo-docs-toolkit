@@ -15,6 +15,7 @@ make test             # the unit tests
 make check            # pre-commit on every file
 make check-stage      # pre-commit on the staged files only
 make sync-vendored    # after editing skills/repo-docs/scripts/docstool.py
+make docs-build       # the documentation site, built strict and checked (needs the Zensical lock)
 make validate-plugin  # needs the claude CLI
 ```
 
