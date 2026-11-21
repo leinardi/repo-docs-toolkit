@@ -38,3 +38,12 @@ as listed:
 > NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
 > DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 > OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+## Copied verbatim
+
+| File | Source | Licence | Copyright |
+| --- | --- | --- | --- |
+| `skills/repo-readme/assets/CODE_OF_CONDUCT.contributor-covenant.md` | [Contributor Covenant 3.0](https://www.contributor-covenant.org/version/3/0/), unchanged, including its attribution section | [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/) | Organization for Ethical Source |
+
+The file keeps its own licence; it is not covered by this repository's MIT licence. Projects that
+copy it into their repository carry the same attribution, which the file itself contains.

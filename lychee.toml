@@ -5,4 +5,8 @@ exclude_path = [
   "(^|/)node_modules/",
   # The docstool fixtures hold planted broken links on purpose (tests/test_check.py).
   "^(\\./)?tests/fixtures/",
+  # Skill assets are copied into other repositories: their relative links (CONTRIBUTING.md, LICENSE,
+  # docs/internal/release.md) point at files of that repository. The landing examples' own links
+  # are checked by their strict builds (tests/test_landing_build.py).
+  "^(\\./)?skills/[^/]+/assets/",
 ]

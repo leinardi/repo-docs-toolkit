@@ -32,6 +32,10 @@ config:
     fix: true
     fixApplicator: true
 
+# Copied verbatim from its publisher (THIRD_PARTY_NOTICES.md): a lint fix would change the text.
+ignores:
+  - "skills/repo-readme/assets/CODE_OF_CONDUCT.contributor-covenant.md"
+
 # Fix any fixable errors
 fix: true
 
