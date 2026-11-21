@@ -1,0 +1,152 @@
+default_install_hook_types: [pre-commit, commit-msg]
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-merge-conflict
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: check-yaml
+      - id: check-json
+      - id: check-toml
+      - id: check-added-large-files
+      - id: check-executables-have-shebangs
+      - id: check-shebang-scripts-are-executable
+        # Run as `python3 -I .../docstool.py` (isolated mode), never by its own path.
+        exclude: ^skills/[^/]+/scripts/docstool\.py$
+  - repo: https://github.com/checkmake/checkmake.git
+    rev: v0.3.2
+    hooks:
+      - id: checkmake
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v2.4.1
+    hooks:
+      - id: mypy
+        # The vendored docstool.py copies are byte-identical to skills/repo-docs/scripts/docstool.py
+        # (check-vendored), and two modules of the same name stop mypy; the canonical one is checked.
+        exclude: ^skills/(zensical-site|repo-readme)/scripts/docstool\.py$
+        additional_dependencies:
+          # pytest ships py.typed; without it every @fixture and @parametrize is an
+          # untyped decorator and mypy reports the test it decorates as untyped.
+          - pytest==9.2.0
+      - id: mypy
+        alias: mypy-json-output
+        name: mypy (json output)
+        exclude: ^skills/(zensical-site|repo-readme)/scripts/docstool\.py$
+        additional_dependencies:
+          - pytest==9.2.0
+        args:
+          [
+            "--output",
+            "json",
+            "--hide-error-context",
+            "--show-column-numbers",
+            "--show-absolute-path",
+            "--no-pretty",
+            "--ignore-missing-imports",
+            "--scripts-are-modules",
+          ]
+        stages: [manual]
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.17.3
+    hooks:
+      - id: ruff-check
+        args: ["--fix"]
+      - id: ruff-format
+      - id: ruff-check
+        alias: ruff-check-rdjson
+        args: ["--fix", "-q", "--output-format=rdjson"]
+        stages: [manual]
+  - repo: https://github.com/rhysd/actionlint
+    rev: v1.7.12
+    hooks:
+      - id: actionlint
+        name: actionlint
+        files: ^\.github/workflows/.*\.(yml|yaml)$
+        args: ["-shellcheck", "shellcheck -S error"]
+      - id: actionlint
+        alias: actionlint-oneline
+        name: actionlint (one line per one error)
+        files: ^\.github/workflows/.*\.(yml|yaml)$
+        args: ["-oneline", "-shellcheck", "shellcheck -S error"]
+        stages: [manual]
+  - repo: https://github.com/DavidAnson/markdownlint-cli2
+    rev: v0.24.0
+    hooks:
+      - id: markdownlint-cli2
+        additional_dependencies:
+          - markdownlint-rule-table-format@1.0.3
+  # Pinned rather than taken from the system, so a developer machine and CI run the same release.
+  - repo: https://github.com/shellcheck-py/shellcheck-py
+    rev: v0.11.0.1
+    hooks:
+      - id: shellcheck
+        args: ["-x"]
+      - id: shellcheck
+        alias: shellcheck-diff-output
+        name: shellcheck (diff output)
+        args: ["-f", "diff", "-x"]
+        stages: [manual]
+      - id: shellcheck
+        alias: shellcheck-json-output
+        name: shellcheck (json output)
+        args: ["-f", "json", "-x"]
+        stages: [manual]
+  - repo: local
+    hooks:
+      - id: prettier-yaml
+        name: prettier-yaml
+        entry: prettier
+        language: node
+        additional_dependencies: ["prettier@3.9.9"]
+        files: \.(yml|yaml)$
+        args: ["--write"]
+      # Every source file carries the MIT header. Reads the whole tree, so it always runs; pinned
+      # to one stage because always_run makes a hook eligible at every installed stage, and
+      # commit-msg is one of them.
+      - id: check-license-headers
+        name: licence headers
+        entry: scripts/check-license-headers.sh
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-commit]
+      # docstool.py is vendored byte for byte into each skill that runs it. Always runs, because
+      # deleting or editing only a copy must fail too.
+      - id: check-vendored
+        name: vendored docstool copies
+        entry: python3 -I scripts/sync-vendored.py --check
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-commit]
+  # The offline link check: every relative link and #fragment in the Markdown resolves. The whole
+  # tree on every commit, because deleting a linked page passes no file to the hook at all, so it
+  # takes its inputs from args: directories, walked with .gitignore, unlike a glob, which lychee
+  # expands itself and which would read ignored files. --hidden reaches .github, .agents, .claude
+  # and .serena, which the walk skips otherwise.
+  - repo: https://github.com/lycheeverse/lychee
+    rev: lychee-v0.24.2
+    hooks:
+      - id: lychee
+        args: ["--config", "lychee.toml", "--offline", "--include-fragments", "--no-progress", "--hidden", "--extensions", "md", "--", "."]
+        types: [markdown]
+        pass_filenames: false
+        always_run: true
+        stages: [pre-commit]
+  - repo: https://github.com/adrienverge/yamllint
+    rev: v1.38.0
+    hooks:
+      - id: yamllint
+      - id: yamllint
+        alias: yamllint-parsable
+        name: "yamllint (parsable output)"
+        args: ["--format", "parsable"]
+        stages: [manual]
+  - repo: https://github.com/compilerla/conventional-pre-commit
+    rev: v4.5.0
+    hooks:
+      - id: conventional-pre-commit
+        stages: [commit-msg]
+        args: ["--force-scope"]

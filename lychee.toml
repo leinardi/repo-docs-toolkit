@@ -1,0 +1,6 @@
+# Options of the lychee hook (.pre-commit-config.yaml). The hook walks the tree with .gitignore, so
+# ignored directories (.scratch/, .arl/, site/) are never read. The paths below are regular
+# expressions matched against the path.
+exclude_path = [
+  "(^|/)node_modules/",
+]

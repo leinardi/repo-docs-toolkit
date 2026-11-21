@@ -1,0 +1,8 @@
+# Development dependencies only: the skills and docstool need nothing beyond python3 >= 3.11 and
+# its standard library.
+#
+# ruff and mypy are pinned by rev in .pre-commit-config.yaml and run in pre-commit's own
+# environments, so they are not listed here.
+#
+# Install with: make dev-deps
+pytest==9.2.0

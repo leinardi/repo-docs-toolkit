@@ -1,0 +1,52 @@
+# OS / editor junk
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IntelliJ IDEA / JetBrains
+.idea/*
+!.idea/codeStyles/
+!.idea/copyright/
+!.idea/scopes/
+*.iml
+out/
+
+# Other editors
+.vscode/
+*.code-workspace
+*.swp
+*~
+
+# Logs
+*.log
+
+# Python
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Zensical build output (the plugin's own site and the landing examples)
+site/
+
+# Local tooling / sandbox
+.env
+.env.*
+.venv/
+venv/
+.cache/
+.tmp/
+tmp/
+
+# Research notes and spike evidence kept on disk while the plugin is built; distilled into
+# docs/internal/research/ before release. Never published, never committed.
+.scratch/
+
+# adversarial-review-loop run state
+.arl/
+
+# Claude Code: the skills symlink and shared settings are tracked; local settings
+# (settings.local.json) and session state never are.
+.claude/*
+!.claude/settings.json
+!.claude/skills

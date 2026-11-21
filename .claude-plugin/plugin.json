@@ -1,0 +1,13 @@
+{
+  "name": "repo-docs-toolkit",
+  "version": "0.0.0",
+  "description": "Skills for repository documentation that stays true to the code: write, audit, maintain and restructure docs, publish them as a Zensical site with a developer landing page, and write lean READMEs and community files.",
+  "author": {
+    "name": "Roberto Leinardi",
+    "url": "https://github.com/leinardi"
+  },
+  "homepage": "https://github.com/leinardi/repo-docs-toolkit",
+  "repository": "https://github.com/leinardi/repo-docs-toolkit",
+  "license": "MIT",
+  "keywords": ["documentation", "docs", "readme", "zensical", "mkdocs", "github-pages", "markdown", "technical-writing"]
+}

@@ -1,0 +1,68 @@
+name: Release
+
+# Both halves of a release, on gh-reusable-workflows:
+#   - a dispatch (bump) resolves the version (explicit, or derived by svu from the Conventional
+#     Commits since the last repo-docs-toolkit--vX.Y.Z tag), writes it into .claude-plugin/plugin.json
+#     with `make release-bump`, and opens the release/<tag> pull request, with CI dispatched on it;
+#   - merging that pull request (release) is checked to be exactly that bump, waits for CI on the
+#     merge commit, and publish tags it and creates the GitHub release.
+# The tag shape, <plugin-name>--vX.Y.Z, is what Claude Code's plugin dependency resolver looks for
+# and what `claude plugin tag` produces. The maintainer procedure is docs/internal/release.md (P8).
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version, e.g. 0.2.0 or v0.2.0 (empty: derive from the commits since the last release)"
+        required: false
+        type: string
+      dry_run:
+        description: "Dry run: resolve the version and show the bump, change nothing"
+        type: boolean
+        default: false
+  push:
+    branches:
+      - main
+    paths:
+      - .claude-plugin/plugin.json
+
+permissions:
+  contents: read
+
+# No concurrency group here: each reusable workflow has its own, never cancelled.
+jobs:
+  bump:
+    if: github.event_name == 'workflow_dispatch'
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
+    uses: leinardi/gh-reusable-workflows/.github/workflows/version-bump-pr.yaml@83b67e285a75505ff27d4ce827235335b8101527 # v1.6.1
+    with:
+      version: ${{ inputs.version }}
+      dry_run: ${{ inputs.dry_run }}
+      tag_prefix: repo-docs-toolkit--v
+      version_command: jq -r .version .claude-plugin/plugin.json
+      bump_command: make release-bump VERSION="$RELEASE_VERSION"
+      allowed_files: .claude-plugin/plugin.json
+
+  release:
+    if: github.event_name == 'push'
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+    uses: leinardi/gh-reusable-workflows/.github/workflows/release-on-merge.yaml@83b67e285a75505ff27d4ce827235335b8101527 # v1.6.1
+    with:
+      tag_prefix: repo-docs-toolkit--v
+      version_command: jq -r .version .claude-plugin/plugin.json
+      allowed_files: .claude-plugin/plugin.json
+
+  publish:
+    needs: release
+    if: needs.release.outputs.release == 'true'
+    permissions:
+      contents: write
+    uses: leinardi/gh-reusable-workflows/.github/workflows/simple-tag-and-release.yaml@83b67e285a75505ff27d4ce827235335b8101527 # v1.6.1
+    with:
+      version: ${{ needs.release.outputs.tag }}
+      tag_prefix: repo-docs-toolkit--v

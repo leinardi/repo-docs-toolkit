@@ -1,0 +1,17 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "repo-docs-toolkit",
+  "description": "Skills for repository documentation, Zensical sites and READMEs.",
+  "owner": {
+    "name": "Roberto Leinardi",
+    "url": "https://github.com/leinardi"
+  },
+  "plugins": [
+    {
+      "name": "repo-docs-toolkit",
+      "description": "Docs authoring, audit and restructuring, Zensical sites with a landing page, and README and community-file skills.",
+      "source": "./",
+      "category": "development"
+    }
+  ]
+}
