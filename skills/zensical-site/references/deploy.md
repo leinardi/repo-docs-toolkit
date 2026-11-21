@@ -9,9 +9,8 @@ shipped workflow builds every pull request with `--strict` and deploys the defau
 `assets/workflows/docs.yaml` goes to `.github/workflows/docs.yaml`. It:
 
 - runs on pull requests (build only), on pushes to `main` and on manual dispatch;
-- installs Zensical from `zensical-requirements.txt` with `--require-hashes` ([config.md](config.md)
-  covers the lock);
-- builds with `zensical build --strict --clean`;
+- installs uv and builds with `uv run --project tools/docs --locked zensical build --strict --clean`,
+  so Zensical comes from the committed `uv.lock` ([config.md](config.md) covers the project);
 - uploads `site/` and deploys it with GitHub's Pages actions, in a separate job that alone has
   `pages: write` and `id-token: write`;
 - pins every action to a full commit SHA, with the tag in a comment.
@@ -25,8 +24,12 @@ Before you copy it, check against the repository:
   repository updates actions with Dependabot or Renovate, it updates these too; otherwise look up
   the current release SHAs (`gh api repos/actions/deploy-pages/releases/latest`) and say so in
   the report.
-- **make-common.** A repository that builds its docs with make-common's `zensical.mk` can call
-  its build target instead of the two install and build steps; keep `--strict`.
+- **The docs project.** `DOCS_UV_PROJECT` at the top names `tools/docs`; change it when the uv
+  project lives elsewhere. A repository that keeps a hashed requirements lock instead keeps its
+  own two steps in place of setup-uv and the uv build: `pip install --require-hashes -r <lock>`
+  after `actions/setup-python`, then `zensical build --strict --clean`.
+- **make-common.** A repository that builds its docs with make-common's `zensical.mk` in uv mode
+  can run `make docs-build` instead of the build step; it builds with `--strict` too.
 
 ## What the user does
 

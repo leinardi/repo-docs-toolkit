@@ -48,7 +48,9 @@ both results, never as a broken site.
   `gh-pages` branch means the site is published from somewhere else: ask. [deploy.md](deploy.md)
   is the target state.
 - **The lock.** Zensical pinned with `==`, the lock committed (an entry in `.gitignore` voids it),
-  installed with `--require-hashes`.
+  installed from it: `uv run --locked` with a `uv.lock`, or `pip install --require-hashes` with a
+  hashed requirements file. A requirements lock still works; moving it to a uv project is a
+  suggestion, not a fault.
 - **Settings that are on but do nothing or claim too much.** Deprecated validation checks, a
   cookie consent dialog with no analytics behind it, Google Fonts where the project avoids
   third-party requests (`font = false`).
@@ -121,8 +123,8 @@ the finding.
    plugins, templates, the theme's HTML.
 2. Baseline the current site, as in [migrate.md](migrate.md) Step 1, with the current lock
    installed: `site-build --ref HEAD`, then `check --save-baseline`.
-3. Change the pin in `zensical-requirements.in`, recompile the lock, install it in a scratch
-   environment, and build again into a new directory.
+3. Change the pin in `tools/docs/pyproject.toml` (or take the Dependabot pull request that did),
+   run `uv lock --project tools/docs`, and build again into a new directory.
 4. `check --baseline` the new build, `site-audit` the config, and compare both sites in a
    browser, landing page included, in both schemes.
 5. If the theme's HTML changed under `home.html` or `home.css` (a broken layout, a missing hero),

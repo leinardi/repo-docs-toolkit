@@ -53,8 +53,9 @@ result they qualify is "partially verified", whatever the exit code.
 1. **Facts come from the repository and from Zensical itself.** Site name, URLs, branch, install
    commands and features come from the code, its config and its docs; a Zensical behaviour comes
    from the references here or the installed package. Anything else is `TODO(verify: ...)`.
-2. **Pin Zensical.** `zensical==0.1.3` in `zensical-requirements.in`, installed from a hashed lock,
-   locally and in CI ([config.md](references/config.md)).
+2. **Pin Zensical.** `zensical==0.1.3` in a uv project (`tools/docs/pyproject.toml` and its
+   committed `uv.lock`), run through `uv run --locked`, locally and in CI
+   ([config.md](references/config.md)).
 3. **`--strict` is not enough.** A strict build misses broken images, unsupported plugins, hooks
    and features that do nothing. Every change ends with `site-audit` and `check` as well.
 4. **Keep the native UI.** Header, search, navigation tabs, palette toggle and footer stay the
@@ -95,7 +96,8 @@ the repo-docs skill's restructure mode; this skill takes over once the content i
 3. Navigation: folders, or an explicit `nav` when order matters. Fix the links that leave
    `docs/` (`check` lists them).
 4. The landing page ([landing-page.md](references/landing-page.md)).
-5. `zensical-requirements.in` and its hashed lock; with make-common, its `zensical.mk` targets.
+5. The `tools/docs` uv project and its `uv.lock`, plus a Dependabot `uv` entry; with make-common,
+   `zensical.mk` in uv mode.
 6. `site-audit`, `check` and `contrast` clean; `site-build` passes.
 7. The Pages workflow ([deploy.md](references/deploy.md)); the user sets the Pages source (Z2).
 8. Screenshots at 1440, 768 and 390 pixels, light and dark, reviewed by the user.

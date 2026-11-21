@@ -1,4 +1,0 @@
-# The Zensical version the repo-docs-toolkit skills were tested with. Lock it with hashes:
-#   uv pip compile --universal --generate-hashes zensical-requirements.in -o zensical-requirements.txt
-# and install with: pip install --require-hashes -r zensical-requirements.txt
-zensical==0.1.3
