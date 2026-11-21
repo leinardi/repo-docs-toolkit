@@ -1,0 +1,9 @@
+# The documentation site's Python dependencies, for make-common's zensical.mk in uv mode
+# (DOCS_UV_PROJECT in the Makefile). Not a package: uv installs only the dependencies, into
+# tools/docs/.venv, from the committed uv.lock. Dependabot's uv ecosystem proposes Zensical bumps;
+# merging one means re-checking the skills' Zensical claims and KNOWN_ZENSICAL in docstool.py.
+[project]
+name = "repo-docs-toolkit-docs"
+version = "0"
+requires-python = ">=3.11"
+dependencies = ["zensical==0.1.3"]

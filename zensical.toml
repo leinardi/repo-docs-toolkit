@@ -1,6 +1,7 @@
-# The repo-docs-toolkit documentation site, built with Zensical 0.1.3 (zensical-requirements.txt) from
+# The repo-docs-toolkit documentation site, built with Zensical 0.1.3 (tools/docs/uv.lock) from
 # the zensical-site skill's template: skills/zensical-site/references/config.md explains each block.
-#   zensical build --strict --clean
+#   make docs-build    (uv run --project tools/docs --locked zensical build --strict --clean)
+#   make docs-serve    (live preview; make docs-verify adds the docstool checks)
 # docs/stylesheets/home.css is a copy of skills/zensical-site/assets/stylesheets/home.css, kept
 # identical by scripts/sync-vendored.py.
 
