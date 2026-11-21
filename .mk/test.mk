@@ -70,6 +70,21 @@ test-landing: ## Build the landing examples strict and check their HTML (needs t
 test-a11y: ## Run the landing page accessibility tests (needs Zensical and requirements/a11y.txt)
 	@DOCSTOOL_REQUIRE_ZENSICAL=1 DOCSTOOL_REQUIRE_A11Y=1 $(PYTHON) -m pytest -m a11y
 
+DOCSTOOL := $(REPO_ROOT)/skills/repo-docs/scripts/docstool.py
+
+# The plugin's own site, built strict by docstool into a fresh temporary directory (removed on
+# exit) and checked the way the skills check a user's site. Any finding or incomplete coverage fails.
+.PHONY: docs-build
+docs-build: ## Build the plugin's own site strict and check it with docstool (needs the pinned Zensical)
+	@out="$$(mktemp -d)" && trap 'rm -rf "$$out"' EXIT && cd $(REPO_ROOT) && \
+	$(PYTHON) -I $(DOCSTOOL) site-build --out "$$out" && \
+	$(PYTHON) -I $(DOCSTOOL) check --scope docs --built "$$out" && \
+	$(PYTHON) -I $(DOCSTOOL) check --scope repo && \
+	$(PYTHON) -I $(DOCSTOOL) site-audit && \
+	$(PYTHON) -I $(DOCSTOOL) drift --scope docs && \
+	$(PYTHON) -I $(DOCSTOOL) drift --scope repo && \
+	$(PYTHON) -I $(DOCSTOOL) readme --home docs/index.md
+
 .PHONY: sync-vendored
 sync-vendored: ## Copy skills/repo-docs/scripts/docstool.py into the other skills
 	@$(PYTHON) -I $(REPO_ROOT)/scripts/sync-vendored.py

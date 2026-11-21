@@ -7,7 +7,7 @@ name: Release
 #   - merging that pull request (release) is checked to be exactly that bump, waits for CI on the
 #     merge commit, and publish tags it and creates the GitHub release.
 # The tag shape, <plugin-name>--vX.Y.Z, is what Claude Code's plugin dependency resolver looks for
-# and what `claude plugin tag` produces. The maintainer procedure is docs/internal/release.md (P8).
+# and what `claude plugin tag` produces. The maintainer procedure is docs/internal/release.md.
 on:
   workflow_dispatch:
     inputs:
