@@ -174,6 +174,12 @@ def test_yaml_subset(text: str, expected: object) -> None:
     assert docstool.yaml_load(text) == expected
 
 
+def test_yaml_plain_key_may_contain_a_hash() -> None:
+    # '#' starts a comment only after whitespace: an anchor redirect key needs no quotes.
+    text = "redirect_maps:\n  guide.md#old: guide.md#new  # moved\n"
+    assert docstool.yaml_load(text) == {"redirect_maps": {"guide.md#old": "guide.md#new"}}
+
+
 def test_yaml_tags_are_kept_not_resolved() -> None:
     data = docstool.yaml_load(
         "i: !!python/name:material.extensions.emoji.twemoji\nk: !ENV [KEY, x]\ns: !!python/object/apply:pymdownx.slugs.slugify\n  kwds:\n    case: lower\n"

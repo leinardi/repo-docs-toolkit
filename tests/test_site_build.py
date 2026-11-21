@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -217,3 +218,86 @@ def test_real_zensical_anchor_redirects_preserve_fragments(tmp_path: Path) -> No
     _real_build(repo, tmp_path / "bare")
     _, report = docstool_json(repo, "check", "--built", str(tmp_path / "bare"), "--baseline", str(tmp_path / "urls.json"))
     assert "fragment-lost" in {f["check"] for f in report["findings"]}
+
+
+def script_generator(tmp_path: Path, body: str) -> str:
+    """A one-off generator: a Python script run in the staged tree, as --generator-cmd."""
+    script = tmp_path / "gen.py"
+    script.write_text(
+        "import pathlib, subprocess, sys\nif sys.argv[1:2] == ['--version']:\n    print('gen 1.0')\n    sys.exit(0)\n" + body,
+        encoding="utf-8",
+    )
+    return f"{sys.executable} {script}"
+
+
+def test_mkdocs_generator_reads_mkdocs_yml_when_both_configs_exist(tmp_path: Path) -> None:
+    repo = site_repo(tmp_path)
+    (repo / "mkdocs.yml").write_text("site_name: Clean\n", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "both configs")
+    gen = script_generator(
+        tmp_path, "assert sys.argv[-1] == 'mkdocs.yml', sys.argv\npathlib.Path('site').mkdir()\npathlib.Path('site/index.html').write_text('x')\n"
+    )
+    for extra in ((), ("--ref", "HEAD")):
+        out = tmp_path / f"out{len(extra)}"
+        result = run_script(DOCSTOOL, "site-build", "--root", str(repo), "--out", str(out), "--generator", "mkdocs", "--generator-cmd", gen, *extra)
+        assert result.returncode == 0, result.stderr
+        stamp = json.loads((out / ".docstool-build.json").read_text(encoding="utf-8"))
+        assert stamp["command"].endswith("-f mkdocs.yml")
+        assert "mkdocs.yml" in stamp["inputs"]
+        # check reads the stamp against mkdocs.yml too: the build is not stale
+        assert docstool_code(repo, "check", "--built", str(out)) in (0, 1)
+
+
+def test_git_plugins_get_the_history_without_touching_the_repository(tmp_path: Path) -> None:
+    repo = site_repo(tmp_path)
+    config = repo / "zensical.toml"
+    config.write_text(config.read_text(encoding="utf-8") + "\n[project.plugins.git-revision-date-localized]\n", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "dates")
+    last_change = git(repo, "log", "-1", "--format=%H", "--", "docs/guide.md").strip()
+    before = sorted(p.relative_to(repo / ".git").as_posix() for p in (repo / ".git").rglob("*"))
+    gen = script_generator(
+        tmp_path,
+        "log = subprocess.run(['git', 'log', '-1', '--format=%H', '--', 'docs/guide.md'], capture_output=True, text=True)\n"
+        "assert log.returncode == 0 and log.stdout.strip(), log.stderr\n"
+        "pathlib.Path('site').mkdir()\npathlib.Path('site/index.html').write_text(log.stdout)\n",
+    )
+    for extra in ((), ("--ref", "HEAD")):
+        out = tmp_path / f"out{len(extra)}"
+        result = run_script(DOCSTOOL, "site-build", "--root", str(repo), "--out", str(out), "--generator-cmd", gen, *extra)
+        assert result.returncode == 0, result.stderr
+        assert (out / "index.html").read_text(encoding="utf-8").strip() == last_change
+    assert sorted(p.relative_to(repo / ".git").as_posix() for p in (repo / ".git").rglob("*")) == before
+    assert git(repo, "status", "--porcelain") == ""
+
+
+def test_lent_history_ignores_an_inherited_git_dir_and_keeps_ignored_committed_inputs(tmp_path: Path) -> None:
+    repo = site_repo(tmp_path)
+    config = repo / "zensical.toml"
+    config.write_text(config.read_text(encoding="utf-8") + "\n[project.plugins.git-revision-date-localized]\n", encoding="utf-8")
+    (repo / ".gitignore").write_text("*.css\n", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "dates, and a committed file that .gitignore matches")
+    assert "docs/assets/extra.css" in git(repo, "ls-files")
+    before = sorted(p.relative_to(repo / ".git").as_posix() for p in (repo / ".git").rglob("*"))
+    gen = script_generator(tmp_path, "pathlib.Path('site').mkdir()\npathlib.Path('site/index.html').write_text('x')\n")
+    out = tmp_path / "out"
+    command = [sys.executable, "-I", str(DOCSTOOL), "site-build", "--root", str(repo), "--out", str(out), "--generator-cmd", gen, "--ref", "HEAD"]
+    environment = {**os.environ, "GIT_DIR": str(repo / ".git"), "GIT_WORK_TREE": str(repo)}
+    result = subprocess.run(command, capture_output=True, text=True, check=False, env=environment)
+    assert result.returncode == 0, result.stderr
+    assert sorted(p.relative_to(repo / ".git").as_posix() for p in (repo / ".git").rglob("*")) == before
+    stamp = json.loads((out / ".docstool-build.json").read_text(encoding="utf-8"))
+    assert "docs/assets/extra.css" in stamp["inputs"]
+
+
+def test_a_failed_build_keeps_the_location_lines(tmp_path: Path) -> None:
+    repo = site_repo(tmp_path)
+    gen = script_generator(
+        tmp_path,
+        "print('Warning: anchor does not exist')\nprint('   --> index.md:3:27')\nprint('Aborted because --strict flag is set')\nsys.exit(1)\n",
+    )
+    result = run_script(DOCSTOOL, "site-build", "--root", str(repo), "--out", str(tmp_path / "out"), "--generator-cmd", gen)
+    assert result.returncode == 2
+    assert "index.md:3:27" in result.stderr

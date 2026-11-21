@@ -26,9 +26,10 @@
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
-from conftest import docstool_json, make_repo
+from conftest import docstool_json, git, make_repo
 
 
 def checks(repo: Path) -> set[str]:
@@ -66,3 +67,53 @@ def test_dotted_pymdownx_keys_are_hoisted(tmp_path: Path) -> None:
     config.write_text(text, encoding="utf-8")
     _, report = docstool_json(repo, "site-audit")
     assert "extension-missing" not in {f["check"] for f in report["findings"]}
+
+
+def commit_all(repo: Path) -> None:
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "change")
+
+
+def test_an_unpinned_requirement_is_reported_at_its_line(tmp_path: Path) -> None:
+    repo = make_repo("clean", tmp_path)
+    (repo / "zensical-requirements.in").write_text("# the docs toolchain\nzensical>=0.1.3\n", encoding="utf-8")
+    commit_all(repo)
+    _, report = docstool_json(repo, "site-audit")
+    lock = [f for f in report["findings"] if f["check"] == "lock"]
+    assert [(f["file"], f["line"]) for f in lock] == [("zensical-requirements.in", 2)]
+    assert "zensical>=0.1.3" in lock[0]["message"]
+
+
+def test_deprecated_validation_and_a_missing_internal_exclusion(tmp_path: Path) -> None:
+    repo = make_repo("clean", tmp_path)
+    config = repo / "zensical.toml"
+    text = config.read_text(encoding="utf-8").replace('exclude_docs = """\ninternal/\n"""\n', "")
+    config.write_text(text + "\n[project.validation]\ninvalid_links = true\nunused_footnotes = true\n", encoding="utf-8")
+    shutil.rmtree(repo / "docs" / "internal", ignore_errors=True)
+    commit_all(repo)
+    _, report = docstool_json(repo, "site-audit")
+    got = {(f["check"], f["severity"]) for f in report["findings"]}
+    assert {("validation-deprecated", "P3"), ("exclude-internal", "P3")} <= got
+    assert "internal-published" not in {check for check, _ in got}
+
+
+def test_slug_uses_the_site_style_by_default(tmp_path: Path) -> None:
+    repo = make_repo("mkdocs-site", tmp_path)
+    _, report = docstool_json(repo, "slug", "Security & Operations")
+    row = report["data"]["slugs"][0]
+    assert (row["github"], row["site"], row["style"]) == ("security--operations", "security-operations", "python-markdown")
+    _, report = docstool_json(repo, "slug", "--style", "pymdownx-lower", "Security & Operations")
+    assert report["data"]["slugs"][0]["site"] == "security--operations"
+
+
+def test_slug_with_an_unknown_site_slugify_is_incomplete_not_guessed(tmp_path: Path) -> None:
+    repo = make_repo("clean", tmp_path)
+    config = repo / "zensical.toml"
+    config.write_text(config.read_text(encoding="utf-8").replace('"pymdownx.slugs.slugify"', '"my_project.slugs.slugify"'), encoding="utf-8")
+    code, report = docstool_json(repo, "slug", "Security & Operations")
+    assert code == 3
+    row = report["data"]["slugs"][0]
+    assert (row["github"], row["site"], row["style"]) == ("security--operations", None, "unknown")
+    # an explicit --style is the caller's answer: complete again
+    code, report = docstool_json(repo, "slug", "--style", "pymdownx-lower", "Security & Operations")
+    assert code == 0

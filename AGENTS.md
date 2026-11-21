@@ -33,8 +33,10 @@ breaks a reference.
 2. **docstool is fail-closed and side-effect free.** It uses only the standard library and Python
    3.11 or newer. It never executes project code (the one exception is `site-build`, which runs
    the site generator after the user agreed), never sends repository content over the network,
-   runs only read-only git commands, and writes only the paths its command documents. An input it
-   cannot analyse is reported as incomplete coverage (exit 3), never as clean.
+   runs only read-only git commands against the repository (`site-build` may create a git
+   repository inside its own temporary staging directory, borrowing the objects, for plugins
+   that read history), and writes only the paths its command documents. An input it cannot
+   analyse is reported as incomplete coverage (exit 3), never as clean.
 3. **The copies of docstool.py never drift.** Edit `skills/repo-docs/scripts/docstool.py`, then run
    `make sync-vendored`. The `check-vendored` hook and `tests/test_vendored.py` fail on any
    difference.
