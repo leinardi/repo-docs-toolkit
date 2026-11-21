@@ -5,6 +5,10 @@ Each skill must work on its own (claude.ai, OpenCode and `npx skills` install sk
 `python3 -I` cannot import from another directory), so docstool.py is vendored into every skill
 that runs it. The canonical copy is skills/repo-docs/scripts/docstool.py.
 
+The plugin's own site uses the landing page stylesheet as shipped. Zensical reads extra_css from
+docs/ or custom_dir, and the asset sits in neither (custom_dir is the skill's assets/overrides/), so
+docs/stylesheets/home.css is a copy of the skill's asset, kept the same way.
+
     scripts/sync-vendored.py          write the copies from the canonical file
     scripts/sync-vendored.py --check  list the copies that differ; exit 1 if any does
 """
@@ -45,29 +49,35 @@ COPIES = (
     Path("skills/zensical-site/scripts/docstool.py"),
     Path("skills/repo-readme/scripts/docstool.py"),
 )
+# (source, copy) pairs outside the docstool copies.
+SITE_COPIES = ((Path("skills/zensical-site/assets/stylesheets/home.css"), Path("docs/stylesheets/home.css")),)
+
+
+def pairs() -> tuple[tuple[Path, Path], ...]:
+    """Every (source, copy) pair this script keeps identical."""
+    return tuple((CANONICAL, copy) for copy in COPIES) + SITE_COPIES
 
 
 def stale_copies(root: Path) -> list[Path]:
-    """Return the copies that are missing, symlinks, or differ from the canonical file."""
-    canonical = (root / CANONICAL).read_bytes()
+    """Return the copies that are missing, symlinks, or differ from their source."""
     stale = []
-    for copy in COPIES:
+    for source, copy in pairs():
         path = root / copy
-        if path.is_symlink() or not path.is_file() or path.read_bytes() != canonical:
+        if path.is_symlink() or not path.is_file() or path.read_bytes() != (root / source).read_bytes():
             stale.append(copy)
     return stale
 
 
 def write_copies(root: Path) -> list[Path]:
-    """Write every stale copy from the canonical file and return the ones written."""
-    canonical = (root / CANONICAL).read_bytes()
+    """Write every stale copy from its source and return the ones written."""
     written = stale_copies(root)
+    sources = {copy: source for source, copy in pairs()}
     for copy in written:
         path = root / copy
         if path.is_symlink():
             path.unlink()
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(canonical)
+        path.write_bytes((root / sources[copy]).read_bytes())
     return written
 
 
@@ -77,17 +87,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--root", type=Path, default=REPO_ROOT, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     root: Path = args.root
-    if not (root / CANONICAL).is_file():
-        print(f"sync-vendored: {CANONICAL} not found under {root}", file=sys.stderr)
-        return 2
+    for source in dict.fromkeys(source for source, _ in pairs()):
+        if not (root / source).is_file():
+            print(f"sync-vendored: {source} not found under {root}", file=sys.stderr)
+            return 2
     if args.check:
         stale = stale_copies(root)
         if stale:
-            print(f"These copies differ from {CANONICAL}; run make sync-vendored:", file=sys.stderr)
+            print("These copies differ from their source; run make sync-vendored:", file=sys.stderr)
             for copy in stale:
                 print(f"  {copy}", file=sys.stderr)
             return 1
-        print(f"Vendored copies: {len(COPIES)} copies match {CANONICAL}.")
+        print(f"Vendored copies: {len(pairs())} copies match their source.")
         return 0
     for copy in write_copies(root):
         print(f"wrote {copy}")
