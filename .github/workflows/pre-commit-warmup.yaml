@@ -29,4 +29,4 @@ jobs:
     permissions:
       contents: read
       actions: write
-    uses: leinardi/gh-reusable-workflows/.github/workflows/pre-commit-warmup.yaml@83b67e285a75505ff27d4ce827235335b8101527 # v1.6.1
+    uses: leinardi/gh-reusable-workflows/.github/workflows/pre-commit-warmup.yaml@de01bef0599aae3ab1d10e74c51b0031788b6d11 # v1.7.0
