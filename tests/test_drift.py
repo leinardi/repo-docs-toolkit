@@ -26,10 +26,13 @@
 
 from __future__ import annotations
 
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
-from conftest import docstool_code, docstool_json, git, make_repo
+import pytest
+from conftest import DOCSTOOL, docstool_code, docstool_json, git, make_repo
 
 
 def found(report: dict[str, Any]) -> set[tuple[str, str, int]]:
@@ -146,3 +149,114 @@ def test_root_relative_links_resolve_from_the_repository_root(tmp_path: Path) ->
     _, report = docstool_json(repo, "check")
     got = {(f["check"], f["message"].split(":")[0]) for f in report["findings"]}
     assert got == {("broken-link", "/docs/nope.md"), ("broken-anchor", "/docs/guide.md#nope")}
+
+
+def test_env_read_through_named_constants_and_unknown_names(tmp_path: Path) -> None:
+    # monmux reads its env vars as os.Getenv(envNoExec); a literal-only scan called them unread
+    repo = make_repo("clean", tmp_path)
+    (repo / "env.go").write_text('package main\n\nconst envNoExec = "APP_NO_EXEC"\n\nfunc a() { _ = os.Getenv(envNoExec) }\n', encoding="utf-8")
+    (repo / "docs" / "env.md").write_text("# Env\n\nEnvironment variable `APP_NO_EXEC` disables writes.\n", encoding="utf-8")
+    _, report = docstool_json(repo, "drift")
+    assert "APP_NO_EXEC" in report["data"]["env_read"]
+    assert "env-unknown" not in {f["check"] for f in report["findings"]}
+    assert {r["input"]: r["state"] for r in report["coverage"]}["env"] == "complete"
+    (repo / "dyn.go").write_text("package main\n\nfunc b(key string) { _ = os.Getenv(key) }\n", encoding="utf-8")
+    code, report = docstool_json(repo, "drift")
+    assert code == 3
+    env = next(r for r in report["coverage"] if r["input"] == "env")
+    assert env["state"] == "partial"
+    assert "dyn.go: key" in env["reason"]
+
+
+def test_path_leads_skip_what_is_not_a_repository_path(tmp_path: Path) -> None:
+    repo = make_repo("clean", tmp_path)
+    (repo / "src").mkdir()
+    (repo / "src" / "main.go").write_text("package main\n", encoding="utf-8")
+    (repo / "docs" / "paths.md").write_text(
+        "# Paths\n\n`main.go` `github.com/x/y` `linux/amd64` `GSM/0x7707` `src/gone.go` `owner/repo` `missing.toml` `olddir/tool.sh`\n",
+        encoding="utf-8",
+    )
+    _, report = docstool_json(repo, "drift", "--paths")
+    got = {(f["message"].split(":")[0], f["severity"], f["confidence"]) for f in report["findings"] if f["check"] == "path-missing"}
+    assert got == {
+        ("src/gone.go", "P2", "likely"),
+        ("olddir/tool.sh", "P2", "likely"),
+        ("owner/repo", "P3", "unverified"),
+        ("missing.toml", "P3", "unverified"),
+    }
+
+
+def test_base_cites_the_flag_definition_and_does_not_double_count(tmp_path: Path) -> None:
+    repo = make_repo("go-service", tmp_path)
+    main = repo / "cmd" / "svc" / "main.go"
+    main.write_text(main.read_text(encoding="utf-8").replace('"listen"', '"addr"'), encoding="utf-8")
+    git(repo, "commit", "-q", "-am", "rename the flag")
+    _, report = docstool_json(repo, "drift", "--base", "HEAD~1")
+    added = next(f for f in report["findings"] if f["check"] == "added-undocumented")
+    assert '"addr"' in main.read_text(encoding="utf-8").split("\n")[added["line"] - 1]
+    on_line = [f["check"] for f in report["findings"] if (f["file"], f["line"]) == ("docs/usage.md", 4)]
+    assert on_line.count("removed-still-documented") == 1
+    assert "flag-unknown" not in on_line
+
+
+@pytest.mark.parametrize(
+    ("name", "source"),
+    [
+        ("concat.go", 'package main\n\nfunc a(p string) { _ = os.Getenv(p + "_TOKEN") }\n'),
+        ("fmt.rs", 'fn a(p: &str) { let _ = std::env::var(format!("{}_TOKEN", p)); }\n'),
+        ("fstr.py", 'import os\n\ndef a(p):\n    return os.environ.get(f"{p}_TOKEN")\n'),
+        ("index.py", 'import os\n\ndef a(p):\n    return os.environ[p + "_X"]\n'),
+        ("asstr.rs", "fn a(key: String) { let _ = std::env::var(key.as_str()); }\n"),
+    ],
+)
+def test_env_reads_docstool_cannot_resolve_make_env_partial(tmp_path: Path, name: str, source: str) -> None:
+    repo = make_repo("clean", tmp_path)
+    (repo / name).write_text(source, encoding="utf-8")
+    code, report = docstool_json(repo, "drift")
+    assert code == 3
+    assert {r["input"]: r["state"] for r in report["coverage"]}["env"] == "partial"
+
+
+def test_a_constant_in_another_file_does_not_resolve_a_parameter(tmp_path: Path) -> None:
+    repo = make_repo("clean", tmp_path)
+    (repo / "other.py").write_text('key = "HOME"\n', encoding="utf-8")
+    (repo / "reader.py").write_text("import os\n\ndef a(key):\n    return os.getenv(key)\n", encoding="utf-8")
+    code, report = docstool_json(repo, "drift")
+    assert code == 3
+    assert "HOME" not in report["data"]["env_read"]
+    # a module-level constant in the same file, and a Go constant of another package, do resolve
+    (repo / "reader.py").write_text('import os\n\nTOKEN = "APP_TOKEN"\n\ndef a():\n    return os.getenv(TOKEN)\n', encoding="utf-8")
+    (repo / "other.py").unlink()
+    (repo / "config").mkdir()
+    (repo / "config" / "env.go").write_text('package config\n\nconst (\n\tEnvMode = "APP_MODE"\n)\n', encoding="utf-8")
+    (repo / "main.go").write_text("package main\n\nfunc a() { _ = os.Getenv(config.EnvMode) }\n", encoding="utf-8")
+    _, report = docstool_json(repo, "drift")
+    assert {"APP_TOKEN", "APP_MODE"} <= set(report["data"]["env_read"])
+    assert {r["input"]: r["state"] for r in report["coverage"]}["env"] == "complete"
+
+
+def test_link_test_census(tmp_path: Path) -> None:
+    repo = make_repo("clean", tmp_path)
+    tests = repo / "tests"
+    tests.mkdir()
+    (tests / "test_docs.py").write_text('def test_no_broken_links():\n    open("README.md")\n', encoding="utf-8")
+    (tests / "test_headers.py").write_text('# the regex anchors at the start\ndef test_header():\n    open("x.md")\n', encoding="utf-8")
+    (tests / "test_root.py").write_text('import os\ndef test_root():\n    os.readlink("a.md")\n', encoding="utf-8")
+    _, report = docstool_json(repo, "inventory")
+    assert report["data"]["doc_tooling"]["link_tests"] == ["tests/test_docs.py"]
+
+
+def test_artifact_paths_are_relative_to_root(tmp_path: Path) -> None:
+    repo = make_repo("clean", tmp_path / "repo")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    args = ["--root", str(repo), "--format", "json"]
+    for command in (
+        ["inventory", "--blocks", "docs/internal/restructure/blocks.json"],
+        ["check", "--save-baseline", "docs/internal/restructure/urls.json"],
+    ):
+        result = subprocess.run([sys.executable, "-I", str(DOCSTOOL), *command, *args], cwd=elsewhere, capture_output=True, text=True, check=False)
+        assert result.returncode in (0, 1), result.stderr
+    assert (repo / "docs/internal/restructure/blocks.json").is_file()
+    assert (repo / "docs/internal/restructure/urls.json").is_file()
+    assert not any(elsewhere.iterdir())

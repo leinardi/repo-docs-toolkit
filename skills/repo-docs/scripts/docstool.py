@@ -2388,6 +2388,11 @@ def changelog_generators(repo: Repo) -> list[str]:
     return found
 
 
+# a test of Markdown links: "link" or "links" on its own or as an identifier part (test_no_broken_links),
+# not inside a word (symlink, linker); or slugs
+LINK_TEST_RE = re.compile(r"(?<![a-z])links?(?![a-z])|slug", re.IGNORECASE)
+
+
 def tooling_census(repo: Repo) -> dict[str, Any]:
     names = {PurePosixPath(f).name for f in repo.files}
     result: dict[str, Any] = {
@@ -2407,7 +2412,7 @@ def tooling_census(repo: Repo) -> dict[str, Any]:
     for rel in repo.files:
         if source_kind(rel, "", Site()) == "test":
             text, _ = repo.text(rel)
-            if text and ".md" in text and re.search(r"slug|anchor|fragment|broken link", text, re.IGNORECASE):
+            if text and ".md" in text and LINK_TEST_RE.search(text):
                 result["link_tests"].append(rel)
     return result
 
@@ -2784,10 +2789,10 @@ def cmd_check(args: argparse.Namespace, report: Report) -> list[str]:
         else:
             baseline = {"kind": "source", **source_url_baseline(corpus)}
             report.coverage.append(CoverageRow("url_baseline", "partial", "source-derived (no --built): preservation partially verified"))
-        _write_output(Path(args.save_baseline), json.dumps(baseline, indent=1, ensure_ascii=False) + "\n")
+        _write_output(_root_path(args, args.save_baseline), json.dumps(baseline, indent=1, ensure_ascii=False) + "\n")
         report.data["baseline_written"] = args.save_baseline
     elif args.baseline and built is not None:
-        old = _read_json(Path(args.baseline))
+        old = _read_json(_root_path(args, args.baseline))
         if not isinstance(old, dict) or "routes" not in old:
             raise UsageError(f"{args.baseline}: not a URL baseline written by check --save-baseline")
         compare_url_baseline(old, built["site"], report, args.baseline)
@@ -2911,7 +2916,7 @@ def cmd_inventory(args: argparse.Namespace, report: Report) -> list[str]:
     )
     if args.blocks:
         _write_output(
-            Path(args.blocks),
+            _root_path(args, args.blocks),
             json.dumps({"tool": "docstool", "version": __version__, "blocks": block_baseline(corpus)}, ensure_ascii=False, indent=0) + "\n",
         )
         report.data["blocks_written"] = str(args.blocks)
@@ -4052,6 +4057,110 @@ def flag_definitions(text: str, language: str, constants: dict[str, str] | None 
     return flags
 
 
+ENV_CALLS = {
+    "rust": re.compile(r"\benv::var(?:_os)?\("),
+    "go": re.compile(r"\bos\.(?:Getenv|LookupEnv)\("),
+    "python": re.compile(r"\b(?:environ\.get|environ\.pop|environ\.setdefault|getenv)\(|\benviron\["),
+    "js": re.compile(r"\bprocess\.env\["),
+}
+LITERAL_ARG_RE = re.compile(r"""^\s*(?:"[^"\\]*"|'[^'\\]*')\s*$""")
+NAME_ARG_RE = re.compile(r"^\s*&?([A-Za-z_]\w*(?:(?:::|\.)[A-Za-z_]\w*)*)\s*$")
+# string constants a reader may name, declared where a parameter cannot shadow them unnoticed
+CONST_DECLS = {
+    "rust": (re.compile(r"\b(?:const|static)\s+([A-Za-z_]\w*)\s*:\s*&(?:'static\s+)?str\s*=\s*\"([^\"]+)\""),),
+    "go": (
+        re.compile(r"^(?:const|var)\s+([A-Za-z_]\w*)\s*(?:[A-Za-z_][\w.]*\s*)?=\s*\"([^\"]+)\"", re.MULTILINE),
+        re.compile(r"^\s+([A-Za-z_]\w*)\s*(?:[A-Za-z_][\w.]*\s*)?=\s*\"([^\"]+)\"\s*(?://.*)?$", re.MULTILINE),
+    ),
+    "python": (re.compile(r"^([A-Za-z_]\w*)\s*(?::\s*\w+\s*)?=\s*[\"']([^\"']+)[\"']\s*(?:#.*)?$", re.MULTILINE),),
+    "js": (re.compile(r"^(?:export\s+)?const\s+([A-Za-z_$][\w$]*)\s*(?::\s*\w+\s*)?=\s*[\"'`]([^\"'`$]+)[\"'`]", re.MULTILINE),),
+}
+
+
+def _const_decls(language: str, text: str) -> dict[str, str]:
+    found: dict[str, str] = {}
+    if language == "go":
+        # the second Go pattern reads the indented lines of const ( ... ) blocks only
+        top = CONST_DECLS["go"][0].findall(text)
+        blocks = "\n".join(re.findall(r"^const\s*\(\n(.*?)^\)", text, re.MULTILINE | re.DOTALL))
+        found.update(dict(top))
+        found.update(dict(CONST_DECLS["go"][1].findall(blocks)))
+        return found
+    for pattern in CONST_DECLS.get(language, ()):
+        found.update(dict(pattern.findall(text)))
+    return found
+
+
+def _first_argument(text: str, start: int) -> str:
+    """The text of the first argument of a call whose ( or [ ends just before start."""
+    depth, index = 0, start
+    while index < len(text):
+        char = text[index]
+        if char in "\"'":
+            index += 1
+            while index < len(text) and text[index] != char:
+                index += 2 if text[index] == "\\" else 1
+        elif char in "([{":
+            depth += 1
+        elif char in ")]}":
+            if depth == 0:
+                return text[start:index]
+            depth -= 1
+        elif char == "," and depth == 0:
+            return text[start:index]
+        index += 1
+    return text[start:]
+
+
+def env_dynamic(rel: str, text: str) -> list[str]:
+    """Arguments of environment API calls that are not string literals: names to resolve, or expressions."""
+    pattern = ENV_CALLS.get(LANG_OF.get(PurePosixPath(rel).suffix.lower()) or "")
+    if pattern is None:
+        return []
+    out = []
+    for match in pattern.finditer(text):
+        argument = _first_argument(text, match.end())
+        if not LITERAL_ARG_RE.match(argument):
+            out.append(" ".join(argument.split()))
+    return out
+
+
+def resolve_env_argument(repo: Repo, rel: str, argument: str, cache: dict[str, dict[str, str]]) -> str | None:
+    """The variable a non-literal env argument names, or None when docstool cannot know it."""
+    name = NAME_ARG_RE.match(argument)
+    if name is None:
+        return None
+    language = LANG_OF.get(PurePosixPath(rel).suffix.lower()) or ""
+
+    def decls(path: str) -> dict[str, str]:
+        if path not in cache:
+            cache[path] = _const_decls(LANG_OF.get(PurePosixPath(path).suffix.lower()) or "", repo.text(path)[0] or "")
+        return cache[path]
+
+    parts = re.split(r"::|\.", name.group(1))
+    ident = parts[-1]
+    if len(parts) == 1:
+        scope = [rel]
+        if language == "go":
+            # a Go package is its directory
+            folder = str(PurePosixPath(rel).parent)
+            scope = [f for f in repo.files if f.endswith(".go") and str(PurePosixPath(f).parent) == folder and not _is_test_path(f)]
+    elif language == "rust":
+        scope = [f for f in repo.files if f.endswith(".rs") and not _is_test_path(f)]
+    else:
+        # pkg.Name / module.NAME: the package directory or module file of that name
+        qualifier = parts[-2]
+        scope = [
+            f
+            for f in repo.files
+            if LANG_OF.get(PurePosixPath(f).suffix.lower()) == language
+            and not _is_test_path(f)
+            and (PurePosixPath(f).parent.name == qualifier or PurePosixPath(f).stem == qualifier)
+        ]
+    values = {decls(f)[ident] for f in scope if ident in decls(f)}
+    return values.pop() if len(values) == 1 else None
+
+
 def env_readers(rel: str, text: str) -> set[str]:
     """Environment variables the file reads through a language API."""
     language = LANG_OF.get(PurePosixPath(rel).suffix.lower())
@@ -4149,9 +4258,11 @@ def cmd_drift(args: argparse.Namespace, report: Report) -> list[str]:
     flatten_unknown: list[str] = []
     rust_structs: set[str] = set()
     constants: dict[str, str] = {}
+    declared: dict[str, dict[str, str]] = {}
     for rel in repo.files:
         if rel.endswith(".rs") and not _is_test_path(rel):
             constants.update(RUST_STR_CONST_RE.findall(repo.text(rel)[0] or ""))
+    unresolved: list[str] = []
     for rel in repo.files:
         suffix = PurePosixPath(rel).suffix.lower()
         language = LANG_OF.get(suffix)
@@ -4166,6 +4277,13 @@ def cmd_drift(args: argparse.Namespace, report: Report) -> list[str]:
             if not _is_test_path(rel):
                 for name in env_readers(rel, text):
                     readers[name].append(rel)
+                for argument in sorted(set(env_dynamic(rel, text))):
+                    resolved = resolve_env_argument(repo, rel, argument, declared)
+                    if resolved is not None:
+                        readers[resolved].append(rel)
+                        mentioned.add(resolved)
+                    else:
+                        unresolved.append(f"{rel}: {argument}")
         if suffix not in MARKDOWN_EXTENSIONS:
             mentioned.update(env_mentions(rel, text))
             mentioned.update(env_readers(rel, text))
@@ -4193,7 +4311,14 @@ def cmd_drift(args: argparse.Namespace, report: Report) -> list[str]:
                 "flags", "partial" if problems else "complete", "; ".join(problems) or f"{len(known_flags)} flags for {', '.join(sorted(binaries))}"
             )
         )
-    report.coverage.append(CoverageRow("env", "complete", f"{len(readers)} variables read through language APIs"))
+    report.coverage.append(
+        CoverageRow(
+            "env",
+            "partial" if unresolved else "complete",
+            f"{len(readers)} variables read through language APIs"
+            + (f"; {len(unresolved)} reads through a name docstool cannot resolve ({', '.join(unresolved[:5])})" if unresolved else ""),
+        )
+    )
     rows = {r.input: r for r in report.coverage}
     flag_confidence = "verified" if rows["flags"].complete else "likely"
     make_confidence = "verified" if rows["make"].complete else "likely"
@@ -4271,7 +4396,7 @@ def cmd_drift(args: argparse.Namespace, report: Report) -> list[str]:
                     "P3",
                     "unverified",
                     files[0],
-                    _line_of(repo, files[0], name),
+                    _line_of(repo, files[0], name) or 1,
                     f"{name} is read here but no Markdown file mentions it",
                 )
             )
@@ -4295,6 +4420,9 @@ def cmd_drift(args: argparse.Namespace, report: Report) -> list[str]:
             )
     if args.base:
         _base_drift(args.base, repo, corpus, models, flags, readers, add)
+        # a removed flag still documented is one problem, not also an unknown flag on the same line
+        removed = {(f.file, f.line, f.message.split(" ")[0]) for f in report.findings if f.check == "removed-still-documented"}
+        report.findings = [f for f in report.findings if not (f.check == "flag-unknown" and (f.file, f.line, _first_flag(f.message)) in removed)]
     report.data.update(
         {
             "binaries": binaries,
@@ -4307,12 +4435,17 @@ def cmd_drift(args: argparse.Namespace, report: Report) -> list[str]:
     return ["markdown", "make", "flags", "env"]
 
 
+def _first_flag(message: str) -> str:
+    match = re.search(r"--[\w-]+", message)
+    return match.group(0) if match else ""
+
+
 def _line_of(repo: Repo, rel: str, needle: str) -> int:
     text, _ = repo.text(rel)
     for number, line in enumerate((text or "").split("\n"), 1):
         if needle in line:
             return number
-    return 1
+    return 0
 
 
 def _package_scripts(repo: Repo) -> set[str]:
@@ -4461,7 +4594,15 @@ def _check_command(
                 )
 
 
+# Slash-separated tokens that are not repository paths: hosts and import paths, OS/arch pairs, hex ids
+NOT_A_PATH_RE = re.compile(
+    r"^(?:[\w-]+\.)+[a-z]{2,}/|^[a-z0-9]+/(?:amd64|arm64|386|arm|armv\d|ppc64le|riscv64|s390x|x86_64|aarch64)$|\b0x[0-9a-fA-F]+\b"
+)
+
+
 def _check_paths(corpus: Corpus, scope: set[str], repo: Repo, add: Callable[[Finding], None]) -> None:
+    basenames = {PurePosixPath(f).name for f in repo.files}
+    top_level = {f.split("/", 1)[0] for f in repo.files}
     for rel in sorted(scope):
         doc = corpus.docs[rel]
         base_dir = str(PurePosixPath(rel).parent)
@@ -4469,10 +4610,31 @@ def _check_paths(corpus: Corpus, scope: set[str], repo: Repo, add: Callable[[Fin
             if origin != "span" or not PATH_SPAN_RE.match(span) or "://" in span or span.startswith(("~", "/")):
                 continue
             target = _strip_dot_slash(span).rstrip("/")
-            if _placeholder(target) or not target:
+            if _placeholder(target) or not target or NOT_A_PATH_RE.search(target):
                 continue
-            if not repo.exists(target) and not repo.exists(normalize_path(base_dir, target) or ""):
+            if repo.exists(target) or repo.exists(normalize_path(base_dir, target) or ""):
+                continue
+            if "/" not in target:
+                # a bare file name: a path only when no file of that name exists anywhere
+                if target not in basenames:
+                    add(Finding("path-missing", "P3", "unverified", rel, number, f"{span}: no file of that name in the repository"))
+                continue
+            first = target.split("/", 1)[0]
+            # a renamed top-level directory is drift too: a span that ends in a file name or a / names a path
+            looks_like_path = bool(re.search(r"\.[A-Za-z0-9]{1,8}$", target)) or span.endswith("/")
+            if first in top_level or repo.exists(normalize_path(base_dir, first) or "") or looks_like_path:
                 add(Finding("path-missing", "P2", "likely", rel, number, f"{span}: no such path in the repository"))
+            else:
+                add(
+                    Finding(
+                        "path-missing",
+                        "P3",
+                        "unverified",
+                        rel,
+                        number,
+                        f"{span}: no such path, and no {first}/ in the repository: it may not be a path",
+                    )
+                )
 
 
 def _commit_times(repo: Repo) -> dict[str, int]:
@@ -4639,7 +4801,7 @@ def _base_drift(
                     "P3",
                     "likely",
                     source,
-                    _line_of(repo, source, value.lstrip("-")),
+                    _line_of(repo, source, f'"{value.lstrip("-")}"') or _line_of(repo, source, value.lstrip("-")) or 1,
                     f"{value} ({kind}) is new since {base} and no doc mentions it",
                 )
             )
@@ -4864,8 +5026,11 @@ def cmd_site_build(args: argparse.Namespace, report: Report) -> list[str]:
         environment = {**os.environ, "NO_COLOR": "1"}
         result = subprocess.run(build, capture_output=True, text=True, check=False, cwd=source, env=environment)
         if result.returncode != 0:
-            tail = "\n".join((result.stdout + result.stderr).strip().split("\n")[-15:])
-            raise UsageError(f"{generator} build failed (exit {result.returncode}); no stamp written:\n{tail}")
+            lines = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", result.stdout + result.stderr).strip().split("\n")
+            # the generator's own diagnostics first: a traceback's tail alone hides the cause
+            diagnostics = [line for line in lines if re.search(r"\b(?:error|warning|does not exist|not found|failed)\b", line, re.IGNORECASE)]
+            shown = list(dict.fromkeys([*diagnostics[:15], *lines[-10:]]))
+            raise UsageError(f"{generator} build --strict failed (exit {result.returncode}); no stamp written:\n" + "\n".join(shown))
         site_dir = str(site.raw.get("site_dir", "site"))
         built = source / site_dir
         if not built.is_dir():
@@ -5287,6 +5452,13 @@ def validate_plan(context: PlanContext) -> None:
             )
         elif hashes[rel] != current:
             error("plan-stale", f"{rel} changed since the plan was written (hash differs)", rel)
+    for rel in sorted(set(hashes) - plan_sources(context)):
+        # files declared only so apply may rewrite their links: bound to the approval like the rest
+        problem = _path_problem(repo, rel)
+        if problem:
+            error("plan-path", f"[meta.sources] {rel}: {problem}")
+        elif hashes[rel] != file_sha256(repo.root / rel):
+            error("plan-stale", f"{rel} changed since the plan was written (hash differs)", rel)
     rows = {r.input: r for r in context.report.coverage}
     for name in ("config", "nav", "exclude_docs", "redirects", "markdown"):
         if name in rows and not rows[name].complete:
@@ -5296,6 +5468,12 @@ def validate_plan(context: PlanContext) -> None:
     if not rows["couplings"].complete:
         error("plan-coverage", f"couplings coverage is {rows['couplings'].state}: {rows['couplings'].reason}")
     _validate_entries(context, couplings)
+
+
+def _link_rewritable(context: PlanContext, rel: str) -> bool:
+    """Apply rewrites the links of Markdown files inside the docs, and of files [meta.sources] declares."""
+    sources = context.plan.meta.get("sources")
+    return _writable(context, rel) or (isinstance(sources, dict) and rel in sources)
 
 
 def _writable(context: PlanContext, rel: str) -> bool:
@@ -5490,7 +5668,16 @@ def _check_inbound(
                 for link in doc.links
                 if not SCHEME_RE.match(link.target)
             )
+            if linked and _link_rewritable(context, source):
+                continue
             if linked:
+                context.error(
+                    "plan-inbound",
+                    f"{source}:{line} links to {target}, which the plan moves; {source} is outside {context.site.docs_dir}/, so apply rewrites its links only when [meta.sources] declares it",
+                    source,
+                    line,
+                    f"add {source!r} = <its sha256> to [meta.sources] (gate G10), or a [[reference]] edit for that line",
+                )
                 continue
         if (source, line) in references:
             continue
@@ -5683,6 +5870,8 @@ def preflight(context: PlanContext) -> tuple[list[dict[str, Any]], list[tuple[st
     markdown = sorted(r for r in repo.files if r.endswith(MARKDOWN_EXTENSIONS))
     split_sources = {s[0]: s for s in splits}
     for rel in markdown:
+        if not _link_rewritable(context, rel):
+            continue  # outside the docs and not declared in [meta.sources]: validate reported its links
         text = tree.text(rel)
         new_rel = path_map.get(rel, rel)
         if rel in split_sources:
@@ -5996,6 +6185,7 @@ def _write_approval(context: PlanContext, by: str) -> None:
     _fsync_write(temporary, text.encode())
     os.replace(temporary, path)
     context.report.data["state"] = f"approved by {by}"
+    context.report.data["approval"] = "approved"
     context.report.data["plan_sha256"] = digest
 
 
@@ -6274,7 +6464,7 @@ def _verify(context: PlanContext, args: argparse.Namespace) -> list[str]:
     if args.urls:
         if not args.built:
             raise UsageError("plan verify --urls needs --built NEW_SITE")
-        urls = _read_json(Path(args.urls))
+        urls = _read_json(_root_path(args, args.urls))
         if not isinstance(urls, dict):
             raise UsageError(f"{args.urls}: not a URL baseline")
         built = load_built(args.built, context.repo, context.site)
@@ -6283,6 +6473,10 @@ def _verify(context: PlanContext, args: argparse.Namespace) -> list[str]:
         compare_url_baseline(urls, built["site"], report, args.urls)
         report.coverage.append(_url_baseline_row(urls, built))
         required.append("url_baseline")
+    elif context.site.config:
+        report.coverage.append(CoverageRow("url_baseline", "partial", "not checked: pass --urls and --built to verify URL preservation"))
+    else:
+        report.coverage.append(CoverageRow("url_baseline", "not_applicable", "no site config: no URLs to preserve"))
     return required
 
 
@@ -6313,14 +6507,21 @@ def _sensitive(block: dict[str, Any]) -> bool:
 # ---------------------------------------------------------------------------------------------
 
 
+def _root_path(args: argparse.Namespace, value: str) -> Path:
+    """A path flag naming a repository artifact: relative paths are relative to --root, not the cwd."""
+    path = Path(value)
+    return path if path.is_absolute() else Path(args.root) / path
+
+
 def _write_output(path: Path, content: str) -> None:
     if path.is_symlink():
         raise UsageError(f"refusing to write through a symlink: {path}")
     target = path.resolve()
     if ".git" in target.parts:
         raise UsageError(f"refusing to write inside .git: {path}")
-    if not target.parent.is_dir():
-        raise UsageError(f"the directory of {path} does not exist")
+    if target.parent.exists() and not target.parent.is_dir():
+        raise UsageError(f"the parent of {path} is not a directory")
+    target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(content, encoding="utf-8")
 
 
@@ -6408,7 +6609,21 @@ COMMANDS = {
     "plan": cmd_plan,
     "slug": cmd_slug,
 }
-TEXT_RENDERERS: dict[str, Callable[[Report], str]] = {"inventory": render_inventory_text, "contrast": render_contrast_text}
+
+
+def render_plan_text(report: Report) -> str:
+    """The operation list of an apply (dry run or written) and the redirects it adds."""
+    operations = report.data.get("operations")
+    if not isinstance(operations, list):
+        return ""
+    out = [f"Operations ({len(operations)}):"] + [f"  {op['change']:<6}  {op['path']}" for op in operations]
+    redirects = report.data.get("redirects") or []
+    if redirects:
+        out += [f"Redirects added ({len(redirects)}):"] + [f"  {r}" for r in redirects]
+    return "\n".join(out) + "\n\n"
+
+
+TEXT_RENDERERS: dict[str, Callable[[Report], str]] = {"inventory": render_inventory_text, "contrast": render_contrast_text, "plan": render_plan_text}
 
 
 def main(argv: list[str] | None = None) -> int:

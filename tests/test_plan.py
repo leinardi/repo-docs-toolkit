@@ -119,7 +119,7 @@ MESSY_PLAN: dict[str, list[dict[str, Any]]] = {
     "reference": [{"file": "src/device.rs", "line": 3, "old": "docs/release.md", "new": "docs/guide/release.md"}],
     "keep": [{"paths": ["docs/protocol.md", "docs/internal/"]}],
 }
-MESSY_SOURCES = ["docs/roadmap.md", "docs/release.md", "src/device.rs"]
+MESSY_SOURCES = ["docs/roadmap.md", "docs/release.md", "src/device.rs", "RELEASING.md"]
 
 
 def messy(tmp_path: Path) -> Path:
@@ -195,8 +195,22 @@ def test_mixed_state_refuses_with_each_paths_state(tmp_path: Path) -> None:
 
 def test_the_shipped_example_plan_validates(tmp_path: Path) -> None:
     example = Path(DOCSTOOL).parents[1] / "assets" / "restructure-plan.example.toml"
-    if not example.exists():
-        pytest.skip("the example plan ships with the skill text (P4)")
+    repo = make_repo("messy-docs", tmp_path)
+    blocks = repo / ART / "blocks.json"
+    blocks.parent.mkdir(parents=True)
+    assert docstool_json(repo, "inventory", "--blocks", str(blocks))[0] in (0, 1)
+    lines = []
+    for raw in example.read_text(encoding="utf-8").split("\n"):
+        line = raw.replace("<base commit>", head(repo))
+        if line.endswith('= "<sha256>"'):
+            line = line.replace("<sha256>", sha(repo / line.split('"')[1]))
+        lines.append(line)
+    (repo / ART / "plan.toml").write_text("\n".join(lines), encoding="utf-8")
+    code, report = docstool_json(repo, "plan", "validate")
+    assert code == 0, report["findings"]
+    code, report = docstool_json(repo, "plan", "apply")
+    assert code == 0, report["findings"]
+    assert {op["path"] for op in report["data"]["operations"]} >= {"docs/internal/release.md", "docs/internal/history/roadmap.md", "src/device.rs"}
 
 
 @pytest.mark.parametrize(
@@ -703,3 +717,43 @@ def test_rewrites_and_promotion_respect_fence_length_and_character() -> None:
     rewritten = module._rewrite_links(text, "docs", "docs", "docs/x.md", "docs/x.md", {"docs/a.md": "docs/b.md"}, {})
     assert "[x](a.md)" in rewritten
     assert "[y](b.md)" in rewritten
+
+
+def test_text_dry_run_lists_operations_and_verify_names_the_unchecked_urls(tmp_path: Path) -> None:
+    repo = messy(tmp_path)
+    result = subprocess.run(
+        ["python3", "-I", str(DOCSTOOL), "plan", "apply", "--root", str(repo)], capture_output=True, text=True, check=False, env=GIT_ENV
+    )
+    assert result.returncode == 0, result.stderr
+    assert "Operations (" in result.stdout
+    assert "docs/guide/release.md" in result.stdout
+    assert "Redirects added (" in result.stdout
+    _, report = docstool_json(repo, "plan", "verify")
+    row = next(r for r in report["coverage"] if r["input"] == "url_baseline")
+    assert row["state"] == "partial"
+    assert "--urls" in row["reason"]
+
+
+def test_blocks_baseline_creates_its_directory(tmp_path: Path) -> None:
+    repo = make_repo("messy-docs", tmp_path)
+    target = repo / "docs" / "internal" / "restructure" / "blocks.json"
+    assert not target.parent.exists()
+    assert docstool_json(repo, "inventory", "--blocks", str(target))[0] in (0, 1)
+    assert target.is_file()
+
+
+def test_links_outside_the_docs_are_rewritten_only_when_declared(tmp_path: Path) -> None:
+    repo = make_repo("messy-docs", tmp_path)
+    write_plan(repo, MESSY_PLAN, [s for s in MESSY_SOURCES if s != "RELEASING.md"])
+    code, report = docstool_json(repo, "plan", "validate")
+    assert code == 1
+    inbound = [f for f in report["findings"] if f["check"] == "plan-inbound"]
+    assert [(f["file"], f["line"]) for f in inbound] == [("RELEASING.md", 3)]
+    assert docstool_json(repo, "plan", "apply")[0] == 1  # refused: validate fails
+    # declared: bound to the approval, so editing it afterwards makes the plan stale
+    write_plan(repo, MESSY_PLAN, MESSY_SOURCES)
+    assert docstool_json(repo, "plan", "validate")[0] == 0
+    releasing = repo / "RELEASING.md"
+    releasing.write_text(releasing.read_text(encoding="utf-8") + "\nmore\n", encoding="utf-8")
+    code, report = docstool_json(repo, "plan", "validate")
+    assert ("plan-stale", "RELEASING.md") in {(f["check"], f["file"]) for f in report["findings"]}
