@@ -4113,6 +4113,8 @@ def project_binaries(repo: Repo) -> dict[str, str]:
     """The project's own executables: name -> language."""
     binaries: dict[str, str] = {}
     for rel in repo.files:
+        if _is_test_path(rel):
+            continue  # a test fixture's manifest is not the project's binary, and its flags are never scanned
         name = PurePosixPath(rel).name
         if name == "Cargo.toml":
             text, _ = repo.text(rel)
