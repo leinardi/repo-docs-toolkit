@@ -3607,9 +3607,13 @@ def _lock_pins(repo: Repo) -> dict[str, str]:
         pin = re.search(r"^zensical==([\w.]+)", text, re.MULTILINE)
         if pin and "--hash=" in text:
             pins[rel] = pin.group(1)
-        uv = re.search(r'name = "zensical"\nversion = "([\w.]+)"', text)
-        if uv:
-            pins[rel] = uv.group(1)
+        if name == "uv.lock":
+            # A [[package]] block counts only when it comes from a registry with sha256 hashes: a git,
+            # path or editable source pins nothing that uv can check.
+            for block in re.split(r"^\[\[package\]\]$", text, flags=re.MULTILINE)[1:]:
+                uv = re.match(r'\s*name = "zensical"\nversion = "([\w.]+)"', block)
+                if uv and re.search(r"^source = \{ registry = ", block, re.MULTILINE) and 'hash = "sha256:' in block:
+                    pins[rel] = uv.group(1)
     return pins
 
 
@@ -3781,11 +3785,16 @@ def cmd_site_audit(args: argparse.Namespace, report: Report) -> list[str]:
                 path,
                 number,
                 f"zensical is required as '{spec}' but no committed hash-pinned lock pins it",
-                suggestion=f"pin zensical=={KNOWN_ZENSICAL} there, compile a --generate-hashes lock and commit it (an ignored lock pins nothing)",
+                suggestion=f"pin zensical=={KNOWN_ZENSICAL} there and commit its lock: uv lock for a uv project, a --generate-hashes compile for a requirements file (an ignored lock pins nothing)",
             )
         )
     elif not pins:
-        add("lock", "P2", "no hash-pinned lock pins zensical", suggestion="add zensical-requirements.in and a pip-compile --generate-hashes lock")
+        add(
+            "lock",
+            "P2",
+            "no hash-pinned lock pins zensical",
+            suggestion=f"add a uv project, tools/docs/pyproject.toml with zensical=={KNOWN_ZENSICAL}, and commit its uv.lock",
+        )
     for path, version in pins.items():
         if version != KNOWN_ZENSICAL:
             report.add(
@@ -4967,7 +4976,10 @@ def _base_drift(
 
 STAMP_NAME = ".docstool-build.json"
 GENERATOR_HINTS = {
-    "zensical": f"install it from the repository's hashed lock, or pip install zensical=={KNOWN_ZENSICAL}",
+    "zensical": (
+        "run docstool through the repository's docs uv project (uv run --project tools/docs --locked python3 -I docstool.py ...), "
+        f"install it from the repository's hashed lock, or pip install zensical=={KNOWN_ZENSICAL}"
+    ),
     "mkdocs": "pip install mkdocs and the theme and plugins mkdocs.yml names",
 }
 # Plugins whose inputs docstool knows: none beyond the pages, or the ones it adds below.

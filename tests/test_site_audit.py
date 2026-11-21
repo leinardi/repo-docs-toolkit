@@ -57,6 +57,36 @@ def test_the_clean_site_only_lacks_a_lock_and_ci(tmp_path: Path) -> None:
     assert code == 0, report["findings"]
 
 
+def test_a_uv_project_lock_pins_zensical(tmp_path: Path) -> None:
+    repo = make_repo("clean", tmp_path)
+    docs = repo / "tools" / "docs"
+    docs.mkdir(parents=True)
+    (docs / "pyproject.toml").write_text('[project]\nname = "docs"\nversion = "0"\ndependencies = ["zensical==0.1.3"]\n', encoding="utf-8")
+    lock = (
+        '[[package]]\nname = "zensical"\nversion = "{}"\nsource = {{ registry = "https://pypi.org/simple" }}\n'
+        'wheels = [\n    {{ url = "https://files.pythonhosted.org/z.whl", hash = "sha256:00" }},\n]\n'
+    )
+    (docs / "uv.lock").write_text(lock.format("0.1.3"), encoding="utf-8")
+    (repo / ".github" / "workflows").mkdir(parents=True)
+    (repo / ".github" / "workflows" / "docs.yaml").write_text(
+        "jobs:\n  b:\n    steps:\n      - run: uv run --project tools/docs --locked zensical build --strict --clean\n", encoding="utf-8"
+    )
+    code, report = docstool_json(repo, "site-audit")
+    assert code == 0, report["findings"]
+    assert report["data"]["locks"] == {"tools/docs/uv.lock": "0.1.3"}
+    # another version in the lock is reported against the one docstool was checked with
+    (docs / "uv.lock").write_text(lock.format("0.2.0"), encoding="utf-8")
+    _, report = docstool_json(repo, "site-audit")
+    assert [(f["check"], f["file"]) for f in report["findings"]] == [("zensical-version", "tools/docs/uv.lock")]
+    # a git source carries no hashes: nothing is pinned, and the requirement is reported instead
+    (docs / "uv.lock").write_text(
+        '[[package]]\nname = "zensical"\nversion = "0.1.3"\nsource = { git = "https://github.com/zensical/zensical" }\n', encoding="utf-8"
+    )
+    _, report = docstool_json(repo, "site-audit")
+    assert report["data"]["locks"] == {}
+    assert "lock" in {f["check"] for f in report["findings"]}
+
+
 def test_dotted_pymdownx_keys_are_hoisted(tmp_path: Path) -> None:
     repo = make_repo("zensical-site", tmp_path)
     config = repo / "zensical.toml"
