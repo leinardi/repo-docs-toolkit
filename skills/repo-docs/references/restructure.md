@@ -142,9 +142,23 @@ it get an approved `[[delete]]` entry, which validate accepts once every block o
 exists in the target),
 rewrite pages that need it, rename headings named by `anchor` entries, update the nav, and add
 anything the report promised. Record every block you reword or drop on purpose in
-`mappings.toml` as you go. The link rewrites apply made need no mapping. Apply rewrites link
-targets, not link text: fix link texts that spell an old path (a mapping, since the text
-changed).
+`mappings.toml` as you go. The link rewrites and the `reference` edits apply made need no
+mapping. Apply rewrites link targets, not link text: fix link texts that spell an old path (a
+mapping, since the text changed).
+
+Three fixes almost every restructure needs after apply:
+
+- **Published pages that link to a page now in `internal/`.** `check` reports them as
+  `links-unpublished`; a strict build fails on them. Re-point each one to the file on GitHub
+  (`https://github.com/<owner>/<repo>/blob/<branch>/docs/internal/...`). Only the link
+  destination changes, so no mapping is needed.
+- **Lines apply made longer.** Rewritten paths and `reference` edits can push a line past the
+  repository's wrap width (`house_style.wrap_p95`, the markdownlint `line_length`). Rewrap
+  those paragraphs and list items; whitespace changes need no mapping. A line that holds only an
+  unbreakable URL may stay long.
+- **README content moved into the docs** (repo-readme, gate R4). The README is in the baseline,
+  so what leaves it needs a `rewritten` mapping to its new page, even when the text is unchanged:
+  the mapping is what tells verify that a warning moved there on purpose.
 
 A `reference` line that also carries an older broken citation (a heading that no longer exists)
 keeps it: report it, and fix it only with the owner's agreement.
@@ -242,7 +256,9 @@ blocks = ["<hash>"]
 proof = "exact duplicate of docs/guide/release.md:5"
 ```
 
-A `dropped` mapping needs a `proof`. `plan approve --mappings` prints each mapping's before text and
+`heading` is optional: leave it out when the destination has no Markdown heading for the block
+(a README whose title is an HTML `<h1>`); the whole file is then the destination. A `dropped`
+mapping needs a `proof`. `plan approve --mappings` prints each mapping's before text and
 writes a receipt binding the mapping, its baseline blocks and the destination blocks as they are
 now. Editing any of them afterwards invalidates that receipt, and `plan verify` fails until it is
 reviewed again. Mappings never touch the plan's own approval.
