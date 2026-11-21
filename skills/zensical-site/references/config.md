@@ -69,6 +69,11 @@ Zensical also skips dotfiles, dot-directories and a top-level `templates/` direc
 
   Every row must say `ok`: accent text on both backgrounds, white text on the accent button,
   and the accent against the slate page. Choosing a colour when the project has none is gate Z3.
+- `logo` and `favicon` under `[project.theme]` take paths relative to `docs/`. Without them the
+  header shows the theme's book icon. A GNOME app's symbolic icon (`data/icons/*-symbolic.svg`,
+  one grey fill) reads on both schemes; copy it into `docs/assets/`, since the site cannot serve
+  files outside `docs/`. The full-colour icon belongs in the landing hero (`home.logo`).
+  Checked on 0.1.3: the build writes `<link rel="icon">` and the header `<img>` from them.
 - Fonts load from Google Fonts by default (the built page links `fonts.googleapis.com`).
   `font = false` under `[project.theme]` uses the reader's system fonts instead; offer it when
   the project cares about third-party requests.

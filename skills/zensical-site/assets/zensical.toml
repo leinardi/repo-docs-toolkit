@@ -23,6 +23,9 @@ extra_css = ["stylesheets/home.css", "stylesheets/brand.css"]
 
 [project.theme]
 custom_dir = "overrides"  # holds home.html, the landing page template
+# The header icon and the favicon, relative to docs/; without them the header shows a book icon.
+# logo = "assets/logo.svg"
+# favicon = "assets/logo.svg"
 features = [
   "content.code.copy",
   "content.tabs.link",
