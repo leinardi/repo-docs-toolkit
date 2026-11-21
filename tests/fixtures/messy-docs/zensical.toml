@@ -1,0 +1,10 @@
+[project]
+site_name = "Messy"
+site_url = "https://example.org/messy/"
+exclude_docs = """
+internal/
+"""
+
+[project.markdown_extensions.attr_list]
+[project.markdown_extensions.toc]
+slugify = { object = "pymdownx.slugs.slugify", kwds = { case = "lower" } }

@@ -1,0 +1,32 @@
+site_name: Legacy
+site_url: https://example.org/legacy/
+repo_url: https://github.com/example/legacy
+theme:
+  name: material
+  features:
+    - search.suggest
+    - navigation.tabs
+hooks:
+  - hooks/build.py
+plugins:
+  - search
+  - gen-files:
+      scripts:
+        - gen_pages.py
+  - redirects:
+      redirect_maps:
+        old.md: guide.md
+markdown_extensions:
+  - admonition
+  - toc:
+      permalink: true
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+extra:
+  analytics:
+    property: !ENV GOOGLE_ANALYTICS_KEY
+nav:
+  - Home: index.md
+  - Guide: guide.md
+  - Missing: missing.md

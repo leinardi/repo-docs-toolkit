@@ -1,0 +1,7 @@
+[project]
+site_name = "rcli"
+site_url = "https://example.org/rcli/"
+repo_url = "https://github.com/example/rcli"
+
+[project.markdown_extensions.toc]
+slugify = { object = "pymdownx.slugs.slugify", kwds = { case = "lower" } }

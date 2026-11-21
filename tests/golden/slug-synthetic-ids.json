@@ -1,0 +1,51 @@
+{
+ "source": "gh api /markdown mode=markdown on slug-synthetic.md, 2026-11-21; zensical 0.1.3 with pymdownx.slugs.slugify(case=lower)",
+ "headings": [
+  "Héllo Wörld & Friends!",
+  "Héllo Wörld & Friends!",
+  "Emoji 🚀 heading",
+  "🚀 Installation",
+  "C++ / Rust: `code` *em*",
+  "Section 2.1 — The \"Quote\"",
+  "snake_case_name",
+  "--flag-name",
+  "Ünïcödé 日本語 Привет",
+  "A.B.C",
+  "Trailing space  ",
+  "x-1",
+  "x",
+  "x"
+ ],
+ "github": [
+  "héllo-wörld--friends",
+  "héllo-wörld--friends-1",
+  "emoji--heading",
+  "-installation",
+  "c--rust-code-em",
+  "section-21--the-quote",
+  "snake_case_name",
+  "--flag-name",
+  "ünïcödé-日本語-привет",
+  "abc",
+  "trailing-space",
+  "x-1",
+  "x",
+  "x-2"
+ ],
+ "zensical": [
+  "héllo-wörld--friends",
+  "héllo-wörld--friends_1",
+  "emoji--heading",
+  "-installation",
+  "c--rust-code-em",
+  "section-21--the-quote",
+  "snake_case_name",
+  "--flag-name",
+  "ünïcödé-日本語-привет",
+  "abc",
+  "trailing-space",
+  "x-1",
+  "x",
+  "x_1"
+ ]
+}
