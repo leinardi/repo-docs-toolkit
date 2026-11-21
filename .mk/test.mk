@@ -62,6 +62,14 @@ endif
 test-zensical: ## Run the tests that need the pinned Zensical (install zensical-requirements.txt first)
 	@DOCSTOOL_REQUIRE_ZENSICAL=1 $(PYTHON) -m pytest -m zensical
 
+.PHONY: test-landing
+test-landing: ## Build the landing examples strict and check their HTML (needs the pinned Zensical)
+	@DOCSTOOL_REQUIRE_ZENSICAL=1 $(PYTHON) -m pytest -m zensical $(REPO_ROOT)/tests/test_landing_build.py
+
+.PHONY: test-a11y
+test-a11y: ## Run the landing page accessibility tests (needs Zensical and requirements/a11y.txt)
+	@DOCSTOOL_REQUIRE_ZENSICAL=1 DOCSTOOL_REQUIRE_A11Y=1 $(PYTHON) -m pytest -m a11y
+
 .PHONY: sync-vendored
 sync-vendored: ## Copy skills/repo-docs/scripts/docstool.py into the other skills
 	@$(PYTHON) -I $(REPO_ROOT)/scripts/sync-vendored.py

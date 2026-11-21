@@ -161,7 +161,8 @@ def test_no_symlinks_in_a_skill(skill: Path) -> None:
 @pytest.mark.parametrize("skill", SKILLS, ids=lambda p: p.name)
 def test_relative_links_resolve(skill: Path) -> None:
     for md in skill.rglob("*.md"):
-        for target in LINK_RE.findall(md.read_text(encoding="utf-8")):
+        # A link inside a fenced block is an example for the reader to adapt, not a link.
+        for target in LINK_RE.findall(FENCE_RE.sub("", md.read_text(encoding="utf-8"))):
             if "://" in target or target.startswith("mailto:"):
                 continue
             assert (md.parent / target).exists(), f"{md.relative_to(SKILLS_DIR)} links to missing {target}"

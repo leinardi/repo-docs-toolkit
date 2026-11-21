@@ -36,6 +36,8 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SKILLS_DIR = REPO_ROOT / "skills"
 DOCSTOOL = SKILLS_DIR / "repo-docs" / "scripts" / "docstool.py"
@@ -95,3 +97,37 @@ def docstool_json(repo: Path, *args: str) -> tuple[int, dict[str, Any]]:
 def docstool_code(repo: Path, *args: str) -> int:
     """Run docstool in repo and return only its exit code (for runs that end in a usage error)."""
     return run_script(DOCSTOOL, *args, "--root", str(repo), "--format", "json").returncode
+
+
+ZENSICAL_SITE = SKILLS_DIR / "zensical-site"
+LANDING_EXAMPLES = ("cli", "gtk-app", "library")
+
+
+def require_or_skip(available: bool, what: str, env: str) -> None:
+    """Skip a test whose tool is missing, or fail it when CI sets env to demand the tool."""
+    if available:
+        return
+    if os.environ.get(env):
+        pytest.fail(f"{what} is not installed but {env} is set")
+    pytest.skip(f"{what} is not installed")
+
+
+def build_landing_example(name: str, dest: Path) -> Path:
+    """Build a landing example the way the skill tells a project to: the example's own files, plus
+    the shipped overrides/home.html and stylesheets/home.css copied in unchanged. Returns the site."""
+    shutil.copytree(ZENSICAL_SITE / "assets" / "landing-examples" / name, dest)
+    shutil.copytree(ZENSICAL_SITE / "assets" / "overrides", dest / "overrides")
+    shutil.copy2(ZENSICAL_SITE / "assets" / "stylesheets" / "home.css", dest / "docs" / "stylesheets" / "home.css")
+    zensical = shutil.which("zensical")
+    assert zensical is not None
+    result = subprocess.run([zensical, "build", "--strict", "--clean"], cwd=dest, capture_output=True, text=True, check=False)
+    assert result.returncode == 0, result.stdout + result.stderr
+    return dest / "site"
+
+
+@pytest.fixture(scope="session")
+def landing_sites(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Path]:
+    """Every landing example, built once per session with the installed Zensical."""
+    require_or_skip(shutil.which("zensical") is not None, "zensical", "DOCSTOOL_REQUIRE_ZENSICAL")
+    root = tmp_path_factory.mktemp("landing")
+    return {name: build_landing_example(name, root / name) for name in LANDING_EXAMPLES}

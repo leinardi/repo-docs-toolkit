@@ -1,6 +1,6 @@
 name: CI
 
-# The authoritative checks (pre-commit-all, test, zensical, plugin-validate) run on every pull request, every
+# The authoritative checks (pre-commit-all, test, zensical, a11y, plugin-validate) run on every pull request, every
 # push to main, every dispatch and every weekly scheduled run. The reviewdog jobs only annotate pull
 # requests. ci-result is the one job that stands for all of them.
 on:
@@ -131,6 +131,39 @@ jobs:
         env:
           DOCSTOOL_REQUIRE_ZENSICAL: "1"
         run: python -m pytest -m zensical
+
+  # The landing page accessibility tests (tests/a11y): the examples built with the pinned Zensical,
+  # then contrast, keyboard, reduced motion, no-JavaScript and phone-width checks in Chromium, from
+  # Playwright's hash-pinned lock. DOCSTOOL_REQUIRE_A11Y turns a missing Playwright into a failure.
+  a11y:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.11"
+
+      - name: Install Zensical, Playwright and the test dependencies
+        run: |
+          python -m pip install --disable-pip-version-check --require-hashes -r zensical-requirements.txt
+          python -m pip install --disable-pip-version-check --require-hashes -r requirements/a11y.txt
+          python -m pip install --disable-pip-version-check -r requirements-dev.txt
+
+      - name: Install Chromium and its system libraries
+        run: python -m playwright install --with-deps chromium
+
+      - name: Run the accessibility tests
+        env:
+          DOCSTOOL_REQUIRE_ZENSICAL: "1"
+          DOCSTOOL_REQUIRE_A11Y: "1"
+        run: python -m pytest -m a11y
 
   # Claude Code's own manifest and skill checks. The validator needs no login (it ran with an empty
   # HOME in the P0 spike). The CLI is pinned to the release the manifests were last checked with;
@@ -397,6 +430,7 @@ jobs:
       - pre-commit-all
       - test
       - zensical
+      - a11y
       - plugin-validate
       - conventional-commits
     runs-on: ubuntu-latest

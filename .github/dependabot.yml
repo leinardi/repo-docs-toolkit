@@ -52,3 +52,12 @@ updates:
     ignore:
       - dependency-name: "zensical"
       - dependency-name: "zensical-ui"
+
+  # requirements/a11y.txt: Playwright for the landing page accessibility tests (dev-only).
+  - package-ecosystem: "pip"
+    directory: "/requirements"
+    multi-ecosystem-group: "dev-tools"
+    patterns: ["*"]
+    labels: ["dependencies", "ci"]
+    cooldown:
+      default-days: 7

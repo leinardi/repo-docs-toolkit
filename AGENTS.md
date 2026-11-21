@@ -80,6 +80,7 @@ Run before considering an edit done. `make check` applies to every row.
 | --- | --- |
 | `skills/repo-docs/scripts/docstool.py` | `make sync-vendored`, `make test` |
 | `skills/**` guidance or references | `make test` (skill lint); verify every tool claim you touched (rule 1) |
+| `skills/zensical-site/assets/**` (config template, landing page, examples) | `make test-landing` and `make test-a11y` (need `zensical-requirements.txt` and `requirements/a11y.txt`); screenshots at 1440, 768 and 390 px in both schemes for a layout change |
 | `.claude-plugin/**`, `skills/*/SKILL.md` frontmatter | `make validate-plugin`, `make test` |
 | `tests/**`, `scripts/**`, `.mk/**` | `make test`; for the bump, `make release-bump VERSION=<higher>` shows a one-line diff (then restore the file) |
 | `.github/workflows/**`, `.github/dependabot.yml` | `pre-commit run actionlint --all-files`; reason through each trigger the workflow has |
