@@ -1,0 +1,18 @@
+[project]
+site_name = "Lab"
+nav = [
+  { "Home" = "index.md" },
+  { "Guide" = "guide.md" },
+]
+
+[project.theme]
+features = ["navigation.indexes", "toc.integrate", "search.suggest", "content.code.copy"]
+
+[project.plugins.redirects.redirect_maps]
+"old.md" = "guide.md"
+"guide.md#old-anchor" = "guide.md#setup"
+
+[project.markdown_extensions]
+admonition = {}
+toc.permalink = true
+pymdownx.superfences = {}

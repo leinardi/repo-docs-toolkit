@@ -70,9 +70,9 @@ def run_script(path: Path, *args: str, cwd: Path | None = None) -> subprocess.Co
     return subprocess.run([sys.executable, "-I", str(path), *args], capture_output=True, text=True, check=False, cwd=cwd)
 
 
-def git(repo: Path, *args: str) -> str:
-    env = {**os.environ, **GIT_ENV}
-    return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, check=True, env=env).stdout
+def git(repo: Path, *args: str, env: dict[str, str] | None = None) -> str:
+    merged = {**os.environ, **GIT_ENV, **(env or {})}
+    return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, check=True, env=merged).stdout
 
 
 def make_repo(fixture: str, tmp_path: Path) -> Path:
@@ -90,3 +90,8 @@ def docstool_json(repo: Path, *args: str) -> tuple[int, dict[str, Any]]:
     result = run_script(DOCSTOOL, *args, "--root", str(repo), "--format", "json")
     assert result.stdout, result.stderr
     return result.returncode, json.loads(result.stdout)
+
+
+def docstool_code(repo: Path, *args: str) -> int:
+    """Run docstool in repo and return only its exit code (for runs that end in a usage error)."""
+    return run_script(DOCSTOOL, *args, "--root", str(repo), "--format", "json").returncode

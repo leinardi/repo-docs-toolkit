@@ -24,8 +24,10 @@ ignore = [
 # `python3 -I <skill-dir>/scripts/docstool.py` (isolated mode, named in every SKILL.md), so it is not executable.
 # docstool is one stdlib file by design (each skill vendors it). Its Markdown scanner and YAML
 # reader are state machines whose branches mirror the grammar, so the size rules are off there;
-# RUF001: the citation patterns match typographic quote marks on purpose.
-"skills/*/scripts/docstool.py" = ["EXE001", "PLR0911", "PLR0912", "PLR0915", "RUF001"]
+# RUF001: the citation patterns match typographic quote marks on purpose. PLR0913/PLR0917: the
+# checks pass the repository, the site and the finding sink explicitly rather than through globals.
+# PLR2004: the WCAG constants (0.04045, 12.92, ...) are the formula, not magic numbers.
+"skills/*/scripts/docstool.py" = ["EXE001", "PLR0911", "PLR0912", "PLR0913", "PLR0915", "PLR0917", "PLR2004", "RUF001"]
 # Tests use bare asserts and literal values by design.
 "tests/**" = ["PLR2004", "S101"]
 

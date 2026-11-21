@@ -1,0 +1,705 @@
+"""docstool plan: validate, approve, apply, recovery and content conservation."""
+
+#
+# MIT License
+#
+# Copyright (c) 2026 Roberto Leinardi
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+#
+
+from __future__ import annotations
+
+import hashlib
+import json
+import subprocess
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
+
+import pytest
+from conftest import DOCSTOOL, GIT_ENV, docstool_code, docstool_json, git, load_module, make_repo
+
+ART = "docs/internal/restructure"
+
+
+def sha(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def snapshot(repo: Path) -> dict[str, str]:
+    """Every file outside .git and the restructure artifacts, with its hash."""
+    return {
+        p.relative_to(repo).as_posix(): sha(p)
+        for p in sorted(repo.rglob("*"))
+        if p.is_file() and ".git" not in p.relative_to(repo).parts and not p.relative_to(repo).as_posix().startswith(ART)
+    }
+
+
+def directories(repo: Path) -> set[str]:
+    """Every directory outside .git and the restructure artifacts: a rollback removes the ones it made."""
+    return {
+        p.relative_to(repo).as_posix()
+        for p in repo.rglob("*")
+        if p.is_dir() and ".git" not in p.relative_to(repo).parts and not p.relative_to(repo).as_posix().startswith(ART)
+    }
+
+
+def head(repo: Path) -> str:
+    return subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True, check=True, env=GIT_ENV).stdout.strip()
+
+
+def toml_value(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, list):
+        return "[" + ", ".join(toml_value(v) for v in value) + "]"
+    return json.dumps(value)
+
+
+def write_plan(repo: Path, entries: dict[str, list[dict[str, Any]]], sources: list[str] | None = None, meta: dict[str, Any] | None = None) -> Path:
+    """A plan.toml whose [meta.sources] hashes the given files as they are now."""
+    blocks = repo / ART / "blocks.json"
+    blocks.parent.mkdir(parents=True, exist_ok=True)
+    if not blocks.exists():
+        code, _ = docstool_json(repo, "inventory", "--blocks", str(blocks))
+        assert code in (0, 1, 3), code
+    hashed = sorted({*(sources or []), f"{ART}/blocks.json", "zensical.toml"})
+    fields: dict[str, Any] = {
+        "schema": 1,
+        "base_commit": head(repo),
+        "docs_dir": "docs",
+        "site_config": "zensical.toml",
+        "blocks": f"{ART}/blocks.json",
+    }
+    fields.update(meta or {})
+    if fields["site_config"] != "zensical.toml":
+        hashed = sorted({*hashed, str(fields["site_config"])} - {"zensical.toml"})
+    lines = ["[meta]"] + [f"{key} = {toml_value(value)}" for key, value in fields.items()]
+    lines.append("")
+    lines.append("[meta.sources]")
+    lines += [f'"{rel}" = "{sha(repo / rel)}"' for rel in hashed if (repo / rel).is_file()]
+    for kind, items in entries.items():
+        for item in items:
+            lines += ["", f"[[{kind}]]"]
+            lines += [f"{k} = {toml_value(v)}" for k, v in item.items()]
+    path = repo / ART / "plan.toml"
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
+MESSY_PLAN: dict[str, list[dict[str, Any]]] = {
+    "archive": [
+        {
+            "from": "docs/roadmap.md",
+            "to": "docs/internal/archive/roadmap.md",
+            "status": "Finished in October 2026; kept as written.",
+            "redirect_to": "docs/protocol.md",
+        }
+    ],
+    "move": [{"from": "docs/release.md", "to": "docs/guide/release.md"}],
+    "reference": [{"file": "src/device.rs", "line": 3, "old": "docs/release.md", "new": "docs/guide/release.md"}],
+    "keep": [{"paths": ["docs/protocol.md", "docs/internal/"]}],
+}
+MESSY_SOURCES = ["docs/roadmap.md", "docs/release.md", "src/device.rs"]
+
+
+def messy(tmp_path: Path) -> Path:
+    repo = make_repo("messy-docs", tmp_path)
+    write_plan(repo, MESSY_PLAN, MESSY_SOURCES)
+    return repo
+
+
+def approve(repo: Path) -> None:
+    code, report = docstool_json(repo, "plan", "approve", "--by", "Owner")
+    assert code == 0, report["findings"]
+
+
+def broken(repo: Path) -> set[tuple[str, str]]:
+    _, report = docstool_json(repo, "check")
+    return {(f["check"], f["message"]) for f in report["findings"] if f["check"].startswith("broken")}
+
+
+def test_plan_round_trip_on_messy_docs(tmp_path: Path) -> None:
+    repo = messy(tmp_path)
+    planted = broken(repo)
+    code, report = docstool_json(repo, "plan", "validate")
+    assert code == 0, report["findings"]
+    assert report["data"]["approval"] == "missing"
+    code, report = docstool_json(repo, "plan", "apply")
+    assert code == 0
+    assert "dry run" in report["data"]["state"]
+    assert {op["path"] for op in report["data"]["operations"]} >= {
+        "docs/roadmap.md",
+        "docs/guide/release.md",
+        "RELEASING.md",
+        "zensical.toml",
+        "src/device.rs",
+    }
+    before = snapshot(repo)
+    assert snapshot(repo) == before
+    approve(repo)
+    code, report = docstool_json(repo, "plan", "apply", "--write")
+    assert code == 0, report["findings"]
+    assert not (repo / "docs/release.md").exists()
+    assert (repo / "docs/guide/release.md").read_text(encoding="utf-8").count("](../internal/notes.md)") == 1
+    assert "docs/guide/release.md" in (repo / "RELEASING.md").read_text(encoding="utf-8")
+    assert "docs/guide/release.md" in (repo / "src/device.rs").read_text(encoding="utf-8").split("\n")[2]
+    archived = (repo / "docs/internal/archive/roadmap.md").read_text(encoding="utf-8")
+    assert "> **Status:** Finished in October 2026; kept as written." in archived
+    config = (repo / "zensical.toml").read_text(encoding="utf-8")
+    assert '"roadmap.md" = "protocol.md"' in config
+    assert '"release.md" = "guide/release.md"' in config
+    assert not any((repo / ART / name).exists() for name in (".apply-journal.json", ".staging", ".backups"))
+    assert (repo / ART / "apply-log.json").is_file()
+    code, report = docstool_json(repo, "plan", "verify")
+    assert code == 0, report["findings"]
+    assert report["data"]["conservation"]["unaccounted"] == 0
+    assert broken(repo) == planted
+    code, report = docstool_json(repo, "plan", "apply", "--write")
+    assert code == 0
+    assert report["data"]["state"] == "already applied, nothing to do"
+
+
+def test_mixed_state_refuses_with_each_paths_state(tmp_path: Path) -> None:
+    repo = messy(tmp_path)
+    approve(repo)
+    assert docstool_json(repo, "plan", "apply", "--write")[0] == 0
+    git(repo, "show", "HEAD:RELEASING.md")
+    original = subprocess.run(["git", "-C", str(repo), "show", "HEAD:RELEASING.md"], capture_output=True, check=True, env=GIT_ENV).stdout
+    (repo / "RELEASING.md").write_bytes(original)
+    code, report = docstool_json(repo, "plan", "apply", "--write")
+    assert code == 1
+    states = {f["file"]: f["message"] for f in report["findings"] if f["check"] == "plan-mixed"}
+    assert "pre-image" in states["RELEASING.md"]
+    assert "post-image" in states["docs/guide/release.md"]
+
+
+def test_the_shipped_example_plan_validates(tmp_path: Path) -> None:
+    example = Path(DOCSTOOL).parents[1] / "assets" / "restructure-plan.example.toml"
+    if not example.exists():
+        pytest.skip("the example plan ships with the skill text (P4)")
+
+
+@pytest.mark.parametrize(
+    ("mutate", "check"),
+    [
+        (lambda repo: (repo / "docs/release.md").write_text("# Release\n\nchanged\n", encoding="utf-8"), "plan-stale"),
+        (
+            lambda repo: (repo / ART / "plan.toml").write_text(
+                (repo / ART / "plan.toml").read_text(encoding="utf-8").replace("kept as written", "kept"), encoding="utf-8"
+            ),
+            "plan-approval",
+        ),
+    ],
+)
+def test_stale_input_and_edited_plan_refuse(tmp_path: Path, mutate: Callable[[Path], None], check: str) -> None:
+    repo = messy(tmp_path)
+    approve(repo)
+    mutate(repo)
+    before = snapshot(repo)
+    code, report = docstool_json(repo, "plan", "apply", "--write")
+    assert code == 1
+    assert check in {f["check"] for f in report["findings"]}
+    assert snapshot(repo) == before
+
+
+def test_head_not_descending_from_base_refuses(tmp_path: Path) -> None:
+    repo = make_repo("messy-docs", tmp_path)
+    git(repo, "checkout", "-q", "-b", "other")
+    (repo / "x.txt").write_text("x\n", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "other")
+    write_plan(repo, MESSY_PLAN, MESSY_SOURCES)
+    git(repo, "checkout", "-q", "main")
+    git(repo, "commit", "-q", "--allow-empty", "-m", "diverge")
+    code, report = docstool_json(repo, "plan", "validate")
+    assert code == 1
+    assert "plan-base" in {f["check"] for f in report["findings"]}
+
+
+@pytest.mark.parametrize(
+    ("entry", "check"),
+    [
+        ({"move": [{"from": "docs/release.md", "to": "docs/../release.md"}]}, "plan-path"),
+        ({"move": [{"from": "docs/release.md", "to": "/tmp/release.md"}]}, "plan-path"),
+        ({"move": [{"from": "docs/release.md", "to": "docs/linked/release.md"}]}, "plan-path"),
+        ({"move": [{"from": "docs/release.md", "to": "docs/Protocol.md"}]}, "plan-collision"),
+        ({"move": [{"from": "docs/release.md", "to": "docs/protocol.md"}]}, "plan-collision"),
+        ({"move": [{"from": "docs/release.md", "to": "src/release.md"}]}, "plan-path"),
+        ({"move": [{"from": "docs/protocol.md", "to": "docs/guide/protocol.md"}]}, "plan-frozen"),
+        ({"delete": [{"path": "docs/release.md", "approved": True, "proof": "duplicate"}]}, "plan-delete"),
+        ({"decision": [{"id": "D1", "question": "Publish the notes?", "answer": ""}]}, "plan-decision"),
+    ],
+)
+def test_validate_rules_refuse(tmp_path: Path, entry: dict[str, list[dict[str, Any]]], check: str) -> None:
+    repo = make_repo("messy-docs", tmp_path)
+    (repo / "elsewhere").mkdir()
+    (repo / "docs" / "linked").symlink_to("../elsewhere")
+    entries = {"keep": [{"paths": ["docs/"]}], **entry}
+    write_plan(repo, entries, ["docs/release.md", "docs/protocol.md"])
+    code, report = docstool_json(repo, "plan", "validate")
+    assert code == 1
+    assert check in {f["check"] for f in report["findings"]}, report["findings"]
+    assert not (repo / "elsewhere" / "release.md").exists()
+
+
+def test_uncovered_doc_and_missing_reference_are_reported(tmp_path: Path) -> None:
+    repo = make_repo("messy-docs", tmp_path)
+    write_plan(repo, {"move": [{"from": "docs/release.md", "to": "docs/guide/release.md"}]}, ["docs/release.md"])
+    _, report = docstool_json(repo, "plan", "validate")
+    found = {(f["check"], f["file"]) for f in report["findings"]}
+    assert ("plan-uncovered", "docs/plan.toml") not in found
+    assert any(c == "plan-uncovered" for c, _ in found)
+    assert ("plan-frozen", "src/device.rs") in found
+
+
+def test_dirty_touched_file_refuses(tmp_path: Path) -> None:
+    repo = messy(tmp_path)
+    approve(repo)
+    (repo / "RELEASING.md").write_text((repo / "RELEASING.md").read_text(encoding="utf-8") + "\nlocal edit\n", encoding="utf-8")
+    code, report = docstool_json(repo, "plan", "apply", "--write")
+    assert code == 1
+    assert {f["check"] for f in report["findings"]} & {"plan-dirty", "plan-stale"}
+    assert (repo / "docs/release.md").exists()
+
+
+def test_redirects_reparse_and_unapproved_apply_refuses(tmp_path: Path) -> None:
+    repo = messy(tmp_path)
+    code, report = docstool_json(repo, "plan", "apply", "--write")
+    assert code == 1
+    assert "plan-approval" in {f["check"] for f in report["findings"]}
+    assert (repo / "docs/release.md").exists()
+
+
+def _run_main(module: Any, repo: Path, *args: str) -> int:
+    return int(module.main([*args, "--root", str(repo), "--format", "json"]))
+
+
+def _post_state(tmp_path: Path) -> dict[str, str]:
+    reference = messy(tmp_path / "reference")
+    approve(reference)
+    assert docstool_json(reference, "plan", "apply", "--write")[0] == 0
+    return snapshot(reference)
+
+
+def _count_ops(repo: Path) -> int:
+    _, report = docstool_json(repo, "plan", "apply")
+    return len(report["data"]["operations"])
+
+
+def test_failure_at_every_operation_rolls_back(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    probe = messy(tmp_path / "probe")
+    total = _count_ops(probe)
+    assert total >= 5
+    for k in range(total):
+        repo = messy(tmp_path / f"k{k}")
+        approve(repo)
+        before, dirs_before = snapshot(repo), directories(repo)
+        module = load_module(f"docstool_fail_{k}", DOCSTOOL)
+        state = {"n": 0, "k": k, "real": module._apply_one}
+
+        def failing(root: Any, art: Any, index: int, entry: Any, state: dict[str, Any] = state) -> None:
+            # the k-th operation's write, rename or unlink fails
+            if state["n"] == state["k"]:
+                raise OSError("injected failure")
+            state["n"] += 1
+            state["real"](root, art, index, entry)
+
+        monkeypatch.setattr(module, "_apply_one", failing)
+        code = _run_main(module, repo, "plan", "apply", "--write")
+        monkeypatch.undo()
+        capsys.readouterr()
+        assert code == 2
+        assert snapshot(repo) == before, k
+        assert directories(repo) == dirs_before, k
+        assert not (repo / ART / ".apply-journal.json").exists()
+
+
+def test_failure_after_a_change_rolls_it_back(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    repo = messy(tmp_path)
+    approve(repo)
+    before = snapshot(repo)
+    module = load_module("docstool_journal_fail", DOCSTOOL)
+    real = module._write_journal
+    calls = {"n": 0}
+
+    def failing(art: Any, journal: Any) -> None:
+        calls["n"] += 1
+        if calls["n"] == 3:  # the plan, op 0 done, then op 1 done fails after op 1 changed the tree
+            raise OSError("disk full")
+        real(art, journal)
+
+    monkeypatch.setattr(module, "_write_journal", failing)
+    assert _run_main(module, repo, "plan", "apply", "--write") == 2
+    capsys.readouterr()
+    assert snapshot(repo) == before
+    assert not any((repo / ART / n).exists() for n in (".apply-journal.json", ".staging", ".backups"))
+
+
+class Crash(BaseException):
+    pass
+
+
+@pytest.mark.parametrize("point", ["before-change", "after-change", "after-done"])
+def test_crash_points_resume_and_rollback(tmp_path: Path, point: str, capsys: pytest.CaptureFixture[str]) -> None:
+    post = _post_state(tmp_path)
+    total = _count_ops(messy(tmp_path / "probe"))
+    for k in range(total):
+        for recovery in ("resume", "rollback"):
+            repo = messy(tmp_path / f"{point}-{k}-{recovery}")
+            approve(repo)
+            before = snapshot(repo)
+            module = load_module(f"docstool_crash_{point}_{k}_{recovery}", DOCSTOOL)
+
+            def hook(name: str, index: int, k: int = k) -> None:
+                if name == point and index == k:
+                    raise Crash
+
+            setattr(module, "_CRASH_HOOK", hook)  # noqa: B010 - the module is loaded by path, so mypy cannot see it
+            with pytest.raises(Crash):
+                _run_main(module, repo, "plan", "apply", "--write")
+            capsys.readouterr()
+            assert (repo / ART / ".apply-journal.json").exists()
+            code, report = docstool_json(repo, "plan", "apply", "--write")
+            assert code == 1
+            assert "plan-journal" in {f["check"] for f in report["findings"]}
+            code, report = docstool_json(repo, "plan", recovery)
+            assert code == 0, report["findings"]
+            assert snapshot(repo) == (post if recovery == "resume" else before), (point, k, recovery)
+            assert not (repo / ART / ".apply-journal.json").exists()
+
+
+@pytest.mark.parametrize("point", ["log-tmp", "after-log", "after-staging", "after-backups"])
+def test_finalisation_crashes_recover(tmp_path: Path, point: str, capsys: pytest.CaptureFixture[str]) -> None:
+    post = _post_state(tmp_path)
+    repo = messy(tmp_path / point)
+    approve(repo)
+    module = load_module(f"docstool_final_{point}", DOCSTOOL)
+
+    def hook(name: str, index: int) -> None:
+        if name == point:
+            raise Crash
+
+    setattr(module, "_CRASH_HOOK", hook)  # noqa: B010 - the module is loaded by path, so mypy cannot see it
+    with pytest.raises(Crash):
+        _run_main(module, repo, "plan", "apply", "--write")
+    capsys.readouterr()
+    code, report = docstool_json(repo, "plan", "resume")
+    assert code == 0, report["findings"]
+    assert snapshot(repo) == post
+    assert not any((repo / ART / n).exists() for n in (".apply-journal.json", ".staging", ".backups", "apply-log.json.tmp"))
+    code, report = docstool_json(repo, "plan", "apply", "--write")
+    assert code == 0
+    assert report["data"]["state"] == "already applied, nothing to do"
+
+
+def test_edit_after_crash_is_a_conflict(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    repo = messy(tmp_path)
+    approve(repo)
+    module = load_module("docstool_conflict", DOCSTOOL)
+
+    def hook(name: str, index: int) -> None:
+        if name == "after-done" and index == 1:
+            raise Crash
+
+    setattr(module, "_CRASH_HOOK", hook)  # noqa: B010 - the module is loaded by path, so mypy cannot see it
+    with pytest.raises(Crash):
+        _run_main(module, repo, "plan", "apply", "--write")
+    capsys.readouterr()
+    journal = json.loads((repo / ART / ".apply-journal.json").read_text(encoding="utf-8"))
+    edited = repo / journal["ops"][0]["path"]
+    edited.parent.mkdir(parents=True, exist_ok=True)
+    edited.write_text("edited by hand\n", encoding="utf-8")
+    for action in ("resume", "rollback"):
+        code, report = docstool_json(repo, "plan", action)
+        assert code == 1
+        assert "plan-conflict" in {f["check"] for f in report["findings"]}
+        assert edited.read_text(encoding="utf-8") == "edited by hand\n"
+
+
+def test_log_with_a_path_reverted_by_hand_is_a_conflict(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    repo = messy(tmp_path)
+    approve(repo)
+    module = load_module("docstool_logconflict", DOCSTOOL)
+
+    def hook(name: str, index: int) -> None:
+        if name == "after-log":
+            raise Crash
+
+    setattr(module, "_CRASH_HOOK", hook)  # noqa: B010 - the module is loaded by path, so mypy cannot see it
+    with pytest.raises(Crash):
+        _run_main(module, repo, "plan", "apply", "--write")
+    capsys.readouterr()
+    (repo / "RELEASING.md").write_bytes(
+        subprocess.run(["git", "-C", str(repo), "show", "HEAD:RELEASING.md"], capture_output=True, check=True, env=GIT_ENV).stdout
+    )
+    code, report = docstool_json(repo, "plan", "resume")
+    assert code == 1
+    assert "plan-conflict" in {f["check"] for f in report["findings"]}
+
+
+# --- verify: content conservation ---------------------------------------------------------------
+
+CONSERVE = """# Guide
+
+## Install
+
+!!! warning
+    Back up the device first.
+
+1. Unplug it.
+2. Flash it.
+3. Plug it in.
+
+~~~sh
+make flash
+	echo tab
+~~~
+
+Never flash over USB hubs.
+
+Same line.
+
+Same line.
+
+## Other
+
+**Do not** skip the check.
+"""
+
+
+def conserve_repo(tmp_path: Path) -> Path:
+    repo = make_repo("clean", tmp_path)
+    (repo / "docs" / "flash.md").write_text(CONSERVE, encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "flash")
+    write_plan(repo, {"keep": [{"paths": ["docs/"]}]})
+    return repo
+
+
+def edit(repo: Path, old: str, new: str) -> None:
+    path = repo / "docs" / "flash.md"
+    text = path.read_text(encoding="utf-8")
+    assert old in text
+    path.write_text(text.replace(old, new, 1), encoding="utf-8")
+
+
+def test_verify_passes_on_an_untouched_tree(tmp_path: Path) -> None:
+    repo = conserve_repo(tmp_path)
+    code, report = docstool_json(repo, "plan", "verify")
+    assert code == 0, report["findings"]
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "check"),
+    [
+        ("!!! warning\n    Back up the device first.\n\n", "", "block-unaccounted"),
+        ("1. Unplug it.\n2. Flash it.", "1. Flash it.\n2. Unplug it.", "order-changed"),
+        ("\techo tab", "    echo tab", "block-unaccounted"),
+        ("Same line.\n\nSame line.\n", "Same line.\n", "block-unaccounted"),
+        ("Never flash over USB hubs.\n\n", "", "context-lost"),
+        ("**Do not** skip", "Do not skip", "block-unaccounted"),
+    ],
+)
+def test_conservation_negatives_fail_verify(tmp_path: Path, old: str, new: str, check: str) -> None:
+    repo = conserve_repo(tmp_path)
+    edit(repo, old, new)
+    if check == "context-lost":
+        edit(repo, "## Other\n", "## Other\n\nNever flash over USB hubs.\n")
+    code, report = docstool_json(repo, "plan", "verify")
+    assert code == 1
+    assert check in {f["check"] for f in report["findings"]}, report["findings"]
+
+
+def test_rewritten_mapping_needs_a_valid_receipt(tmp_path: Path) -> None:
+    repo = conserve_repo(tmp_path)
+    blocks = json.loads((repo / ART / "blocks.json").read_text(encoding="utf-8"))["blocks"]
+    target = next(b for b in blocks if b["text"] == "Never flash over USB hubs.")
+    edit(repo, "Never flash over USB hubs.", "Never flash through a USB hub.")
+    mappings = repo / ART / "mappings.toml"
+    mappings.write_text(f'[[rewritten]]\nid = "m1"\nblocks = ["{target["hash"]}"]\nto = "docs/flash.md"\nheading = "Install"\n', encoding="utf-8")
+    plan_before = (repo / ART / "plan.toml").read_bytes()
+    code, report = docstool_json(repo, "plan", "verify")
+    assert code == 1
+    assert "mapping-unreviewed" in {f["check"] for f in report["findings"]}
+    code, report = docstool_json(repo, "plan", "approve", "--mappings", "--by", "Owner")
+    assert code == 0, report["findings"]
+    assert report["data"]["review"][0]["before"] == ["Never flash over USB hubs."]
+    code, report = docstool_json(repo, "plan", "verify")
+    assert code == 0, report["findings"]
+    assert (repo / ART / "plan.toml").read_bytes() == plan_before
+    edit(repo, "Never flash through a USB hub.", "Flash anywhere.")
+    code, report = docstool_json(repo, "plan", "verify")
+    assert code == 1
+    assert "receipt-invalid" in {f["check"] for f in report["findings"]}
+    edit(repo, "Flash anywhere.", "Never flash through a USB hub.")
+    assert docstool_json(repo, "plan", "verify")[0] == 0
+    mappings.write_text(mappings.read_text(encoding="utf-8") + 'note = "changed"\n', encoding="utf-8")
+    code, report = docstool_json(repo, "plan", "verify")
+    assert "receipt-invalid" in {f["check"] for f in report["findings"]}
+
+
+def test_split_moves_a_section_and_its_anchors(tmp_path: Path) -> None:
+    repo = make_repo("clean", tmp_path)
+    (repo / "docs" / "big.md").write_text(
+        "# Big\n\nSee [opts](#options).\n\n## Options\n\nText [back](#big).\n\n### Sub\n\nMore.\n\n## Tail\n\nEnd.\n", encoding="utf-8"
+    )
+    (repo / "docs" / "index.md").write_text((repo / "docs" / "index.md").read_text(encoding="utf-8") + "\n[o](big.md#options)\n", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "big")
+    write_plan(
+        repo,
+        {
+            "split": [{"from": "docs/big.md", "heading": "Options", "to": "docs/options.md"}],
+            "keep": [{"paths": ["docs/index.md", "docs/guide.md", "docs/reference.md", "docs/internal/"]}],
+        },
+        ["docs/big.md"],
+    )
+    approve(repo)
+    code, report = docstool_json(repo, "plan", "apply", "--write")
+    assert code == 0, report["findings"]
+    moved = (repo / "docs" / "options.md").read_text(encoding="utf-8")
+    assert moved.startswith("# Options")
+    assert "## Sub" in moved
+    assert "[back](big.md#big)" in moved
+    assert "[o](options.md#options)" in (repo / "docs" / "index.md").read_text(encoding="utf-8")
+    assert "[opts](options.md#options)" in (repo / "docs" / "big.md").read_text(encoding="utf-8")
+    assert '"big.md#options" = "options.md#options"' in (repo / "zensical.toml").read_text(encoding="utf-8")
+    code, report = docstool_json(repo, "check")
+    assert [f for f in report["findings"] if f["check"].startswith("broken")] == []
+
+
+def test_split_then_verify_accounts_for_every_block(tmp_path: Path) -> None:
+    # a split promotes the moved headings; conservation and section context must follow them
+    repo = make_repo("clean", tmp_path)
+    (repo / "docs" / "big.md").write_text(
+        "# Big\n\n## Options\n\nNever set both flags.\n\n### Sub\n\n- one\n- two\n\n## Tail\n\nEnd.\n", encoding="utf-8"
+    )
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "big")
+    write_plan(
+        repo,
+        {
+            "split": [{"from": "docs/big.md", "heading": "Options", "to": "docs/options.md"}],
+            "keep": [{"paths": ["docs/index.md", "docs/guide.md", "docs/reference.md", "docs/internal/"]}],
+        },
+        ["docs/big.md"],
+    )
+    approve(repo)
+    assert docstool_json(repo, "plan", "apply", "--write")[0] == 0
+    code, report = docstool_json(repo, "plan", "verify")
+    assert code == 0, report["findings"]
+    assert report["data"]["conservation"]["unaccounted"] == 0
+
+
+SECTIONS = "# Setup\n\n## Linux\n\n### Install\n\nNever run it as root.\n\n## Windows\n\n### Install\n\nPlain.\n"
+
+
+@pytest.mark.parametrize("where", ["sibling", "other-file"])
+def test_sensitive_block_moved_between_same_named_sections_loses_context(tmp_path: Path, where: str) -> None:
+    repo = make_repo("clean", tmp_path)
+    (repo / "docs" / "setup.md").write_text(SECTIONS, encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "setup")
+    write_plan(repo, {"keep": [{"paths": ["docs/"]}]})
+    assert docstool_json(repo, "plan", "verify")[0] == 0
+    if where == "sibling":
+        text = SECTIONS.replace("Never run it as root.\n\n", "").replace("Plain.\n", "Plain.\n\nNever run it as root.\n")
+        (repo / "docs" / "setup.md").write_text(text, encoding="utf-8")
+    else:
+        (repo / "docs" / "setup.md").write_text(SECTIONS.replace("Never run it as root.\n\n", ""), encoding="utf-8")
+        (repo / "docs" / "other.md").write_text("# Setup\n\n## Linux\n\n### Install\n\nNever run it as root.\n", encoding="utf-8")
+    code, report = docstool_json(repo, "plan", "verify")
+    assert code == 1
+    assert "context-lost" in {f["check"] for f in report["findings"]}, report["findings"]
+
+
+def test_a_failure_while_staging_changes_nothing_and_recovers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    repo = messy(tmp_path)
+    approve(repo)
+    before, dirs_before = snapshot(repo), directories(repo)
+    module = load_module("docstool_stage_fail", DOCSTOOL)
+    real = module._fsync_write
+    calls = {"n": 0}
+
+    def failing(path: Path, data: bytes) -> None:
+        calls["n"] += 1
+        if calls["n"] == 3:
+            raise OSError("no space left on device")
+        real(path, data)
+
+    monkeypatch.setattr(module, "_fsync_write", failing)
+    assert _run_main(module, repo, "plan", "apply", "--write") == 2
+    monkeypatch.undo()
+    assert "nothing was changed" in capsys.readouterr().err
+    assert snapshot(repo) == before
+    assert directories(repo) == dirs_before
+    assert not any((repo / ART / n).exists() for n in (".apply-journal.json", ".staging", ".backups"))
+    # staging left by a run killed before its journal: apply refuses, resume clears it, apply then works
+    (repo / ART / ".staging").mkdir()
+    (repo / ART / ".staging" / "0").write_bytes(b"half")
+    assert docstool_code(repo, "plan", "apply", "--write") == 2
+    code, report = docstool_json(repo, "plan", "resume")
+    assert code == 0, report["findings"]
+    assert "stopped before changing anything" in report["data"]["state"]
+    assert snapshot(repo) == before
+    assert docstool_json(repo, "plan", "apply", "--write")[0] == 0
+
+
+def test_a_plan_outside_the_root_is_refused(tmp_path: Path) -> None:
+    repo = messy(tmp_path / "repo")
+    outside = tmp_path / "x"
+    outside.mkdir()
+    (outside / "plan.toml").write_bytes((repo / ART / "plan.toml").read_bytes())
+    for given in ("../x/plan.toml", str(outside / "plan.toml"), "docs/../../x/plan.toml"):
+        for action in ("validate", "approve"):
+            assert docstool_code(repo, "plan", action, "--plan", given, "--by", "Owner") == 2, (given, action)
+    assert "[approval]" not in (outside / "plan.toml").read_text(encoding="utf-8")
+    assert docstool_json(repo, "plan", "validate", "--plan", str(repo / ART / "plan.toml"))[0] == 0
+
+
+def test_a_dropped_mapping_needs_proof(tmp_path: Path) -> None:
+    repo = conserve_repo(tmp_path)
+    blocks = json.loads((repo / ART / "blocks.json").read_text(encoding="utf-8"))["blocks"]
+    target = next(b for b in blocks if b["text"] == "Same line.")
+    edit(repo, "Same line.\n\nSame line.\n", "Same line.\n")
+    mappings = repo / ART / "mappings.toml"
+    mappings.write_text(f'[[dropped]]\nid = "d1"\nblocks = ["{target["hash"]}"]\n', encoding="utf-8")
+    code, report = docstool_json(repo, "plan", "approve", "--mappings", "--by", "Owner")
+    assert code == 1
+    assert "mapping-invalid" in {f["check"] for f in report["findings"]}
+    assert not (repo / ART / "review-receipts.json").exists()
+    mappings.write_text(mappings.read_text(encoding="utf-8") + 'proof = "an exact duplicate of the line above"\n', encoding="utf-8")
+    assert docstool_json(repo, "plan", "approve", "--mappings", "--by", "Owner")[0] == 0
+    assert docstool_json(repo, "plan", "verify")[0] == 0
+
+
+def test_rewrites_and_promotion_respect_fence_length_and_character() -> None:
+    module = load_module("docstool_fences", DOCSTOOL)
+    lines = ["````md", "```", "# inside", "[x](a.md)", "```", "````", "~~~", "```", "# tilde inside", "~~~", "## real"]
+    assert module._promote(lines, 1) == [*lines[:-1], "# real"]
+    text = "\n".join(lines) + "\n[y](a.md)\n"
+    rewritten = module._rewrite_links(text, "docs", "docs", "docs/x.md", "docs/x.md", {"docs/a.md": "docs/b.md"}, {})
+    assert "[x](a.md)" in rewritten
+    assert "[y](b.md)" in rewritten

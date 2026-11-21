@@ -43,17 +43,24 @@ from __future__ import annotations
 import argparse
 import hashlib
 import html
+import io
 import json
+import os
 import re
+import shlex
+import shutil
 import subprocess
 import sys
+import tarfile
+import tempfile
 import unicodedata
 from collections import Counter, defaultdict
 from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
-from urllib.parse import unquote
+from urllib.parse import unquote, urljoin
 
 if sys.version_info < (3, 11):  # noqa: UP036 - the check is for users running an older python3
     sys.exit("docstool needs Python 3.11 or newer")
@@ -1493,6 +1500,24 @@ def _extensions_from_mkdocs(value: Any) -> dict[str, Any]:
     return result
 
 
+def _zensical_extensions(value: Any) -> dict[str, Any]:
+    """zensical.toml's extension table with dotted pymdownx/zensical keys hoisted, as Zensical does."""
+    if not isinstance(value, dict):
+        return {}
+    result = dict(value)
+    for prefix in ("pymdownx", "zensical"):
+        nested = result.pop(prefix, None)
+        if not isinstance(nested, dict):
+            continue
+        for name, options in nested.items():
+            if (prefix, name) in (("pymdownx", "blocks"), ("zensical", "extensions")) and isinstance(options, dict):
+                for inner, inner_options in options.items():
+                    result[f"{prefix}.{name}.{inner}"] = inner_options
+            else:
+                result[f"{prefix}.{name}"] = options
+    return result
+
+
 def _plugins_from_mkdocs(value: Any) -> dict[str, Any]:
     return _extensions_from_mkdocs(value)
 
@@ -1619,7 +1644,7 @@ def load_site(repo: Repo, report: Report) -> Site:
     # extensions and plugins
     if site.kind == "zensical":
         explicit = "markdown_extensions" in data
-        site.extensions = dict(data.get("markdown_extensions") or {}) if explicit else {name: {} for name in ZENSICAL_DEFAULT_EXTENSIONS}
+        site.extensions = _zensical_extensions(data.get("markdown_extensions")) if explicit else {name: {} for name in ZENSICAL_DEFAULT_EXTENSIONS}
         plugins = data.get("plugins") or {}
         site.plugins = dict(plugins) if isinstance(plugins, dict) else {}
     else:
@@ -2738,7 +2763,53 @@ def cmd_check(args: argparse.Namespace, report: Report) -> list[str]:
     check_structure(corpus, report, scope)
     if args.scope != "repo":
         check_site(corpus, report)
-    return ["config", "nav", "exclude_docs", "markdown"]
+    required = ["config", "nav", "exclude_docs", "markdown"]
+    if args.baseline and not args.built:
+        raise UsageError("--baseline needs --built NEW_SITE (a docstool site-build output)")
+    built = load_built(args.built, repo, site) if args.built else None
+    if args.save_baseline:
+        if built is not None:
+            baseline = {
+                "kind": "built",
+                "generator": built.get("generator"),
+                "generator_version": built.get("generator_version"),
+                "dependencies": built.get("dependencies"),
+                "unknown_dependencies": built.get("unknown_dependencies", []),
+                **built["site"],
+            }
+            if built.get("dependencies") == "complete":
+                report.coverage.append(CoverageRow("url_baseline", "complete", f"built by {built.get('generator')} {built.get('generator_version')}"))
+            else:
+                report.coverage.append(_url_baseline_row(baseline, built))
+        else:
+            baseline = {"kind": "source", **source_url_baseline(corpus)}
+            report.coverage.append(CoverageRow("url_baseline", "partial", "source-derived (no --built): preservation partially verified"))
+        _write_output(Path(args.save_baseline), json.dumps(baseline, indent=1, ensure_ascii=False) + "\n")
+        report.data["baseline_written"] = args.save_baseline
+    elif args.baseline and built is not None:
+        old = _read_json(Path(args.baseline))
+        if not isinstance(old, dict) or "routes" not in old:
+            raise UsageError(f"{args.baseline}: not a URL baseline written by check --save-baseline")
+        compare_url_baseline(old, built["site"], report, args.baseline)
+        report.coverage.append(_url_baseline_row(old, built))
+        required.append("url_baseline")
+    elif built is not None:
+        report.coverage.append(CoverageRow("built_site", "complete", f"{len(built['site']['routes'])} routes"))
+    return required
+
+
+def _url_baseline_row(old: dict[str, Any], built: dict[str, Any]) -> CoverageRow:
+    """URL preservation is verified only when both builds came from a generator run that saw every input."""
+    reasons = []
+    if old.get("kind") != "built":
+        reasons.append("the baseline is source-derived")
+    elif old.get("dependencies") != "complete":
+        reasons.append("the baseline build had unknown dependencies (" + "; ".join(old.get("unknown_dependencies", [])[:3]) + ")")
+    if built.get("dependencies") != "complete":
+        reasons.append("the new build has unknown dependencies (" + "; ".join(built.get("unknown_dependencies", [])[:3]) + ")")
+    if reasons:
+        return CoverageRow("url_baseline", "partial", ", ".join(reasons) + ": preservation partially verified")
+    return CoverageRow("url_baseline", "complete", f"{len(old['routes'])} routes")
 
 
 # ---------------------------------------------------------------------------------------------
@@ -2752,7 +2823,7 @@ def block_baseline(corpus: Corpus) -> list[dict[str, Any]]:
     for rel in sorted(corpus.docs):
         for block in corpus.docs[rel].blocks:
             text = block.text if block.type == "code" else " ".join(block.text.split())
-            digest = hashlib.sha256(f"{block.type}\0{block.info}\0{text}".encode()).hexdigest()[:16]
+            digest = _block_hash(block)
             out.append(
                 {
                     "file": rel,
@@ -2937,6 +3008,3307 @@ def cmd_slug(args: argparse.Namespace, report: Report) -> list[str]:
 
 
 # ---------------------------------------------------------------------------------------------
+# Shared helpers for the analysis commands
+# ---------------------------------------------------------------------------------------------
+
+
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def file_sha256(path: Path) -> str | None:
+    """The SHA-256 of a regular file's bytes, or None when there is no file."""
+    try:
+        if path.is_symlink() or not path.is_file():
+            return None
+        return sha256_bytes(path.read_bytes())
+    except OSError:
+        return None
+
+
+FENCED_RE = re.compile(r"(?ms)^[ \t]*(`{3,}|~{3,})[^\n]*\n.*?^[ \t]*\1[ \t]*$")
+
+
+def without_fences(text: str) -> str:
+    """Text with fenced code blocks blanked (line numbers kept)."""
+    return FENCED_RE.sub(lambda m: "\n" * m.group(0).count("\n"), text)
+
+
+def walk_values(value: Any, path: str = "") -> Iterable[tuple[str, Any]]:
+    """Every (key path, value) pair in nested dicts and lists."""
+    yield path, value
+    if isinstance(value, dict):
+        for key, item in value.items():
+            yield from walk_values(item, f"{path}.{key}" if path else str(key))
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            yield from walk_values(item, f"{path}[{index}]")
+    elif isinstance(value, Tagged):
+        yield from walk_values(value.value, path)
+
+
+# ---------------------------------------------------------------------------------------------
+# contrast
+# ---------------------------------------------------------------------------------------------
+
+# The page backgrounds of Zensical's two schemes (P0 S5, zensical-ui 0.0.43).
+SCHEME_BACKGROUNDS = {"default": "#ffffff", "slate": "#0b0c0f"}
+HEX_RE = re.compile(r"^#?([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$")
+
+
+def parse_hex(value: str) -> tuple[int, int, int]:
+    match = HEX_RE.match(value.strip())
+    if not match:
+        raise UsageError(f"not a hex colour: {value!r} (use #rrggbb or #rgb)")
+    digits = match.group(1)
+    if len(digits) == 3:
+        digits = "".join(c * 2 for c in digits)
+    return int(digits[0:2], 16), int(digits[2:4], 16), int(digits[4:6], 16)
+
+
+def to_hex(rgb: tuple[int, int, int]) -> str:
+    return "#" + "".join(f"{max(0, min(255, round(c))):02x}" for c in rgb)
+
+
+def relative_luminance(rgb: tuple[int, int, int]) -> float:
+    """WCAG 2.x relative luminance."""
+
+    def channel(value: int) -> float:
+        c = value / 255
+        return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+
+    r, g, b = (channel(v) for v in rgb)
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
+def contrast_ratio(a: tuple[int, int, int], b: tuple[int, int, int]) -> float:
+    la, lb = sorted((relative_luminance(a), relative_luminance(b)), reverse=True)
+    return (la + 0.05) / (lb + 0.05)
+
+
+def _mix(colour: tuple[int, int, int], other: tuple[int, int, int], share: float) -> tuple[int, int, int]:
+    return (
+        round(colour[0] + (other[0] - colour[0]) * share),
+        round(colour[1] + (other[1] - colour[1]) * share),
+        round(colour[2] + (other[2] - colour[2]) * share),
+    )
+
+
+def _nearest_passing(colour: tuple[int, int, int], toward: tuple[int, int, int], against: tuple[int, int, int], minimum: float) -> str | None:
+    for step in range(1, 21):
+        candidate = _mix(colour, toward, step / 20)
+        if contrast_ratio(candidate, against) >= minimum:
+            return to_hex(candidate)
+    return None
+
+
+def cmd_contrast(args: argparse.Namespace, report: Report) -> list[str]:
+    brand = parse_hex(args.colour)
+    slate_colour = parse_hex(args.slate) if args.slate else brand
+    white, black = (255, 255, 255), (0, 0, 0)
+    light_bg, slate_bg = parse_hex(SCHEME_BACKGROUNDS["default"]), parse_hex(SCHEME_BACKGROUNDS["slate"])
+    pairs = [
+        ("accent text on the light page", brand, light_bg, 4.5, black),
+        ("accent text on the slate page", slate_colour, slate_bg, 4.5, white),
+        ("white button text on the accent fill", white, brand, 4.5, None),
+        ("accent fill against the slate page (WCAG 1.4.11)", slate_colour, slate_bg, 3.0, white),
+    ]
+    rows = []
+    for label, fg, bg, minimum, toward in pairs:
+        ratio = contrast_ratio(fg, bg)
+        rows.append(
+            {
+                "pair": label,
+                "foreground": to_hex(fg),
+                "background": to_hex(bg),
+                "ratio": round(ratio, 2),
+                "minimum": minimum,
+                "pass": ratio >= minimum,
+            }
+        )
+        if ratio >= minimum:
+            continue
+        if toward is None:
+            fix = _nearest_passing(brand, black, white, minimum)
+            suggestion = f"darken the fill (for example {fix}) or use dark button text" if fix else "use dark button text"
+        elif bg == slate_bg:
+            fix = _nearest_passing(slate_colour, toward, bg, minimum)
+            suggestion = (
+                f'override it for dark mode: [data-md-color-scheme="slate"] {{ --md-primary-fg-color: {fix}; }}' if fix else "pick another colour"
+            )
+        else:
+            fix = _nearest_passing(brand, toward, bg, minimum)
+            suggestion = f"darken it (for example {fix})" if fix else "pick another colour"
+        report.add(
+            Finding("contrast", "P1", "verified", "", 0, f"{label}: {ratio:.2f}:1, needs {minimum}:1", [f"{to_hex(fg)} on {to_hex(bg)}"], suggestion)
+        )
+    report.data["pairs"] = rows
+    report.coverage.append(CoverageRow("colours", "complete", "computed (WCAG 2.x relative luminance)"))
+    return []
+
+
+def render_contrast_text(report: Report) -> str:
+    out = ["Contrast:"]
+    for row in report.data.get("pairs", []):
+        flag = "ok  " if row["pass"] else "FAIL"
+        out.append(f"  {flag} {row['ratio']:>5}:1 (min {row['minimum']})  {row['foreground']} on {row['background']}  {row['pair']}")
+    return "\n".join(out) + "\n\n"
+
+
+# ---------------------------------------------------------------------------------------------
+# readme
+# ---------------------------------------------------------------------------------------------
+
+BADGE_RE = re.compile(
+    r"img\.shields\.io|badgen\.net|badge\.svg|/badges?/|flathub\.org/api/badge|badge\.fury\.io|codecov\.io/.+/graph/badge", re.IGNORECASE
+)
+HTML_IMG_RE = re.compile(r"<img\b[^>]*>", re.IGNORECASE)
+PICTURE_RE = re.compile(r"<picture\b.*?</picture>", re.IGNORECASE | re.DOTALL)
+ALT_RE = re.compile(r"""\balt\s*=\s*(?:"([^"]*)"|'([^']*)')""", re.IGNORECASE)
+CARD_TITLE_RE = re.compile(r"^[ \t]*[-*+][ \t]+(?::[\w-]+:(?:\{[^}]*\})?[ \t]*)?(?:\*\*|__)(.+?)(?:\*\*|__)")
+FEATURE_BULLET_RE = re.compile(r"^[ \t]*[-*+][ \t]+(?:\S+[ \t]+)?(?:\*\*|__)(.+?)(?:\*\*|__)")
+README_LINE_BUDGET = (50, 100)
+MAX_BADGES = 4
+
+
+def is_emoji(ch: str) -> bool:
+    return unicodedata.category(ch) == "So" and ord(ch) >= 0x2000
+
+
+def _strip_inline(text: str) -> str:
+    text = TAG_RE.sub("", text)
+    text = re.sub(r"(\*\*|__|\*|_|`)", "", text)
+    return " ".join(text.split()).strip().rstrip(".")
+
+
+def readme_facts(doc: MarkdownDoc, text: str) -> dict[str, Any]:
+    """Tagline, feature titles and first install block of a README."""
+    body = without_fences(text).split("\n")
+    first_h2 = next((h.line for h in doc.headings if h.level == 2), len(body) + 1)
+    tagline = None
+    for line in body[: first_h2 - 1]:
+        strong = re.search(r"<strong>(.+?)</strong>", line) or re.match(r"^[ \t]*(?:\*\*|__)(.+?)(?:\*\*|__)[ \t]*$", line)
+        if strong:
+            tagline = _strip_inline(strong.group(1))
+            break
+    features: list[str] = []
+    install = None
+    sections = [(h, i) for i, h in enumerate(doc.headings) if h.level == 2]
+    for position, (heading, _index) in enumerate(sections):
+        end = sections[position + 1][0].line if position + 1 < len(sections) else len(body) + 1
+        name = heading.text.casefold()
+        if "feature" in name:
+            for line in body[heading.line : end - 1]:
+                match = FEATURE_BULLET_RE.match(line)
+                if match:
+                    features.append(_strip_inline(match.group(1)).rstrip(":"))
+        if install is None and re.search(r"install|get(ting)? started|quick ?start", name):
+            install = next((b.text.strip() for b in doc.blocks if b.type == "code" and heading.line < b.line < end), None)
+    return {"tagline": tagline, "features": features, "install": install}
+
+
+def home_facts(doc: MarkdownDoc) -> dict[str, Any]:
+    """Tagline, feature card titles and first install block of a homepage built on home.html."""
+    home = doc.front_matter.get("home") if isinstance(doc.front_matter, dict) else None
+    tagline = _strip_inline(str(home["tagline"])) if isinstance(home, dict) and home.get("tagline") else None
+    features: list[str] = []
+    install = None
+    region: str | None = None
+    depth = 0
+    start = 0
+    for number, line in enumerate(doc.lines, 1):
+        opening = re.search(r'<div\b[^>]*class="([^"]*)"', line)
+        if region is None and opening:
+            classes = opening.group(1).split()
+            if "cards" in classes:
+                region, depth, start = "cards", 0, number
+            elif "rdt-install" in classes:
+                region, depth, start = "install", 0, number
+        if region is not None:
+            depth += len(re.findall(r"<div\b", line)) - len(re.findall(r"</div>", line))
+            if region == "cards":
+                match = CARD_TITLE_RE.match(line)
+                if match:
+                    features.append(_strip_inline(match.group(1)).rstrip(":"))
+            if depth <= 0 and number >= start:
+                if region == "install" and install is None:
+                    install = next((b.text.strip() for b in doc.blocks if b.type == "code" and start < b.line < number), None)
+                region = None
+    return {"tagline": tagline, "features": features, "install": install}
+
+
+def _published_package(repo: Repo) -> str | None:
+    """The registry a README is also shown on, when the manifest says the package is published."""
+    cargo, _ = repo.text("Cargo.toml") if "Cargo.toml" in repo.file_set else (None, "")
+    if cargo:
+        try:
+            package = tomllib.loads(cargo).get("package", {})
+        except tomllib.TOMLDecodeError:
+            package = {}
+        if package and package.get("publish", True) is not False:
+            return "crates.io"
+    npm, _ = repo.text("package.json") if "package.json" in repo.file_set else (None, "")
+    if npm:
+        try:
+            manifest = json.loads(npm)
+        except json.JSONDecodeError:
+            manifest = {}
+        if isinstance(manifest, dict) and manifest.get("name") and not manifest.get("private"):
+            return "npm"
+    py, _ = repo.text("pyproject.toml") if "pyproject.toml" in repo.file_set else (None, "")
+    if py:
+        try:
+            project = tomllib.loads(py).get("project", {})
+        except tomllib.TOMLDecodeError:
+            project = {}
+        if project.get("name") and not any("Private" in str(c) for c in project.get("classifiers", [])):
+            return "PyPI"
+    return None
+
+
+MD_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\(\s*<?([^)\s>]+)")
+IMG_SRC_RE = re.compile(r"""<(?:img|source)\b[^>]*?\b(?:src|srcset)\s*=\s*["']([^"'\s]+)""", re.IGNORECASE)
+
+
+def _readme_images(body: str) -> list[Link]:
+    """Every image of a README, nested in links or not: Markdown images, <img> and <source>."""
+    images = []
+    for number, line in enumerate(body.split("\n"), 1):
+        masked = mask_code_spans(line)
+        images += [Link("image", m.group(2), number, m.group(1)) for m in MD_IMAGE_RE.finditer(masked)]
+        images += [Link("html-src", m.group(1), number) for m in IMG_SRC_RE.finditer(masked)]
+    return images
+
+
+def cmd_readme(args: argparse.Namespace, report: Report) -> list[str]:
+    repo = Repo(Path(args.root))
+    site = load_site(repo, report)
+    rel = normalize_path("", args.file) or args.file
+    text, status = repo.text(rel)
+    if text is None:
+        report.coverage.append(CoverageRow("readme", "failed", f"{rel}: {status}"))
+        return ["readme"]
+    report.coverage.append(CoverageRow("readme", "complete", rel))
+    doc = parse_markdown(rel, text, None, False)
+    lines = text.rstrip("\n").split("\n")
+    low, high = README_LINE_BUDGET
+    if len(lines) > high:
+        report.add(
+            Finding(
+                "readme-length",
+                "P2",
+                "verified",
+                rel,
+                high + 1,
+                f"{len(lines)} lines; a README stays within {low}-{high}",
+                suggestion="move reference material into the docs and link to it",
+            )
+        )
+    elif len(lines) < low:
+        report.add(Finding("readme-length", "P3", "verified", rel, 1, f"{len(lines)} lines; under {low} usually means install or usage is missing"))
+    body = without_fences(text)
+    h1 = [h.line for h in doc.headings if h.level == 1] + [body[: m.start()].count("\n") + 1 for m in re.finditer(r"<h1\b", body, re.IGNORECASE)]
+    if len(h1) != 1:
+        report.add(Finding("readme-h1", "P2", "verified", rel, (sorted(h1)[1:] or [1])[0], f"{len(h1)} level-1 headings; a README has exactly one"))
+    images = _readme_images(body)
+    badges = [link for link in images if BADGE_RE.search(link.target)]
+    if len(badges) > MAX_BADGES:
+        report.add(
+            Finding(
+                "readme-badges",
+                "P2",
+                "verified",
+                rel,
+                badges[MAX_BADGES].line,
+                f"{len(badges)} badges; keep at most {MAX_BADGES} (CI, version, docs, license)",
+            )
+        )
+    styles = {m.group(1) if (m := re.search(r"[?&]style=([\w-]+)", b.target)) else "flat" for b in badges if "shields.io" in b.target}
+    if len(styles) > 1:
+        report.add(Finding("readme-badges", "P3", "verified", rel, badges[0].line, f"badges mix styles: {', '.join(sorted(styles))}"))
+    for heading in doc.headings:
+        emoji = [i for i, ch in enumerate(heading.text) if is_emoji(ch)]
+        if emoji and (heading.level != 2 or emoji != [0] or len(heading.text) < 2):
+            report.add(
+                Finding("readme-emoji", "P3", "verified", rel, heading.line, f"emoji in {heading.text!r}: only as the first character of an h2")
+            )
+    for link in images:
+        if link.kind == "image" and not link.text.strip():
+            report.add(Finding("readme-alt", "P2", "verified", rel, link.line, f"image {link.target} has no alt text"))
+    for match in HTML_IMG_RE.finditer(body):
+        alt = ALT_RE.search(match.group(0))
+        if not alt or not (alt.group(1) or alt.group(2) or "").strip():
+            report.add(Finding("readme-alt", "P2", "verified", rel, body[: match.start()].count("\n") + 1, "an <img> without alt text"))
+    for match in PICTURE_RE.finditer(body):
+        if not HTML_IMG_RE.search(match.group(0)):
+            report.add(
+                Finding(
+                    "readme-picture",
+                    "P1",
+                    "verified",
+                    rel,
+                    body[: match.start()].count("\n") + 1,
+                    "<picture> without an <img> fallback renders nothing where <source> is unsupported",
+                )
+            )
+    registry = "the registry" if args.registry else _published_package(repo)
+    if registry:
+        for link in images:
+            if not SCHEME_RE.match(link.target):
+                report.add(
+                    Finding(
+                        "readme-registry-image",
+                        "P2",
+                        "verified" if args.registry else "likely",
+                        rel,
+                        link.line,
+                        f"relative image {link.target} breaks where the README is shown on {registry}",
+                        suggestion="use an absolute https://raw.githubusercontent.com/... URL",
+                    )
+                )
+    docs_url = site.site_url
+    if docs_url:
+        count = text.count(docs_url.rstrip("/"))
+        if count > 3:
+            report.add(
+                Finding(
+                    "readme-docs-url",
+                    "P3",
+                    "verified",
+                    rel,
+                    1,
+                    f"the docs URL appears {count} times; link it once in the header and once where it helps",
+                )
+            )
+    alerts = [n for n, line in enumerate(lines, 1) if ALERT_RE.match(line)]
+    if len(alerts) > 2:
+        report.add(Finding("readme-alerts", "P3", "verified", rel, alerts[2], f"{len(alerts)} alerts; keep at most two so they still stand out"))
+    h2 = [h for h in doc.headings if h.level == 2]
+    licence = [h for h in h2 if "licen" in h.text.casefold()]
+    if h2 and not licence:
+        report.add(Finding("readme-license", "P3", "verified", rel, h2[-1].line, "no License section"))
+    elif licence and licence[-1] is not h2[-1]:
+        report.add(Finding("readme-license", "P3", "verified", rel, licence[-1].line, "License is not the last section"))
+    anchors = doc.anchors()
+    for link in doc.links:
+        if link.target.startswith("#") and len(link.target) > 1 and unquote(link.target[1:]).lower() not in {a.lower() for a in anchors}:
+            report.add(
+                Finding(
+                    "broken-anchor",
+                    "P1",
+                    "verified",
+                    rel,
+                    link.line,
+                    f"{link.target}: no heading has that GitHub anchor",
+                    suggestion="headings that start with an emoji get anchors like #-install",
+                )
+            )
+    facts = readme_facts(doc, text)
+    report.data["readme"] = {"file": rel, "lines": len(lines), "badges": len(badges), **facts}
+    required = ["readme"]
+    if args.home:
+        home_rel = normalize_path("", args.home) or args.home
+        home_text, home_status = repo.text(home_rel)
+        if home_text is None:
+            report.coverage.append(CoverageRow("home", "failed", f"{home_rel}: {home_status}"))
+            return [*required, "home"]
+        home = home_facts(parse_markdown(home_rel, home_text, None, True))
+        report.coverage.append(CoverageRow("home", "complete", home_rel))
+        report.data["home"] = home
+        required.append("home")
+        _readme_drift(report, rel, home_rel, facts, home)
+    return required
+
+
+def _readme_drift(report: Report, rel: str, home_rel: str, readme: dict[str, Any], home: dict[str, Any]) -> None:
+    if home["tagline"] and readme["tagline"] != home["tagline"]:
+        report.add(
+            Finding(
+                "readme-drift",
+                "P2",
+                "verified",
+                rel,
+                1,
+                f"tagline {readme['tagline']!r} differs from the homepage's {home['tagline']!r}",
+                [f"{home_rel}: home.tagline"],
+                "the homepage front matter is canonical; copy its tagline verbatim",
+            )
+        )
+    ours, theirs = {f.casefold() for f in readme["features"]}, {f.casefold() for f in home["features"]}
+    for title in home["features"]:
+        if title.casefold() not in ours:
+            report.add(Finding("readme-drift", "P2", "verified", rel, 1, f"homepage feature {title!r} is not in the README's features", [home_rel]))
+    for title in readme["features"]:
+        if title.casefold() not in theirs and home["features"]:
+            report.add(Finding("readme-drift", "P2", "verified", home_rel, 1, f"README feature {title!r} is not a homepage card", [rel]))
+    if home["install"] and readme["install"] and home["install"] != readme["install"]:
+        report.add(
+            Finding("readme-drift", "P2", "verified", rel, 1, "the README's install block differs from the homepage's", [f"{home_rel}: rdt-install"])
+        )
+
+
+# ---------------------------------------------------------------------------------------------
+# site-audit
+# ---------------------------------------------------------------------------------------------
+
+# Plugins Zensical 0.1.3 implements (zensical/config.py, _PLUGIN_UNSUPPORTED_OPTIONS); any other
+# plugin entry is silently ignored. section-index is native, so its entry is ignored harmlessly.
+ZENSICAL_PLUGINS = frozenset(
+    [
+        "api-autonav",
+        "autorefs",
+        "awesome-nav",
+        "blog",
+        "callouts",
+        "exclude",
+        "gh-admonitions",
+        "git-revision-date-localized",
+        "glightbox",
+        "include-markdown",
+        "literate-nav",
+        "llmstxt",
+        "macros",
+        "markdown-exec",
+        "markdownextradata",
+        "meta",
+        "meta-descriptions",
+        "mike",
+        "minify",
+        "mkdocs-audio",
+        "mkdocs-autoapi",
+        "mkdocs-nav-weight",
+        "mkdocs-video",
+        "mkdocstrings",
+        "offline",
+        "optimize",
+        "privacy",
+        "redirects",
+        "rss",
+        "search",
+        "social",
+        "table-reader",
+        "tags",
+    ]
+)
+NATIVE_PLUGINS = frozenset({"section-index"})
+# Feature flags no template or script of zensical-ui 0.0.43 reads, and documented incompatible pairs.
+NOOP_FEATURES = frozenset({"search.suggest", "search.share"})
+INCOMPATIBLE_FEATURES = (("navigation.indexes", "toc.integrate"), ("navigation.prune", "navigation.expand"))
+SEARCH_OPTIONS = frozenset({"enabled", "separator"})
+FEATURE_SYNTAX = (
+    ("admonition", re.compile(r"^[ \t]*!!!\s", re.MULTILINE), "!!! admonitions"),
+    ("pymdownx.details", re.compile(r"^[ \t]*\?\?\?\+?\s", re.MULTILINE), "??? collapsible blocks"),
+    ("pymdownx.tabbed", re.compile(r'^[ \t]*===\+?[ \t]+"', re.MULTILINE), '=== "Tab" content tabs'),
+    ("pymdownx.snippets", re.compile(r"^[ \t]*;?--8<--", re.MULTILINE), "--8<-- snippets"),
+    ("pymdownx.tasklist", re.compile(r"^[ \t]*[-*+][ \t]+\[[ xX]\][ \t]", re.MULTILINE), "task lists"),
+    ("footnotes", re.compile(r"\[\^[^\]\s]+\]"), "footnotes"),
+    ("md_in_html", re.compile(r"<\w+\b[^>]*\bmarkdown(?:=\"1\"|=\"block\"|\b)[^>]*>"), "Markdown inside HTML"),
+    ("attr_list", re.compile(r"\{\s*[#.:][\w-][^}\n]*\}"), "attribute lists"),
+    ("pymdownx.emoji", re.compile(r":(?:material|octicons|fontawesome|lucide|simple)-[\w-]+:"), "icon shortcodes"),
+)
+
+
+def _lock_pins(repo: Repo) -> dict[str, str]:
+    """Hash-pinned zensical locks: path -> pinned version."""
+    pins = {}
+    for rel in repo.files:
+        name = PurePosixPath(rel).name
+        if not (name.endswith(".txt") and "requirements" in name) and name != "uv.lock":
+            continue
+        text, _ = repo.text(rel)
+        if not text:
+            continue
+        pin = re.search(r"^zensical==([\w.]+)", text, re.MULTILINE)
+        if pin and "--hash=" in text:
+            pins[rel] = pin.group(1)
+        uv = re.search(r'name = "zensical"\nversion = "([\w.]+)"', text)
+        if uv:
+            pins[rel] = uv.group(1)
+    return pins
+
+
+def installed_zensical() -> str | None:
+    try:
+        from importlib import metadata  # noqa: PLC0415 - only site-audit needs it
+
+        return metadata.version("zensical")
+    except Exception:  # noqa: BLE001 - any failure means "not visible to this interpreter"
+        return None
+
+
+def cmd_site_audit(args: argparse.Namespace, report: Report) -> list[str]:
+    repo = Repo(Path(args.root))
+    site = load_site(repo, report)
+    rows = {r.input: r for r in report.coverage}
+    if site.config is None or not rows["config"].complete:
+        return ["config"]
+    cfg, raw = site.config, site.raw
+    config_text, _ = repo.text(cfg)
+    lines = (config_text or "").split("\n")
+
+    def line_of(needle: str) -> int:
+        return next((i for i, line in enumerate(lines, 1) if needle in line), 1)
+
+    def add(check: str, severity: str, message: str, needle: str = "", suggestion: str = "", confidence: str = "verified") -> None:
+        report.add(Finding(check, severity, confidence, cfg, line_of(needle) if needle else 1, message, suggestion=suggestion))
+
+    if site.kind == "mkdocs" and "hooks" in raw:
+        add(
+            "hooks",
+            "P1",
+            "hooks: are not run by Zensical (silently ignored, even with --strict)",
+            "hooks",
+            "move the hook's work into a script run before the build, or drop it",
+        )
+    for name in site.plugins:
+        canonical = name.removeprefix("material/").split("/", 1)[0]
+        if canonical in NATIVE_PLUGINS:
+            add("plugin-native", "P3", f"plugin {name}: Zensical does this natively and ignores the entry", name)
+        elif canonical not in ZENSICAL_PLUGINS:
+            add(
+                "plugin-unsupported",
+                "P1",
+                f"plugin {name} is not supported by Zensical {KNOWN_ZENSICAL}; its configuration is silently ignored",
+                name,
+                "replace what it did, or keep building with MkDocs",
+            )
+    search = site.plugins.get("search")
+    if isinstance(search, dict):
+        for option in sorted(set(search) - SEARCH_OPTIONS):
+            add("search-option", "P3", f"search option {option} is ignored by Zensical (only enabled and separator are read)", option)
+    theme: dict[str, Any] = raw["theme"] if isinstance(raw.get("theme"), dict) else {}
+    features = [str(f) for f in theme.get("features", []) or []]
+    for feature in features:
+        if feature in NOOP_FEATURES:
+            add("feature-noop", "P2", f"feature {feature} does nothing in Zensical {KNOWN_ZENSICAL}", feature, "remove it")
+    for first, second in INCOMPATIBLE_FEATURES:
+        if first in features and second in features:
+            add("feature-conflict", "P2", f"features {first} and {second} do not work together", second)
+    if site.slug_style not in GITHUB_STYLES:
+        add(
+            "slugify",
+            "P2",
+            f"toc slugify is {site.slug_style}: site anchors differ from GitHub's",
+            "slugify" if "slugify" in (config_text or "") else "",
+            'set toc.slugify = { object = "pymdownx.slugs.slugify", kwds = { case = "lower" } }',
+        )
+    if not site.site_url:
+        add(
+            "site-url",
+            "P2",
+            "site_url is not set: instant navigation, previews, the 404 page and social cards need it",
+            suggestion="set site_url to the published URL",
+        )
+    if site.docs_dir == ".":
+        add("docs-dir", "P1", "docs_dir is the project root, which Zensical does not allow", "docs_dir")
+    internal = [r for r in repo.files if site.in_docs(r) and site.docs_rel(r).startswith("internal/")]
+    if internal and any(site.published(r) for r in internal):
+        add(
+            "internal-published",
+            "P1",
+            f"{site.docs_dir}/internal/ exists but exclude_docs does not exclude it, so it is published",
+            "exclude_docs",
+            'set exclude_docs = "internal/"',
+        )
+    for key_path, value in walk_values(raw):
+        if isinstance(value, Tagged):
+            if value.tag.startswith("!ENV"):
+                add("yaml-env", "P2", f"{key_path}: !ENV is read by MkDocs only", key_path.rsplit(".", 1)[-1])
+            elif value.tag.startswith("!!python/name:material"):
+                add(
+                    "yaml-python-name",
+                    "P3",
+                    f"{key_path}: {value.tag} works with mkdocs.yml; zensical.toml uses a plain string",
+                    key_path.rsplit(".", 1)[-1],
+                    confidence="likely",
+                )
+    explicit = site.kind == "mkdocs" or "markdown_extensions" in raw
+    if explicit:
+        _audit_extensions(repo, site, add)
+    if "codehilite" in site.extensions:
+        hint = "drop it: pymdownx.highlight is configured" if "pymdownx.highlight" in site.extensions else "use pymdownx.highlight instead"
+        add("codehilite", "P3", "codehilite is redundant with Zensical's highlighter", "codehilite", hint)
+    alerts = any(ALERT_RE.search(t or "") for t in (repo.text(r)[0] for r in repo.markdown_files() if site.published(r)))
+    if alerts and "gh-admonitions" not in site.plugins:
+        add(
+            "gh-admonitions",
+            "P2",
+            "pages use GitHub alerts (> [!NOTE]) but the gh-admonitions plugin is not enabled, so they render as quotes",
+            suggestion="add [project.plugins.gh-admonitions]",
+        )
+    validation = raw.get("validation")
+    if validation is False or (isinstance(validation, dict) and validation and not any(validation.values())):
+        add("validation", "P2", "link validation is turned off", "validation")
+    pins = _lock_pins(repo)
+    if not pins:
+        add("lock", "P2", "no hash-pinned lock pins zensical", suggestion="add zensical-requirements.in and a pip-compile --generate-hashes lock")
+    for path, version in pins.items():
+        if version != KNOWN_ZENSICAL:
+            report.add(
+                Finding(
+                    "zensical-version", "P3", "verified", path, 1, f"the lock pins zensical {version}; docstool was checked against {KNOWN_ZENSICAL}"
+                )
+            )
+    workflows = [r for r in repo.files if r.startswith(".github/workflows/")]
+    if not any(re.search(r"\b(?:zensical|mkdocs) build\b|\bmake docs-build\b", repo.text(w)[0] or "") for w in workflows):
+        add("ci-build", "P2", "no workflow builds the site, so a broken build is found only locally", suggestion="build with --strict in CI")
+    installed = installed_zensical()
+    if installed and installed != KNOWN_ZENSICAL:
+        report.add(
+            Finding("zensical-version", "P3", "verified", cfg, 1, f"zensical {installed} is installed; docstool was checked against {KNOWN_ZENSICAL}")
+        )
+    report.data.update({"site_config": cfg, "kind": site.kind, "known_zensical": KNOWN_ZENSICAL, "installed_zensical": installed, "locks": pins})
+    return ["config"]
+
+
+def _audit_extensions(repo: Repo, site: Site, add: Callable[..., None]) -> None:
+    """Syntax the published pages use that the explicit extension list does not enable."""
+    used: dict[str, str] = {}
+    mermaid = False
+    for rel in repo.markdown_files():
+        if not site.published(rel):
+            continue
+        text, _ = repo.text(rel)
+        if not text:
+            continue
+        mermaid = mermaid or bool(re.search(r"^[ \t]*(`{3,}|~{3,})[ \t]*mermaid\b", text, re.MULTILINE))
+        prose = without_fences(text)
+        for extension, pattern, label in FEATURE_SYNTAX:
+            match = pattern.search(prose)
+            if match and extension not in used:
+                used[extension] = f"{rel}:{prose[: match.start()].count(chr(10)) + 1} ({label})"
+    for extension, where in sorted(used.items()):
+        if extension not in site.extensions:
+            add(
+                "extension-missing",
+                "P1",
+                f"{where} needs {extension}, which the explicit markdown_extensions list does not enable",
+                suggestion="add it: an explicit list replaces the defaults",
+            )
+    if mermaid:
+        fences = (
+            (site.extensions.get("pymdownx.superfences") or {}).get("custom_fences", [])
+            if isinstance(site.extensions.get("pymdownx.superfences"), dict)
+            else []
+        )
+        if not any(isinstance(f, dict) and f.get("name") == "mermaid" for f in fences):
+            add("extension-missing", "P1", "pages have mermaid fences but pymdownx.superfences has no mermaid custom fence", "superfences")
+
+
+# ---------------------------------------------------------------------------------------------
+# drift: commands, flags, environment variables and paths the docs name, against the code
+# ---------------------------------------------------------------------------------------------
+
+MAKE_VAR_RE = re.compile(r"^(?:override[ \t]+|export[ \t]+)?([A-Za-z_][\w.-]*)[ \t]*(::?=|:::=|\?=|\+=|!=|=)[ \t]*(.*)$")
+MAKE_RULE_RE = re.compile(r"^([^\t#=:][^#=:]*?)[ \t]*::?(?![=])(.*)$")
+MAKE_INCLUDE_RE = re.compile(r"^[ \t]*(-include|sinclude|include)[ \t]+(.+)$")
+MAKE_REF_RE = re.compile(r"\$[({]([^(){}$]+)[)}]")
+MAKE_FUNC_RE = re.compile(
+    r"\$\((addprefix|addsuffix|wildcard|notdir|basename|patsubst|subst|strip|sort|eval|shell|call|foreach|filter|if|or|and|word|firstword|lastword|dir|realpath|abspath)[ \t]+([^()]*(?:\([^()]*\)[^()]*)*)\)"
+)
+SHELL_INFOS = frozenset(
+    {"", "sh", "bash", "shell", "console", "zsh", "fish", "terminal", "shell-session", "sh-session", "shellsession", "powershell", "ps1"}
+)
+CMD_SPLIT_RE = re.compile(r"\s*(?:&&|\|\||;|\|)\s*")
+DOC_ENV_SPAN_RE = re.compile(r"^\$?\{?([A-Z][A-Z0-9]*_[A-Z0-9_]+)\}?(?:=\S*)?$")
+DOC_ENV_BLOCK_RE = re.compile(
+    r"(?:\bexport[ \t]+|^[ \t]*|[ \t]-e[ \t]+|--env[ \t=]+)([A-Z][A-Z0-9]*_[A-Z0-9_]+)=|\$\{?([A-Z][A-Z0-9]*_[A-Z0-9_]+)\b", re.MULTILINE
+)
+FLAG_TOKEN_RE = re.compile(r"^(--[a-zA-Z][\w-]*)(?:=.*)?$")
+ENV_CONTEXT_RE = re.compile(r"\b(?:env(?:ironment)?(?:[ -]var(?:iable)?s?)?|variables?|export(?:ed)?|set(?:s|ting)?)\b", re.IGNORECASE)
+FLAG_LITERAL_RE = re.compile(r"[\"'](--[a-zA-Z][\w-]*)[\"'=]")
+GLIB_CONST_FLAG_RE = re.compile(r"add_main_option\(\s*(?:[\w]+::)*([A-Z][A-Z0-9_]*)\s*,")
+RUST_STR_CONST_RE = re.compile(r"\bconst\s+([A-Z][A-Z0-9_]*)\s*:\s*&(?:'static\s+)?str\s*=\s*\"([^\"]+)\"")
+IMPLICIT_ENV = frozenset(
+    [
+        "RUST_LOG",
+        "RUST_BACKTRACE",
+        "RUST_LIB_BACKTRACE",
+        "RUST_MIN_STACK",
+        "HOME",
+        "PATH",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "TERM",
+        "LANG",
+        "LANGUAGE",
+        "TZ",
+        "TMPDIR",
+        "PWD",
+        "NO_COLOR",
+        "FORCE_COLOR",
+        "CLICOLOR",
+        "CLICOLOR_FORCE",
+        "CI",
+        "EDITOR",
+        "VISUAL",
+        "PAGER",
+        "DISPLAY",
+        "WAYLAND_DISPLAY",
+        "DBUS_SESSION_BUS_ADDRESS",
+        "GOPATH",
+        "GOFLAGS",
+        "GOOS",
+        "GOARCH",
+        "GOBIN",
+        "CGO_ENABLED",
+        "GOPROXY",
+        "GOPRIVATE",
+        "PYTHONPATH",
+        "PYTHONUNBUFFERED",
+        "PYTHONDONTWRITEBYTECODE",
+        "VIRTUAL_ENV",
+        "NODE_ENV",
+        "NODE_OPTIONS",
+        "NPM_TOKEN",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+        "SSH_AUTH_SOCK",
+        "DOCKER_HOST",
+        "DOCKER_BUILDKIT",
+        "SOURCE_DATE_EPOCH",
+        "MAKEFLAGS",
+        "DESTDIR",
+        "PREFIX",
+        "G_MESSAGES_DEBUG",
+        "GTK_DEBUG",
+        "GTK_THEME",
+        "GSK_RENDERER",
+        "GDK_BACKEND",
+        "GDK_SCALE",
+        "FLATPAK_ID",
+    ]
+)
+IMPLICIT_ENV_PREFIXES = ("CARGO_", "XDG_", "GITHUB_", "RUNNER_", "LC_", "GIT_", "GSETTINGS_", "DEBIAN_", "ACTIONS_")
+ENV_READERS = {
+    "rust": (
+        re.compile(r"\benv::var(?:_os)?\(\s*\"([A-Z][A-Z0-9_]*)\""),
+        re.compile(r"\b(?:option_)?env!\(\s*\"([A-Z][A-Z0-9_]*)\""),
+        re.compile(r"\benv\s*=\s*\"([A-Z][A-Z0-9_]*)\""),
+    ),
+    "go": (re.compile(r"\bos\.(?:Getenv|LookupEnv)\(\s*\"([A-Z][A-Z0-9_]*)\""), re.compile(r"\benv(?:config)?:\"([A-Z][A-Z0-9_]*)")),
+    "python": (
+        re.compile(r"\benviron\[\s*[\"']([A-Z][A-Z0-9_]*)[\"']"),
+        re.compile(r"\b(?:environ\.get|getenv)\(\s*[\"']([A-Z][A-Z0-9_]*)[\"']"),
+    ),
+    "js": (
+        re.compile(r"\bprocess\.env\.([A-Z][A-Z0-9_]*)"),
+        re.compile(r"\bprocess\.env\[\s*[\"']([A-Z][A-Z0-9_]*)[\"']"),
+        re.compile(r"\bimport\.meta\.env\.([A-Z][A-Z0-9_]*)"),
+    ),
+}
+SHELL_ENV_RE = re.compile(r"\$\{?([A-Z][A-Z0-9_]*)")
+COMPOSE_ENV_RE = re.compile(r"^[ \t]*-?[ \t]*([A-Z][A-Z0-9_]*)[ \t]*[=:]", re.MULTILINE)
+DOCKER_ENV_RE = re.compile(r"^[ \t]*(?:ENV|ARG)[ \t]+([A-Z][A-Z0-9_]*)", re.MULTILINE)
+DOTENV_RE = re.compile(r"^[ \t]*(?:export[ \t]+)?([A-Z][A-Z0-9_]*)=", re.MULTILINE)
+LANG_OF = {
+    ".rs": "rust",
+    ".go": "go",
+    ".py": "python",
+    ".js": "js",
+    ".mjs": "js",
+    ".cjs": "js",
+    ".ts": "js",
+    ".tsx": "js",
+    ".jsx": "js",
+    ".mts": "js",
+}
+CLAP_FIELD_RE = re.compile(
+    r"#\[(?:arg|clap)\(((?:[^\[\]]|\[[^\[\]]*\])*)\)\]\s*(?:(?:///[^\n]*|#\[[^\]]*\])\s*)*(?:pub(?:\([^)]*\))?\s+)?(?:r#)?(\w+)\s*:"
+)
+CLAP_FLATTEN_RE = re.compile(r"#\[(?:command|clap)\(\s*flatten\s*\)\]\s*(?:(?:///[^\n]*|#\[[^\]]*\])\s*)*(?:pub(?:\([^)]*\))?\s+)?\w+\s*:\s*([\w:]+)")
+FLAG_DEFS = {
+    "rust": (re.compile(r"\.long\(\s*\"([\w-]+)\""), re.compile(r"\b(?:visible_)?alias(?:es)?\s*=\s*\[?\s*\"([\w-]+)\"")),
+    "go": (
+        re.compile(r"\.(?:Persistent)?Flags\(\)\.\w+\(\s*(?:&[\w.\[\]]+\s*,\s*)?\"([\w-]+)\""),
+        re.compile(r"\bflag\.\w+\(\s*(?:&[\w.\[\]]+\s*,\s*)?\"([\w-]+)\""),
+        re.compile(r"&cli\.\w+Flag\{[^}]*?Name:\s*\"([\w-]+)\"", re.DOTALL),
+        re.compile(r"\.Flag\(\s*\"([\w-]+)\""),
+    ),
+    "python": (re.compile(r"\b(?:add_argument|option|Option)\(([^)]*)\)"),),
+    "js": (re.compile(r"\.(?:option|requiredOption)\(\s*['\"`]([^'\"`]+)['\"`]"),),
+}
+GLIB_FLAG_RE = re.compile(r"add_main_option\(\s*\"([\w-]+)\"")
+AUTO_FLAGS = frozenset({"--help", "--version"})
+STATUS_RE = re.compile(
+    r"\b(since|from|as of|added in|introduced in|available in|new in|released in|until|before|planned for|coming in|will (?:be|ship|land) in)[ \t]+(?:version[ \t]+)?v?(\d+\.\d+(?:\.\d+)?)\b",
+    re.IGNORECASE,
+)
+COUNT_RE = re.compile(
+    r"\b(\d{1,4})[ \t]+(commands?|subcommands?|checks?|rules?|crates?|skills?|plugins?|tests?|flags?|options?|endpoints?|languages?|monitors?|models?|refusals?|devices?)\b",
+    re.IGNORECASE,
+)
+PATH_SPAN_RE = re.compile(
+    r"^(?:\./)?(?:\.?[\w@+-][\w.@+-]*/)+[\w@+.-]*$|^(?:\./)?\.?[\w@+-][\w.@+-]*\.(?:sh|py|rs|go|toml|ya?ml|json|mk|ts|js|md|txt|cfg|ini|conf|service|desktop|xml|blp|ui|css)$"
+)
+
+
+class _Unexpandable(Exception):
+    pass
+
+
+def _join_continuations(text: str) -> list[tuple[int, str]]:
+    out: list[tuple[int, str]] = []
+    pending = ""
+    start = 0
+    for number, line in enumerate(text.split("\n"), 1):
+        if not pending:
+            start = number
+        if line.endswith("\\"):
+            pending += line[:-1] + " "
+            continue
+        out.append((start, pending + line))
+        pending = ""
+    if pending:
+        out.append((start, pending))
+    return out
+
+
+class MakeModel:
+    """Targets of a Makefile and the files it includes, read statically (nothing is run)."""
+
+    def __init__(self, repo: Repo, makefile: str) -> None:
+        self.repo = repo
+        self.base = str(PurePosixPath(makefile).parent)
+        self.variables: dict[str, str] = {}
+        self.targets: dict[str, str] = {}
+        self.problems: list[str] = []
+        self.files: list[str] = []
+        self._read(makefile, 0)
+
+    def expand(self, text: str, depth: int = 0) -> str:
+        if depth > 12:
+            raise _Unexpandable(text)
+        previous = None
+        while previous != text:
+            previous = text
+            text = MAKE_FUNC_RE.sub(lambda m: self._function(m.group(1), m.group(2), depth), text)
+            text = MAKE_REF_RE.sub(lambda m: self._variable(m.group(1), depth), text)
+        if "$(" in text or "${" in text:
+            raise _Unexpandable(text)
+        return text.replace("$$", "$")
+
+    def _variable(self, name: str, depth: int) -> str:
+        if name in self.variables:
+            return self.expand(self.variables[name], depth + 1)
+        if name == "CURDIR":
+            return self.base
+        if name in ("MAKE", "MAKEFILE_LIST", "SHELL"):
+            return name
+        raise _Unexpandable(name)
+
+    def _function(self, name: str, body: str, depth: int) -> str:
+        if name == "shell" and re.match(r"^\s*(?:git rev-parse --show-toplevel|pwd)\b", body):
+            # the repository-root idiom: REPO_ROOT := $(shell git rev-parse --show-toplevel 2>/dev/null || pwd)
+            return self.base
+        args = [self.expand(a, depth + 1) for a in body.split(",")]
+        if name == "addprefix" and len(args) == 2:
+            return " ".join(args[0].strip() + w for w in args[1].split())
+        if name == "addsuffix" and len(args) == 2:
+            return " ".join(w + args[0].strip() for w in args[1].split())
+        if name in ("strip", "sort"):
+            words = args[0].split()
+            return " ".join(sorted(set(words)) if name == "sort" else words)
+        if name == "wildcard":
+            matched = [
+                f for pattern in args[0].split() for f in self.repo.files if PurePosixPath(f).match(normalize_path(self.base, pattern) or pattern)
+            ]
+            return " ".join(sorted({str(PurePosixPath(f).relative_to(self.base)) if self.base != "." else f for f in matched}))
+        raise _Unexpandable(name)
+
+    def _read(self, rel: str, depth: int) -> None:
+        text, status = self.repo.text(rel)
+        if text is None:
+            self.problems.append(f"{rel} ({status})")
+            return
+        self.files.append(rel)
+        for number, line in _join_continuations(text):
+            if line.startswith("\t") or not line.strip() or line.lstrip().startswith("#"):
+                continue
+            stripped = re.sub(r"[ \t]+#.*$", "", line).rstrip()
+            include = MAKE_INCLUDE_RE.match(stripped)
+            if include:
+                optional = include.group(1) != "include"
+                try:
+                    names = self.expand(include.group(2)).split()
+                except _Unexpandable as error:
+                    self.problems.append(f"{rel}:{number} include of {include.group(2).strip()} ({error} is not known statically)")
+                    continue
+                for name in names:
+                    target = normalize_path(self.base, name)
+                    if target and target in self.repo.file_set and depth < 10:
+                        self._read(target, depth + 1)
+                    elif not optional:
+                        self.problems.append(f"{rel}:{number} includes {name}, which is not in the repository")
+                continue
+            if "$(eval" in stripped or stripped.startswith("define "):
+                self.problems.append(f"{rel}:{number} defines targets dynamically ({stripped.split()[0]})")
+                continue
+            variable = MAKE_VAR_RE.match(stripped)
+            if variable:
+                if variable.group(2) == "+=":
+                    self.variables[variable.group(1)] = self.variables.get(variable.group(1), "") + " " + variable.group(3)
+                elif variable.group(2) != "?=" or variable.group(1) not in self.variables:
+                    self.variables[variable.group(1)] = variable.group(3)
+                continue
+            rule = MAKE_RULE_RE.match(stripped)
+            if rule:
+                try:
+                    names = self.expand(rule.group(1)).split()
+                except _Unexpandable:
+                    self.problems.append(f"{rel}:{number} rule {rule.group(1).strip()} names targets through unknown variables")
+                    continue
+                for name in names:
+                    if not name.startswith(".") and "%" not in name:
+                        self.targets.setdefault(name, f"{rel}:{number}")
+
+
+def project_binaries(repo: Repo) -> dict[str, str]:
+    """The project's own executables: name -> language."""
+    binaries: dict[str, str] = {}
+    for rel in repo.files:
+        name = PurePosixPath(rel).name
+        if name == "Cargo.toml":
+            text, _ = repo.text(rel)
+            try:
+                data = tomllib.loads(text or "")
+            except tomllib.TOMLDecodeError:
+                continue
+            package = data.get("package", {})
+            directory = str(PurePosixPath(rel).parent)
+            main = normalize_path(directory, "src/main.rs")
+            if package.get("name") and main in repo.file_set:
+                binaries[str(package["name"])] = "rust"
+            for entry in data.get("bin", []) or []:
+                if isinstance(entry, dict) and entry.get("name"):
+                    binaries[str(entry["name"])] = "rust"
+        elif name == "main.go":
+            parts = PurePosixPath(rel).parts
+            if len(parts) >= 3 and parts[-3] == "cmd":
+                binaries[parts[-2]] = "go"
+        elif name == "pyproject.toml":
+            text, _ = repo.text(rel)
+            try:
+                scripts = tomllib.loads(text or "").get("project", {}).get("scripts", {})
+            except tomllib.TOMLDecodeError:
+                continue
+            binaries.update(dict.fromkeys(map(str, scripts), "python"))
+        elif name == "package.json" and "node_modules/" not in rel:
+            text, _ = repo.text(rel)
+            try:
+                manifest = json.loads(text or "{}")
+            except json.JSONDecodeError:
+                continue
+            bin_field = manifest.get("bin") if isinstance(manifest, dict) else None
+            if isinstance(bin_field, str) and manifest.get("name"):
+                binaries[str(manifest["name"]).rsplit("/", 1)[-1]] = "js"
+            elif isinstance(bin_field, dict):
+                binaries.update(dict.fromkeys(map(str, bin_field), "js"))
+    if "go.mod" in repo.file_set and not any(lang == "go" for lang in binaries.values()):
+        text, _ = repo.text("go.mod")
+        module = re.search(r"^module\s+(\S+)", text or "", re.MULTILINE)
+        main_text = repo.text("main.go")[0] if "main.go" in repo.file_set else None
+        if module and main_text and re.search(r"^package main\b", main_text, re.MULTILINE):
+            binaries[module.group(1).rsplit("/", 1)[-1]] = "go"
+    return binaries
+
+
+def _is_test_path(rel: str) -> bool:
+    path = PurePosixPath(rel)
+    return bool(
+        set(path.parts[:-1]) & {"test", "tests", "testdata", "__tests__", "spec"} or re.search(r"(^test_|_test\.|\.test\.|\.spec\.)", path.name)
+    )
+
+
+def flag_definitions(text: str, language: str, constants: dict[str, str] | None = None) -> set[str]:
+    """Long flags a source file defines: CLI-library patterns, plus "--flag" literals of hand parsers."""
+    flags: set[str] = set(FLAG_LITERAL_RE.findall(text))
+    for name in GLIB_CONST_FLAG_RE.findall(text):
+        if constants and name in constants:
+            flags.add("--" + constants[name].lstrip("-"))
+    if language == "rust":
+        for match in CLAP_FIELD_RE.finditer(text):
+            attrs = match.group(1)
+            if not re.search(r"\blong\b", attrs):
+                continue
+            explicit = re.search(r"\blong\s*=\s*\"([\w-]+)\"", attrs)
+            flags.add("--" + (explicit.group(1) if explicit else match.group(2).replace("_", "-")))
+            flags.update("--" + a for a in re.findall(r"\b(?:visible_)?(?:long_)?alias(?:es)?\s*=\s*\[?\s*\"([\w-]+)\"", attrs))
+    for pattern in FLAG_DEFS.get(language, ()):
+        for match in pattern.finditer(text):
+            value = match.group(1)
+            if language == "python":
+                flags.update(re.findall(r"[\"'](--[\w-]+)[\"']", value))
+            elif language == "js":
+                if "--" in value:
+                    flags.update(re.findall(r"(--[\w-]+)", value))
+                else:
+                    flags.add("--" + value.strip())
+            else:
+                flags.add("--" + value)
+    flags.update("--" + f for f in GLIB_FLAG_RE.findall(text))
+    return flags
+
+
+def env_readers(rel: str, text: str) -> set[str]:
+    """Environment variables the file reads through a language API."""
+    language = LANG_OF.get(PurePosixPath(rel).suffix.lower())
+    found: set[str] = set()
+    for pattern in ENV_READERS.get(language or "", ()):
+        found.update(pattern.findall(text))
+    return found
+
+
+def env_mentions(rel: str, text: str) -> set[str]:
+    """Variables a script, compose file, Dockerfile, workflow or .env sample uses or defines."""
+    name = re.sub(r"\.(?:j2|jinja2?|tmpl|tpl|template|example|sample|dist)$", "", PurePosixPath(rel).name)
+    found: set[str] = set()
+    if name.endswith((".sh", ".bash", ".zsh", ".mk")) or name in ("Makefile", "GNUmakefile", "justfile", "Justfile") or rel.startswith(".github/"):
+        found.update(SHELL_ENV_RE.findall(text))
+    if re.match(r"(docker-)?compose.*\.ya?ml$", name) or name.startswith("Dockerfile") or name.endswith(".env") or ".env." in name or name == ".env":
+        found.update(SHELL_ENV_RE.findall(text))
+        found.update(COMPOSE_ENV_RE.findall(text))
+        found.update(DOCKER_ENV_RE.findall(text))
+        found.update(DOTENV_RE.findall(text))
+    return found
+
+
+def _implicit_env(name: str) -> bool:
+    return name in IMPLICIT_ENV or name.startswith(IMPLICIT_ENV_PREFIXES)
+
+
+def doc_commands(doc: MarkdownDoc) -> Iterable[tuple[int, str, str]]:
+    """(line, command, origin) for every shell command in a doc: code blocks and inline code."""
+    for info, content, line in doc.code_blocks:
+        if info.split(" ", 1)[0].lower() not in SHELL_INFOS:
+            continue
+        prompted = any(re.match(r"^[ \t]*[$%#][ \t]", text) for text in content.split("\n"))
+        for offset, text in _join_continuations(content):
+            stripped = text.strip()
+            if prompted:
+                prompt = re.match(r"^[$%][ \t]+(.*)$", stripped)
+                if not prompt:
+                    continue
+                stripped = prompt.group(1)
+            if stripped and not stripped.startswith("#"):
+                yield line + offset, stripped, "block"
+    body = without_fences("\n".join(doc.lines))
+    for number, text in enumerate(body.split("\n"), 1):
+        for match in CODE_SPAN_RE.finditer(text):
+            yield number, match.group(2).strip(), "span"
+
+
+def _split_command(text: str) -> list[list[str]]:
+    """Shell words of each command in a line: comments dropped, split at ;, &, |, && and ||."""
+    lexer = shlex.shlex(text, posix=True, punctuation_chars=";&|()<>")
+    lexer.whitespace_split = True
+    try:
+        words = list(lexer)
+    except ValueError:
+        words = text.split("#", 1)[0].split()
+    commands: list[list[str]] = [[]]
+    for word in words:
+        if word and set(word) <= set(";&|()<>"):
+            commands.append([])
+        else:
+            commands[-1].append(word)
+    out = []
+    for words_of_command in commands:
+        start = 0
+        while start < len(words_of_command) and (
+            re.match(r"^[A-Za-z_]\w*=", words_of_command[start]) or words_of_command[start] in ("sudo", "env", "time", "exec", "command")
+        ):
+            start += 1
+        if start < len(words_of_command):
+            out.append(words_of_command[start:])
+    return out
+
+
+def _placeholder(token: str) -> bool:
+    return not re.match(r"^[\w.+/@:-]+$", token) or token.isupper()
+
+
+def cmd_drift(args: argparse.Namespace, report: Report) -> list[str]:
+    repo = Repo(Path(args.root))
+    site = load_site(repo, report)
+    corpus = Corpus(repo, site)
+    report.coverage.append(
+        CoverageRow("markdown", "partial" if corpus.unreadable else "complete", ", ".join(corpus.unreadable) or f"{len(corpus.docs)} files")
+    )
+    scope = select_scope(corpus, args.scope)
+    binaries = project_binaries(repo)
+    # Definitions in the code
+    makefiles = {r: None for r in repo.files if PurePosixPath(r).name in ("Makefile", "GNUmakefile", "makefile") and not _is_test_path(r)}
+    models = {r: MakeModel(repo, r) for r in makefiles}
+    make_problems = [p for m in models.values() for p in m.problems]
+    flags: dict[str, set[str]] = defaultdict(set)
+    readers: dict[str, list[str]] = defaultdict(list)
+    mentioned: set[str] = set()
+    flatten_unknown: list[str] = []
+    rust_structs: set[str] = set()
+    constants: dict[str, str] = {}
+    for rel in repo.files:
+        if rel.endswith(".rs") and not _is_test_path(rel):
+            constants.update(RUST_STR_CONST_RE.findall(repo.text(rel)[0] or ""))
+    for rel in repo.files:
+        suffix = PurePosixPath(rel).suffix.lower()
+        language = LANG_OF.get(suffix)
+        text, _ = repo.text(rel)
+        if not text:
+            continue
+        if language and not _is_test_path(rel):
+            flags[language].update(flag_definitions(text, language, constants))
+            if language == "rust":
+                rust_structs.update(re.findall(r"\bstruct\s+(\w+)", text))
+                flatten_unknown += [f"{rel}: {t}" for t in CLAP_FLATTEN_RE.findall(text)]
+            if not _is_test_path(rel):
+                for name in env_readers(rel, text):
+                    readers[name].append(rel)
+        if suffix not in MARKDOWN_EXTENSIONS:
+            mentioned.update(env_mentions(rel, text))
+            mentioned.update(env_readers(rel, text))
+    flatten_unknown = [f for f in flatten_unknown if f.rsplit("::", 1)[-1].rsplit(" ", 1)[-1] not in rust_structs]
+    scripts = _package_scripts(repo)
+    recipes = _just_recipes(repo)
+    languages = set(binaries.values())
+    known_flags = set(AUTO_FLAGS).union(*(flags[lang] for lang in languages)) if languages else set(AUTO_FLAGS)
+    if not makefiles:
+        report.coverage.append(CoverageRow("make", "not_applicable", "no Makefile"))
+    else:
+        reason = f"{sum(len(m.targets) for m in models.values())} targets from {sum(len(m.files) for m in models.values())} files"
+        report.coverage.append(
+            CoverageRow("make", "partial" if make_problems else "complete", reason + ("; " + "; ".join(make_problems[:5]) if make_problems else ""))
+        )
+    if not binaries:
+        report.coverage.append(CoverageRow("flags", "not_applicable", "no project binaries found"))
+    else:
+        missing_lang = sorted(lang for lang in languages if not flags[lang])
+        problems = [f"no flag definitions recognised in the {lang} sources" for lang in missing_lang] + [
+            f"flattened type defined outside the repository: {f}" for f in flatten_unknown[:5]
+        ]
+        report.coverage.append(
+            CoverageRow(
+                "flags", "partial" if problems else "complete", "; ".join(problems) or f"{len(known_flags)} flags for {', '.join(sorted(binaries))}"
+            )
+        )
+    report.coverage.append(CoverageRow("env", "complete", f"{len(readers)} variables read through language APIs"))
+    rows = {r.input: r for r in report.coverage}
+    flag_confidence = "verified" if rows["flags"].complete else "likely"
+    make_confidence = "verified" if rows["make"].complete else "likely"
+    documented_env: dict[str, tuple[str, int]] = {}
+    seen: set[tuple[str, int, str]] = set()
+
+    def add(finding: Finding) -> None:
+        key = (finding.file, finding.line, finding.message)
+        if key not in seen:
+            seen.add(key)
+            report.add(finding)
+
+    for rel in sorted(scope):
+        doc = corpus.docs[rel]
+        base_dir = str(PurePosixPath(rel).parent)
+        for number, command, origin in doc_commands(doc):
+            if origin == "span":
+                env = DOC_ENV_SPAN_RE.match(command)
+                line_text = doc.lines[number - 1] if number <= len(doc.lines) else ""
+                if env and (command[0] == "$" or "=" in command or ENV_CONTEXT_RE.search(line_text)):
+                    documented_env.setdefault(env.group(1), (rel, number))
+                flag = FLAG_TOKEN_RE.match(command)
+                mentions_binary = any(re.search(rf"(?<![\w-]){re.escape(b)}(?![\w-])", line_text) for b in binaries)
+                if flag and mentions_binary and flag.group(1) not in known_flags:
+                    add(
+                        Finding(
+                            "flag-unknown",
+                            "P3",
+                            "unverified",
+                            rel,
+                            number,
+                            f"{flag.group(1)} is not a flag of {', '.join(sorted(binaries))}",
+                            suggestion="if it is another tool's flag, ignore this lead",
+                        )
+                    )
+            else:
+                for match in DOC_ENV_BLOCK_RE.finditer(command):
+                    documented_env.setdefault(match.group(1) or match.group(2), (rel, number))
+            for tokens in _split_command(command):
+                _check_command(
+                    tokens,
+                    rel,
+                    number,
+                    origin,
+                    base_dir,
+                    repo,
+                    models,
+                    scripts,
+                    recipes,
+                    binaries,
+                    known_flags,
+                    flag_confidence,
+                    make_confidence,
+                    add,
+                )
+    for name, (rel, number) in sorted(documented_env.items()):
+        if name not in readers and name not in mentioned and not _implicit_env(name):
+            add(
+                Finding(
+                    "env-unknown",
+                    "P2",
+                    "likely",
+                    rel,
+                    number,
+                    f"{name} is documented but nothing in the repository reads it",
+                    suggestion="remove it from the docs, or point at the code that reads it",
+                )
+            )
+    all_text = "\n".join("\n".join(d.lines) for d in corpus.docs.values())
+    for name, files in sorted(readers.items()):
+        if not _implicit_env(name) and not re.search(rf"(?<![\w]){re.escape(name)}(?![\w])", all_text):
+            add(
+                Finding(
+                    "env-undocumented",
+                    "P3",
+                    "unverified",
+                    files[0],
+                    _line_of(repo, files[0], name),
+                    f"{name} is read here but no Markdown file mentions it",
+                )
+            )
+    if args.paths:
+        _check_paths(corpus, scope, repo, add)
+    history = _commit_times(repo)
+    report.data["stale"] = _staleness(corpus, scope, repo, history)
+    if args.leads:
+        _status_leads(corpus, scope, repo, add)
+        for item in report.data["stale"]:
+            add(
+                Finding(
+                    "stale-lead",
+                    "P3",
+                    "unverified",
+                    item["doc"],
+                    1,
+                    f"last changed {item['days']} days before {item['reference']}, which it references",
+                    suggestion="check the doc against the current file",
+                )
+            )
+    if args.base:
+        _base_drift(args.base, repo, corpus, models, flags, readers, add)
+    report.data.update(
+        {
+            "binaries": binaries,
+            "make_targets": sorted({t for m in models.values() for t in m.targets}),
+            "flags": sorted(known_flags),
+            "env_read": sorted(readers),
+            "package_scripts": sorted(scripts),
+        }
+    )
+    return ["markdown", "make", "flags", "env"]
+
+
+def _line_of(repo: Repo, rel: str, needle: str) -> int:
+    text, _ = repo.text(rel)
+    for number, line in enumerate((text or "").split("\n"), 1):
+        if needle in line:
+            return number
+    return 1
+
+
+def _package_scripts(repo: Repo) -> set[str]:
+    """Scripts of every package.json in the repository (a doc may cd into a package first)."""
+    scripts: set[str] = set()
+    for rel in repo.files:
+        if PurePosixPath(rel).name != "package.json" or "node_modules/" in rel:
+            continue
+        text, _ = repo.text(rel)
+        try:
+            manifest = json.loads(text) if text else {}
+        except json.JSONDecodeError:
+            continue
+        if isinstance(manifest, dict) and isinstance(manifest.get("scripts"), dict):
+            scripts.update(manifest["scripts"])
+    return scripts
+
+
+def _just_recipes(repo: Repo) -> set[str]:
+    for name in ("justfile", "Justfile", ".justfile"):
+        if name in repo.file_set:
+            text, _ = repo.text(name)
+            return set(re.findall(r"^@?([a-zA-Z_][\w-]*)(?:[ \t]+[^:\n=]*)?:(?!=)", text or "", re.MULTILINE))
+    return set()
+
+
+def _check_command(
+    tokens: list[str],
+    rel: str,
+    number: int,
+    origin: str,
+    base_dir: str,
+    repo: Repo,
+    models: dict[str, MakeModel],
+    scripts: set[str],
+    recipes: set[str],
+    binaries: dict[str, str],
+    known_flags: set[str],
+    flag_confidence: str,
+    make_confidence: str,
+    add: Callable[[Finding], None],
+) -> None:
+    program = tokens[0]
+    rest = tokens[1:]
+    if program in ("make", "gmake"):
+        directory, makefile, targets = ".", None, []
+        index = 0
+        while index < len(rest):
+            token = rest[index]
+            if token in ("-C", "--directory", "-f", "--file", "--makefile", "-j", "--jobs", "-l", "-o", "-W") and index + 1 < len(rest):
+                if token in ("-C", "--directory"):
+                    directory = normalize_path(directory, rest[index + 1]) or directory
+                elif token in ("-f", "--file", "--makefile"):
+                    makefile = rest[index + 1]
+                index += 2
+                continue
+            if token.startswith("--directory="):
+                directory = normalize_path(directory, token.split("=", 1)[1]) or directory
+            elif token.startswith(("--file=", "--makefile=")):
+                makefile = token.split("=", 1)[1]
+            elif not token.startswith("-") and "=" not in token and not _placeholder(token):
+                targets.append(token)
+            index += 1
+        path = (
+            normalize_path(directory, makefile)
+            if makefile
+            else next((normalize_path(directory, n) for n in ("GNUmakefile", "makefile", "Makefile") if normalize_path(directory, n) in models), None)
+        )
+        model = models.get(path or "")
+        if model is None:
+            if targets and origin == "block":
+                add(Finding("make-missing", "P2", "likely", rel, number, f"make {' '.join(targets)}: no Makefile at {directory}"))
+            return
+        for target in targets:
+            if target not in model.targets:
+                add(
+                    Finding(
+                        "make-target-missing",
+                        "P1",
+                        make_confidence,
+                        rel,
+                        number,
+                        f"make {target}: no such target in {path} or the files it includes",
+                        suggestion=f"targets: {', '.join(sorted(model.targets)[:12])}",
+                    )
+                )
+        return
+    if (
+        program in ("npm", "pnpm", "yarn", "bun")
+        and len(rest) >= 2
+        and rest[0] == "run"
+        and not rest[1].startswith("-")
+        and not _placeholder(rest[1])
+    ):
+        if rest[1] not in scripts:
+            add(Finding("script-missing", "P1", "verified", rel, number, f"{program} run {rest[1]}: package.json has no such script"))
+        return
+    if program == "just" and rest and not rest[0].startswith("-") and recipes and not _placeholder(rest[0]):
+        if rest[0] not in recipes:
+            add(Finding("recipe-missing", "P1", "verified", rel, number, f"just {rest[0]}: the justfile has no such recipe"))
+        return
+    if program in ("bash", "sh", "zsh", "python", "python3") and rest and not rest[0].startswith("-"):
+        program, rest = rest[0], rest[1:]
+    if program.startswith("./") or re.match(r"^(?:scripts|bin|tools|hack|ci)/[\w./-]+$", program):
+        target = _strip_dot_slash(program)
+        if not _placeholder(target) and not repo.exists(target) and not repo.exists(normalize_path(base_dir, target) or ""):
+            parent = str(PurePosixPath(target).parent)
+            if parent == "." or repo.exists(parent):
+                add(
+                    Finding(
+                        "path-missing",
+                        "P2",
+                        "likely",
+                        rel,
+                        number,
+                        f"{program}: no such file in the repository",
+                        suggestion="if it runs on another machine, say so in the text",
+                    )
+                )
+            else:
+                add(Finding("path-missing", "P3", "unverified", rel, number, f"{program}: {parent}/ is not in the repository (a build output?)"))
+        return
+    binary = program
+    if program == "cargo" and rest[:1] == ["run"]:
+        binary = next(iter(sorted(b for b, lang in binaries.items() if lang == "rust")), "")
+        rest = rest[rest.index("--") + 1 :] if "--" in rest else []
+    elif program == "go" and rest[:1] == ["run"] and len(rest) > 1:
+        binary = PurePosixPath(rest[1]).name if rest[1].startswith(("./", "cmd/")) else ""
+        rest = rest[2:]
+    if binary in binaries:
+        for token in rest:
+            if token == "--":
+                break
+            flag = FLAG_TOKEN_RE.match(token)
+            if flag and flag.group(1) not in known_flags:
+                add(
+                    Finding(
+                        "flag-unknown",
+                        "P1",
+                        flag_confidence,
+                        rel,
+                        number,
+                        f"{binary} {flag.group(1)}: the code defines no such flag",
+                        suggestion="update the doc to the current flag name",
+                    )
+                )
+
+
+def _check_paths(corpus: Corpus, scope: set[str], repo: Repo, add: Callable[[Finding], None]) -> None:
+    for rel in sorted(scope):
+        doc = corpus.docs[rel]
+        base_dir = str(PurePosixPath(rel).parent)
+        for number, span, origin in doc_commands(doc):
+            if origin != "span" or not PATH_SPAN_RE.match(span) or "://" in span or span.startswith(("~", "/")):
+                continue
+            target = _strip_dot_slash(span).rstrip("/")
+            if _placeholder(target) or not target:
+                continue
+            if not repo.exists(target) and not repo.exists(normalize_path(base_dir, target) or ""):
+                add(Finding("path-missing", "P2", "likely", rel, number, f"{span}: no such path in the repository"))
+
+
+def _commit_times(repo: Repo) -> dict[str, int]:
+    """The time of the last commit that touched each path (one read-only git log)."""
+    if not repo.is_git:
+        return {}
+    out = git(repo.root, "log", "--format=%x00%ct", "--name-only", "--no-renames")
+    times: dict[str, int] = {}
+    if not out:
+        return times
+    for chunk in out.split("\0")[1:]:
+        lines = chunk.strip("\n").split("\n")
+        stamp = int(lines[0]) if lines and lines[0].isdigit() else 0
+        for name in lines[1:]:
+            if name and name not in times:
+                times[name] = stamp
+    return times
+
+
+def _staleness(corpus: Corpus, scope: set[str], repo: Repo, history: dict[str, int]) -> list[dict[str, Any]]:
+    """Docs whose last commit is older than the last commit of a file they link to or name."""
+    out = []
+    for rel in sorted(scope):
+        if rel not in history:
+            continue
+        doc = corpus.docs[rel]
+        base_dir = str(PurePosixPath(rel).parent)
+        references: set[str] = set()
+        for link in doc.links:
+            target = unquote(link.target.split("#", 1)[0])
+            if target and not SCHEME_RE.match(target):
+                resolved = normalize_path(base_dir, target)
+                if resolved and resolved in repo.file_set and not resolved.endswith(MARKDOWN_EXTENSIONS):
+                    references.add(resolved)
+        for _number, span, origin in doc_commands(doc):
+            if origin == "span" and PATH_SPAN_RE.match(span):
+                candidate = _strip_dot_slash(span)
+                if candidate in repo.file_set and not candidate.endswith(MARKDOWN_EXTENSIONS):
+                    references.add(candidate)
+        dated = [(history[r], r) for r in references if r in history]
+        if dated:
+            newest, reference = max(dated)
+            if newest > history[rel]:
+                out.append({"doc": rel, "reference": reference, "days": (newest - history[rel]) // 86400})
+    return out
+
+
+def _version_key(version: str) -> tuple[int, ...]:
+    return tuple(int(p) for p in re.findall(r"\d+", version)[:3])
+
+
+def _status_leads(corpus: Corpus, scope: set[str], repo: Repo, add: Callable[[Finding], None]) -> None:
+    tags_out = git(repo.root, "tag", "--list") if repo.is_git else None
+    tags = {m.group(1) for t in (tags_out or "").split() if (m := re.search(r"v?(\d+\.\d+(?:\.\d+)?)$", t))}
+    latest = max(tags, key=_version_key) if tags else None
+    for rel in sorted(scope):
+        for block in corpus.docs[rel].blocks:
+            if block.type not in ("paragraph", "list-item", "quote") and not block.type.startswith(("admonition", "alert")):
+                continue
+            for match in STATUS_RE.finditer(block.text):
+                word, version = match.group(1).lower(), match.group(2)
+                future = word.startswith(("planned", "coming", "will"))
+                released = any(_version_key(t) == _version_key(version) for t in tags)
+                if future and released:
+                    add(Finding("status-claim", "P2", "unverified", rel, block.line, f"says {version} is upcoming, but it is tagged"))
+                elif not future and tags and not released and latest and _version_key(version) > _version_key(latest):
+                    add(Finding("status-claim", "P2", "unverified", rel, block.line, f"names {version} as released; the latest tag is {latest}"))
+            for match in COUNT_RE.finditer(block.text):
+                add(
+                    Finding(
+                        "count-lead",
+                        "P3",
+                        "unverified",
+                        rel,
+                        block.line,
+                        f"hand-maintained count: {match.group(0)!r}",
+                        suggestion="recount, or drop the number",
+                    )
+                )
+
+
+def _diff_sides(repo: Repo, base: str) -> dict[str, tuple[str, str]]:
+    """Per changed non-Markdown file: (removed lines, added lines) of git diff base."""
+    if not repo.is_git or git(repo.root, "rev-parse", "--verify", "--quiet", base + "^{commit}") is None:
+        raise UsageError(f"--base {base} is not a commit in this repository")
+    out = git(
+        repo.root, "diff", "--no-color", "--no-ext-diff", "--unified=0", "--no-renames", base, "--", ".", ":(exclude)*.md", ":(exclude)*.markdown"
+    )
+    sides: dict[str, tuple[list[str], list[str]]] = {}
+    current = None
+    for line in (out or "").split("\n"):
+        if line.startswith("+++ "):
+            current = line[6:] if line.startswith("+++ b/") else current
+        elif line.startswith("--- "):
+            current = line[6:] if line.startswith("--- a/") else None
+        elif current and line.startswith("-") and not line.startswith("---"):
+            sides.setdefault(current, ([], []))[0].append(line[1:])
+        elif current and line.startswith("+") and not line.startswith("+++"):
+            sides.setdefault(current, ([], []))[1].append(line[1:])
+    return {k: ("\n".join(v[0]), "\n".join(v[1])) for k, v in sides.items()}
+
+
+def _tokens(rel: str, text: str) -> set[tuple[str, str]]:
+    language = LANG_OF.get(PurePosixPath(rel).suffix.lower())
+    tokens: set[tuple[str, str]] = set()
+    if language:
+        tokens |= {("flag", f) for f in flag_definitions(text, language)}
+        tokens |= {("env", e) for e in env_readers(rel, text)}
+    name = PurePosixPath(rel).name
+    if name in ("Makefile", "GNUmakefile", "makefile") or name.endswith(".mk"):
+        for line in text.split("\n"):
+            rule = MAKE_RULE_RE.match(line)
+            if rule and not line.startswith("\t") and "=" not in rule.group(1):
+                tokens |= {("make", t) for t in rule.group(1).split() if not t.startswith(".") and "%" not in t and "$" not in t}
+    return tokens
+
+
+def _base_drift(
+    base: str,
+    repo: Repo,
+    corpus: Corpus,
+    models: dict[str, MakeModel],
+    flags: dict[str, set[str]],
+    readers: dict[str, list[str]],
+    add: Callable[[Finding], None],
+) -> None:
+    removed: dict[tuple[str, str], str] = {}
+    added: dict[tuple[str, str], str] = {}
+    for rel, (old, new) in sorted(_diff_sides(repo, base).items()):
+        before, after = _tokens(rel, old), _tokens(rel, new)
+        for token in before - after:
+            removed.setdefault(token, rel)
+        for token in after - before:
+            added.setdefault(token, rel)
+    current = (
+        {("flag", f) for fs in flags.values() for f in fs} | {("env", e) for e in readers} | {("make", t) for m in models.values() for t in m.targets}
+    )
+    for token in list(removed):
+        if token in added or token in current:
+            removed.pop(token)
+            added.pop(token, None)
+    for (kind, value), source in sorted(removed.items()):
+        for rel, doc in sorted(corpus.docs.items()):
+            for number, line in enumerate(doc.lines, 1):
+                pattern = rf"\bmake\b[^\n`]*\s{re.escape(value)}\b" if kind == "make" else rf"(?<![\w-]){re.escape(value)}(?![\w-])"
+                if re.search(pattern, line):
+                    add(
+                        Finding(
+                            "removed-still-documented",
+                            "P1",
+                            "verified",
+                            rel,
+                            number,
+                            f"{value} ({kind}) was removed from {source} since {base} but the doc still names it",
+                            [f"{source}: removed"],
+                        )
+                    )
+    all_text = "\n".join("\n".join(d.lines) for d in corpus.docs.values())
+    for (kind, value), source in sorted(added.items()):
+        if not re.search(rf"(?<![\w-]){re.escape(value)}(?![\w-])", all_text):
+            add(
+                Finding(
+                    "added-undocumented",
+                    "P3",
+                    "likely",
+                    source,
+                    _line_of(repo, source, value.lstrip("-")),
+                    f"{value} ({kind}) is new since {base} and no doc mentions it",
+                )
+            )
+
+
+# ---------------------------------------------------------------------------------------------
+# site-build and built-site baselines
+# ---------------------------------------------------------------------------------------------
+
+STAMP_NAME = ".docstool-build.json"
+GENERATOR_HINTS = {
+    "zensical": f"install it from the repository's hashed lock, or pip install zensical=={KNOWN_ZENSICAL}",
+    "mkdocs": "pip install mkdocs and the theme and plugins mkdocs.yml names",
+}
+# Plugins whose inputs docstool knows: none beyond the pages, or the ones it adds below.
+KNOWN_INPUT_PLUGINS = frozenset(
+    [
+        "search",
+        "tags",
+        "offline",
+        "privacy",
+        "social",
+        "meta",
+        "minify",
+        "glightbox",
+        "section-index",
+        "literate-nav",
+        "awesome-nav",
+        "redirects",
+        "gh-admonitions",
+        "callouts",
+        "exclude",
+        "llmstxt",
+        "meta-descriptions",
+        "rss",
+        "optimize",
+        "blog",
+        "autorefs",
+        "mkdocs-nav-weight",
+        "nav-weight",
+        "mkdocs-video",
+        "mkdocs-audio",
+        "table-reader",
+        "include-markdown",
+        "git-revision-date-localized",
+        "mike",
+    ]
+)
+META_REFRESH_RE = re.compile(r"""<meta[^>]+http-equiv=["']refresh["'][^>]*content=["']\s*\d+\s*;\s*url=([^"'>]+)["']""", re.IGNORECASE)
+ID_ATTR_RE = re.compile(r"""\bid=(?:"([^"]+)"|'([^']+)')""")
+INCLUDE_MARKDOWN_RE = re.compile(r"""\{%\s*include(?:-markdown)?\s+["']([^"']+)["']""")
+SNIPPET_BLOCK_RE = re.compile(r"^[ \t]*;?--8<--[ \t]*$")
+
+
+def _snippet_paths(text: str) -> list[str]:
+    paths = []
+    in_block = False
+    for line in text.split("\n"):
+        if SNIPPET_BLOCK_RE.match(line):
+            in_block = not in_block
+            continue
+        if in_block:
+            if line.strip() and not line.strip().startswith(";"):
+                paths.append(line.strip())
+            continue
+        match = SNIPPET_RE.match(line)
+        if match:
+            paths.append(match.group("path"))
+    return paths
+
+
+def build_inputs(repo: Repo, site: Site) -> tuple[dict[str, str], list[str]]:
+    """Every file the build reads, with its SHA-256, and what makes that list incomplete."""
+    inputs: dict[str, str] = {}
+    partial: list[str] = []
+
+    def take(rel: str) -> bool:
+        if rel in inputs:
+            return False
+        digest = file_sha256(repo.root / rel)
+        if digest is None:
+            return False
+        inputs[rel] = digest
+        return True
+
+    if site.config:
+        take(site.config)
+    pages = []
+    for rel in repo.files:
+        if site.in_docs(rel):
+            inner = site.docs_rel(rel)
+            if not (DEFAULT_EXCLUDES.match(inner) or site.exclude.match(inner)):
+                take(rel)
+                if rel.endswith(MARKDOWN_EXTENSIONS):
+                    pages.append(rel)
+        if site.custom_dir and rel.startswith(site.custom_dir + "/"):
+            take(rel)
+    bases = snippet_bases(site)
+    options = site.extensions.get("pymdownx.snippets")
+    appended = options.get("auto_append", []) if isinstance(options, dict) else []
+    queue = list(pages)
+    if bases is not None:
+        for name in appended if isinstance(appended, list) else [appended]:
+            for base in bases:
+                candidate = normalize_path(base, str(name))
+                if candidate and take(candidate):
+                    queue.append(candidate)
+    while queue:
+        rel = queue.pop()
+        text, _ = repo.text(rel)
+        if not text:
+            continue
+        if bases is not None:
+            for raw in _snippet_paths(text):
+                if re.match(r"^https?://", raw):
+                    partial.append(f"{rel}: snippet from a URL ({raw})")
+                    continue
+                name = re.sub(r":(\d+(?::\d+)?|[\w-]+)$", "", raw)
+                found = [c for b in bases if (c := normalize_path(b, name)) and c in repo.file_set]
+                for candidate in found[:1]:
+                    if take(candidate) and candidate.endswith((*MARKDOWN_EXTENSIONS, ".html", ".txt")):
+                        queue.append(candidate)
+        if "include-markdown" in site.plugins:
+            for name in INCLUDE_MARKDOWN_RE.findall(text):
+                candidate = normalize_path(str(PurePosixPath(rel).parent), name)
+                if candidate and take(candidate):
+                    queue.append(candidate)
+    for name, options_value in site.plugins.items():
+        canonical = name.removeprefix("material/").split("/", 1)[0]
+        if canonical == "git-revision-date-localized" or canonical.startswith("git-"):
+            head = git(repo.root, "rev-parse", "HEAD") if repo.is_git else None
+            inputs["git:HEAD"] = (head or "unknown").strip()
+        elif canonical == "macros":
+            module = options_value.get("module_name", "main") if isinstance(options_value, dict) else "main"
+            if f"{module}.py" in repo.file_set or any(f.startswith(f"{module}/") for f in repo.files):
+                partial.append(f"macros module {module} runs Python whose reads docstool cannot follow")
+            include_dir = options_value.get("include_dir") if isinstance(options_value, dict) else None
+            for rel in repo.files:
+                if include_dir and rel.startswith(str(include_dir).strip("/") + "/"):
+                    take(rel)
+        elif canonical not in KNOWN_INPUT_PLUGINS:
+            partial.append(f"plugin {name}: its inputs are not known")
+    if site.kind == "mkdocs" and "hooks" in site.raw:
+        partial.append("hooks: run Python whose reads docstool cannot follow")
+    return dict(sorted(inputs.items())), partial
+
+
+def _tree_sha256(root: Path) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(p for p in root.rglob("*") if p.is_file() and p.name != STAMP_NAME):
+        digest.update(path.relative_to(root).as_posix().encode() + b"\0" + (file_sha256(path) or "").encode() + b"\n")
+    return digest.hexdigest()
+
+
+def _safe_extract(archive: bytes, dest: Path) -> None:
+    with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
+        for member in tar.getmembers():
+            name = PurePosixPath(member.name)
+            if name.is_absolute() or ".." in name.parts or member.isdev():
+                raise UsageError(f"refusing archive member {member.name}")
+            if member.issym() or member.islnk():
+                target = (dest / name.parent / member.linkname).resolve()
+                if not target.is_relative_to(dest.resolve()):
+                    raise UsageError(f"refusing archive link {member.name} -> {member.linkname}")
+        if hasattr(tarfile, "data_filter"):
+            tar.extractall(dest, filter="data")
+        else:  # pragma: no cover - Python 3.11 before 3.11.4
+            tar.extractall(dest)
+
+
+def _copy_worktree(repo: Repo, dest: Path) -> None:
+    for rel in repo.files:
+        target = dest / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(repo.root / rel, target)
+    for rel, real in repo.symlinks.items():
+        if real is not None:
+            link = dest / rel
+            link.parent.mkdir(parents=True, exist_ok=True)
+            link.symlink_to(os.readlink(repo.root / rel))
+
+
+def _fresh_out(out: Path) -> None:
+    if out.is_symlink():
+        raise UsageError(f"--out {out} is a symlink")
+    if out.exists() and (not out.is_dir() or any(out.iterdir())):
+        raise UsageError(f"--out {out} must not exist or must be empty")
+    if ".git" in out.resolve().parts:
+        raise UsageError(f"refusing to write inside .git: {out}")
+
+
+def cmd_site_build(args: argparse.Namespace, report: Report) -> list[str]:
+    repo = Repo(Path(args.root))
+    out = Path(args.out_dir)
+    _fresh_out(out)
+    with tempfile.TemporaryDirectory(prefix="docstool-build-") as scratch:
+        source = Path(scratch) / "src"
+        source.mkdir()
+        commit = None
+        if args.ref:
+            commit = git(repo.root, "rev-parse", "--verify", "--quiet", args.ref + "^{commit}") if repo.is_git else None
+            if commit is None:
+                raise UsageError(f"--ref {args.ref} is not a commit in this repository")
+            commit = commit.strip()
+            archive = subprocess.run(["git", "-C", str(repo.root), "archive", "--format=tar", commit], capture_output=True, check=False)
+            if archive.returncode != 0:
+                raise UsageError(f"git archive {args.ref} failed: {archive.stderr.decode('utf-8', 'replace').strip()}")
+            _safe_extract(archive.stdout, source)
+        else:
+            _copy_worktree(repo, source)
+        built_repo = Repo(source)
+        site = load_site(built_repo, report)
+        if site.config is None or not {r.input: r for r in report.coverage}["config"].complete:
+            raise UsageError("no readable zensical.toml or mkdocs.yml to build")
+        generator = args.generator or ("zensical" if site.kind == "zensical" else "mkdocs")
+        command = shlex.split(args.generator_cmd) if args.generator_cmd else [shutil.which(generator) or ""]
+        if not command[0]:
+            raise UsageError(f"{generator} is not installed: {GENERATOR_HINTS[generator]}")
+        version_run = subprocess.run([*command, "--version"], capture_output=True, text=True, check=False, cwd=source)
+        version = (version_run.stdout or version_run.stderr).strip().split("\n")[0] if version_run.returncode == 0 else "unknown"
+        build = [*command, "build", "--strict", "--clean", "-f", site.config]
+        environment = {**os.environ, "NO_COLOR": "1"}
+        result = subprocess.run(build, capture_output=True, text=True, check=False, cwd=source, env=environment)
+        if result.returncode != 0:
+            tail = "\n".join((result.stdout + result.stderr).strip().split("\n")[-15:])
+            raise UsageError(f"{generator} build failed (exit {result.returncode}); no stamp written:\n{tail}")
+        site_dir = str(site.raw.get("site_dir", "site"))
+        built = source / site_dir
+        if not built.is_dir():
+            raise UsageError(f"{generator} build wrote no {site_dir}/ directory")
+        inputs, partial = build_inputs(Repo(source), site) if args.ref else build_inputs(repo, _reload_site(repo))
+        out.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(built, out, dirs_exist_ok=True, symlinks=True)
+    stamp = {
+        "tool": "docstool",
+        "version": __version__,
+        "ref": args.ref,
+        "commit": commit,
+        "generator": generator,
+        "generator_version": version,
+        "command": " ".join([generator, *build[len(command) :]]),
+        "output_sha256": _tree_sha256(out),
+        "dependencies": "partial" if partial else "complete",
+        "unknown_dependencies": partial,
+        "inputs": inputs,
+    }
+    (out / STAMP_NAME).write_text(json.dumps(stamp, indent=1) + "\n", encoding="utf-8")
+    report.coverage.append(CoverageRow("dependencies", "partial" if partial else "complete", "; ".join(partial[:5]) or f"{len(inputs)} inputs"))
+    report.data.update({k: v for k, v in stamp.items() if k != "inputs"} | {"inputs": len(inputs), "out": str(out)})
+    return []
+
+
+def _reload_site(repo: Repo) -> Site:
+    return load_site(repo, Report(command="site-build", root=str(repo.root)))
+
+
+def load_built(path: str, repo: Repo, site: Site) -> dict[str, Any]:
+    """Read a site-build output; refuse one docstool did not build or whose inputs changed since."""
+    out = Path(path)
+    stamp_path = out / STAMP_NAME
+    if not stamp_path.is_file():
+        raise UsageError(f"{path} has no {STAMP_NAME}: build it with docstool site-build")
+    stamp: dict[str, Any] = json.loads(stamp_path.read_text(encoding="utf-8"))
+    if _tree_sha256(out) != stamp.get("output_sha256"):
+        raise UsageError(f"{path} changed after it was built (output hash differs from the stamp)")
+    if stamp.get("ref"):
+        current = git(repo.root, "rev-parse", "--verify", "--quiet", str(stamp["ref"]) + "^{commit}") if repo.is_git else None
+        if (current or "").strip() != stamp.get("commit"):
+            raise UsageError(f"{path} was built from {stamp['ref']} at {stamp.get('commit')}, which now names another commit")
+    else:
+        inputs, _ = build_inputs(repo, site)
+        if inputs != stamp.get("inputs"):
+            changed = sorted(k for k in set(inputs) | set(stamp.get("inputs", {})) if inputs.get(k) != stamp.get("inputs", {}).get(k))
+            raise UsageError(f"{path} is stale: {len(changed)} build inputs changed since it was built ({', '.join(changed[:5])})")
+    stamp["site"] = read_built_site(out)
+    return stamp
+
+
+def _page_url(rel: str) -> str:
+    if rel == "index.html":
+        return ""
+    if rel.endswith("/index.html"):
+        return rel[: -len("index.html")]
+    return rel
+
+
+def _join_url(page: str, target: str) -> str:
+    joined = urljoin("https://site.invalid/" + page, target.strip())
+    if not joined.startswith("https://site.invalid/"):
+        return target.strip()
+    return joined.removeprefix("https://site.invalid/")
+
+
+def read_built_site(out: Path) -> dict[str, Any]:
+    """Routes of a built site: pages with their element ids, redirect stubs, anchor redirects."""
+    routes: dict[str, dict[str, Any]] = {}
+    for path in sorted(out.rglob("*.html")):
+        rel = path.relative_to(out).as_posix()
+        text = path.read_text(encoding="utf-8", errors="replace")
+        url = _page_url(rel)
+        refresh = META_REFRESH_RE.search(text)
+        if refresh:
+            routes[url] = {"type": "redirect", "to": _join_url(url, html.unescape(refresh.group(1)))}
+        else:
+            ids = sorted({html.unescape(a or b) for a, b in ID_ATTR_RE.findall(text)} - {""})
+            routes[url] = {"type": "page", "ids": [i for i in ids if not i.startswith("__")]}
+    anchors: dict[str, str] = {}
+    redirect_json = out / "redirect.json"
+    if redirect_json.is_file():
+        try:
+            anchors = {str(k): str(v) for k, v in json.loads(redirect_json.read_text(encoding="utf-8")).items()}
+        except (json.JSONDecodeError, AttributeError):
+            anchors = {}
+    sitemap = out / "sitemap.xml"
+    locations = re.findall(r"<loc>([^<]+)</loc>", sitemap.read_text(encoding="utf-8")) if sitemap.is_file() else []
+    return {"routes": routes, "anchor_redirects": anchors, "sitemap": locations}
+
+
+def _source_url(inner: str) -> str:
+    """The directory URL a page under docs_dir gets (use_directory_urls, the default)."""
+    path = PurePosixPath(inner)
+    if path.name in ("index.md", "README.md"):
+        return "" if str(path.parent) == "." else f"{path.parent}/"
+    return str(path.with_suffix("")) + "/"
+
+
+def source_url_baseline(corpus: Corpus) -> dict[str, Any]:
+    """Routes the site would have, derived from the Markdown (used when no build is possible)."""
+    site = corpus.site
+    routes: dict[str, dict[str, Any]] = {}
+    for rel, doc in sorted(corpus.docs.items()):
+        if not site.published(rel):
+            continue
+        routes[_source_url(site.docs_rel(rel))] = {"type": "page", "ids": sorted(doc.anchors(site=True))}
+    for source, target in site.redirects.items():
+        page, _, fragment = target.partition("#")
+        routes.setdefault(_source_url(source), {"type": "redirect", "to": _source_url(page) + ("#" + fragment if fragment else "")})
+    github = {rel: sorted(doc.anchors()) for rel, doc in sorted(corpus.docs.items())}
+    return {"routes": routes, "anchor_redirects": {}, "sitemap": [], "github": github}
+
+
+def compare_url_baseline(baseline: dict[str, Any], new: dict[str, Any], report: Report, where: str) -> None:
+    routes, anchors = new["routes"], new.get("anchor_redirects", {})
+
+    def follow(url: str) -> tuple[str | None, int, str]:
+        seen_urls: list[str] = []
+        current = url.split("#", 1)[0]
+        while True:
+            entry = routes.get(current)
+            if entry is None:
+                return None, len(seen_urls), "missing" if not seen_urls else "dangling"
+            if entry["type"] == "page":
+                return current, len(seen_urls), "ok"
+            if current in seen_urls:
+                return None, len(seen_urls), "loop"
+            seen_urls.append(current)
+            current = entry["to"].split("#", 1)[0]
+
+    for url, old in sorted(baseline["routes"].items()):
+        final, hops, state = follow(url)
+        shown = "/" + url
+        if state == "missing":
+            report.add(
+                Finding(
+                    "route-missing",
+                    "P1",
+                    "verified",
+                    where,
+                    0,
+                    f"{shown} existed before and is neither a page nor a redirect now",
+                    suggestion="add a redirect to the page that took its content",
+                )
+            )
+            continue
+        if state in ("loop", "dangling"):
+            report.add(
+                Finding(
+                    f"redirect-{state}",
+                    "P1",
+                    "verified",
+                    where,
+                    0,
+                    f"{shown}: the redirect chain {'loops' if state == 'loop' else 'ends at a missing page'}",
+                )
+            )
+            continue
+        if hops > 1:
+            report.add(
+                Finding(
+                    "redirect-chain",
+                    "P3",
+                    "verified",
+                    where,
+                    0,
+                    f"{shown} reaches /{final} through {hops} redirects",
+                    suggestion="point the first redirect at the final page",
+                )
+            )
+        if old["type"] != "page" or final is None:
+            continue
+        have = set(routes[final].get("ids", []))
+        lost = []
+        for fragment in old.get("ids", []):
+            if fragment in have:
+                continue
+            mapped = anchors.get(f"{url}#{fragment}") or anchors.get(f"{final}#{fragment}")
+            if mapped:
+                target_page, _, target_id = mapped.partition("#")
+                if target_id in set(routes.get(target_page, {}).get("ids", [])):
+                    continue
+            lost.append(fragment)
+        if lost:
+            report.add(
+                Finding(
+                    "fragment-lost",
+                    "P1",
+                    "verified",
+                    where,
+                    0,
+                    f"/{final}: {len(lost)} anchors of /{url} are gone: {', '.join('#' + f for f in lost[:8])}",
+                    suggestion="keep the heading text, add an explicit {#id}, or add an anchor redirect",
+                )
+            )
+
+
+# ---------------------------------------------------------------------------------------------
+# plan: validate, approve, apply, resume, rollback, verify a restructure
+# ---------------------------------------------------------------------------------------------
+
+PLAN_SCHEMA = 1
+PLAN_TYPES = ("move", "archive", "split", "merge", "anchor", "reference", "freeze", "keep", "stub", "delete", "decision")
+MAPPING_TYPES = ("rewritten", "dropped")
+JOURNAL_NAME = ".apply-journal.json"
+LOG_NAME = "apply-log.json"
+STAGING_NAME = ".staging"
+BACKUPS_NAME = ".backups"
+RECEIPTS_NAME = "review-receipts.json"
+MAPPINGS_NAME = "mappings.toml"
+APPROVAL_RE = re.compile(r"(?m)^\[approval\][ \t]*$")
+SENSITIVE_RE = re.compile(r"\b(?:warning|caution|never|must not|do not|don't|before you|requires?)\b", re.IGNORECASE)
+LINK_DEST_RE = re.compile(
+    r"(\]\(\s*<?)([^)\s>]+)|(^[ \t]{0,3}\[[^\]]+\]:[ \t]*<?)(\S+?)(?=>|\s|$)|(\b(?:href|src)\s*=\s*[\"'])([^\"']+)", re.MULTILINE
+)
+
+# Tests replace this to simulate a crash at a named point of apply (it must raise a BaseException
+# that is not an Exception, which apply's own rollback does not catch).
+_CRASH_HOOK: Callable[[str, int], None] | None = None
+
+
+def _crash_point(name: str, index: int = -1) -> None:
+    if _CRASH_HOOK is not None:
+        _CRASH_HOOK(name, index)
+
+
+def _digest(data: bytes | None) -> str | None:
+    return None if data is None else sha256_bytes(data)
+
+
+def plan_digest(text: str) -> str:
+    """SHA-256 of the plan with its [approval] table removed."""
+    match = APPROVAL_RE.search(text)
+    if match:
+        rest = text[match.end() :]
+        following = re.search(r"(?m)^\[", rest)
+        text = text[: match.start()] + (rest[following.start() :] if following else "")
+    return sha256_bytes(text.rstrip().encode() + b"\n")
+
+
+def _fsync_write(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "wb") as handle:
+        handle.write(data)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _fsync_dir(path: Path) -> None:
+    try:
+        descriptor = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(descriptor)
+    except OSError:
+        pass
+    finally:
+        os.close(descriptor)
+
+
+def _json_bytes(value: Any) -> bytes:
+    return (json.dumps(value, indent=1, sort_keys=True) + "\n").encode()
+
+
+@dataclass
+class Plan:
+    rel: str
+    text: str
+    data: dict[str, Any]
+    directory: str
+
+    @property
+    def meta(self) -> dict[str, Any]:
+        meta = self.data.get("meta")
+        return meta if isinstance(meta, dict) else {}
+
+    def entries(self, kind: str) -> list[dict[str, Any]]:
+        value = self.data.get(kind, [])
+        return [e for e in value if isinstance(e, dict)] if isinstance(value, list) else []
+
+    def artifact(self, name: str) -> str:
+        return f"{self.directory}/{name}" if self.directory != "." else name
+
+
+def _paths_of(entry: dict[str, Any], key: str) -> list[str]:
+    value = entry.get(key)
+    if isinstance(value, str):
+        return [value]
+    return [str(v) for v in value] if isinstance(value, list) else []
+
+
+def load_plan(repo: Repo, rel: str) -> Plan:
+    text, status = repo.text(rel)
+    if text is None:
+        raise UsageError(f"{rel}: {status}")
+    try:
+        data = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as error:
+        raise UsageError(f"{rel}: {error}") from error
+    return Plan(rel, text, data, str(PurePosixPath(rel).parent))
+
+
+class PlanContext:
+    """Everything validate, approve and apply share: the repo, its site, docs and couplings."""
+
+    def __init__(self, args: argparse.Namespace, report: Report) -> None:
+        self.repo = Repo(Path(args.root))
+        self.report = report
+        self.site = load_site(self.repo, report)
+        self.corpus = Corpus(self.repo, self.site)
+        report.coverage.append(
+            CoverageRow(
+                "markdown", "partial" if self.corpus.unreadable else "complete", ", ".join(self.corpus.unreadable) or f"{len(self.corpus.docs)} files"
+            )
+        )
+        self.plan = load_plan(self.repo, _plan_rel(self.repo, str(args.plan)))
+
+    def couplings(self) -> list[dict[str, Any]]:
+        if not hasattr(self, "_couplings"):
+            # Coupling findings belong to inventory; a plan only needs the couplings and their coverage.
+            scratch = Report(command="inventory", root=self.report.root)
+            self._couplings = scan_couplings(self.corpus, scratch)
+            self.report.coverage += [row for row in scratch.coverage if row.input == "couplings"]
+        return self._couplings
+
+    def error(self, check: str, message: str, file: str = "", line: int = 0, suggestion: str = "") -> None:
+        self.report.add(Finding(check, "Blocking", "verified", file or self.plan.rel, line, message, suggestion=suggestion))
+
+
+def _plan_rel(repo: Repo, given: str) -> str:
+    """--plan as a safe path inside the root; everything the plan writes sits next to it."""
+    path = Path(given)
+    if path.is_absolute():
+        try:
+            given = path.resolve().relative_to(repo.root.resolve()).as_posix()
+        except ValueError:
+            raise UsageError(f"--plan {path} is outside --root") from None
+    rel = normalize_path("", given)
+    problem = _path_problem(repo, rel) if rel else "must stay inside --root"
+    if rel is None or problem:
+        raise UsageError(f"--plan {given}: {problem}")
+    return rel
+
+
+def _path_problem(repo: Repo, rel: str) -> str | None:
+    """Why a plan path is unsafe, or None."""
+    if not rel or rel.startswith("/") or re.match(r"^[A-Za-z]:", rel):
+        return "must be a relative path"
+    if normalize_path("", rel) != rel or ".." in PurePosixPath(rel).parts:
+        return "must be normalised (no .., no ./, no //)"
+    if ".git" in PurePosixPath(rel).parts:
+        return "must not touch .git"
+    parts = PurePosixPath(rel).parts
+    for index in range(len(parts)):
+        prefix = "/".join(parts[: index + 1])
+        if prefix in repo.symlinks or (repo.root / prefix).is_symlink():
+            return f"{prefix} is a symlink"
+    try:
+        (repo.root / rel).resolve().relative_to(repo.root)
+    except ValueError:
+        return "resolves outside the repository"
+    return None
+
+
+def plan_sources(context: PlanContext) -> set[str]:
+    """Files the plan reads or rewrites in place; their hashes are bound into [meta.sources]."""
+    plan = context.plan
+    sources: set[str] = set()
+    for kind in ("move", "archive", "split", "delete"):
+        for entry in plan.entries(kind):
+            sources.update(_paths_of(entry, "from") or _paths_of(entry, "path"))
+    for entry in plan.entries("merge"):
+        sources.update(_paths_of(entry, "from"))
+        sources.update(p for p in _paths_of(entry, "into") if context.repo.exists(p))
+    for entry in plan.entries("reference"):
+        sources.update(_paths_of(entry, "file"))
+    for key in ("site_config", "inventory", "blocks"):
+        value = plan.meta.get(key)
+        if isinstance(value, str) and value:
+            sources.add(value)
+    return sources
+
+
+def validate_plan(context: PlanContext) -> None:
+    repo, site, plan = context.repo, context.site, context.plan
+    meta = plan.meta
+    error = context.error
+    unknown = sorted(set(plan.data) - {"meta", "approval", *PLAN_TYPES})
+    for key in unknown:
+        error("plan-schema", f"unknown table [{key}]" + (" (rewritten/dropped mappings go in mappings.toml)" if key in MAPPING_TYPES else ""))
+    if meta.get("schema") != PLAN_SCHEMA:
+        error("plan-schema", f"[meta] schema must be {PLAN_SCHEMA}")
+    if str(meta.get("docs_dir", "")) != site.docs_dir:
+        error("plan-schema", f"[meta] docs_dir is {meta.get('docs_dir')!r}; the site config says {site.docs_dir!r}")
+    if (meta.get("site_config") or None) != site.config:
+        error("plan-schema", f"[meta] site_config is {meta.get('site_config')!r}; the repository has {site.config!r}")
+    if not isinstance(meta.get("blocks"), str):
+        error(
+            "plan-schema",
+            "[meta] blocks must name the inventory --blocks baseline",
+            suggestion="docstool inventory --blocks docs/internal/restructure/blocks.json",
+        )
+    base = meta.get("base_commit")
+    if not isinstance(base, str) or not repo.is_git or git(repo.root, "rev-parse", "--verify", "--quiet", base + "^{commit}") is None:
+        error("plan-base", f"[meta] base_commit {base!r} is not a commit in this repository")
+    elif git(repo.root, "merge-base", "--is-ancestor", base, "HEAD") is None:
+        error("plan-base", f"HEAD does not descend from base_commit {base}")
+    hashes: dict[str, Any] = meta["sources"] if isinstance(meta.get("sources"), dict) else {}
+    for rel in sorted(plan_sources(context)):
+        current = file_sha256(repo.root / rel)
+        if rel not in hashes:
+            error(
+                "plan-stale",
+                f"{rel} is read or written by the plan but not hashed in [meta.sources]",
+                suggestion=f"{rel!r} = {current!r}" if current else "",
+            )
+        elif hashes[rel] != current:
+            error("plan-stale", f"{rel} changed since the plan was written (hash differs)", rel)
+    rows = {r.input: r for r in context.report.coverage}
+    for name in ("config", "nav", "exclude_docs", "redirects", "markdown"):
+        if name in rows and not rows[name].complete:
+            error("plan-coverage", f"{name} coverage is {rows[name].state}: a plan never runs on incomplete analysis")
+    couplings = context.couplings()
+    rows = {r.input: r for r in context.report.coverage}
+    if not rows["couplings"].complete:
+        error("plan-coverage", f"couplings coverage is {rows['couplings'].state}: {rows['couplings'].reason}")
+    _validate_entries(context, couplings)
+
+
+def _writable(context: PlanContext, rel: str) -> bool:
+    site, plan = context.site, context.plan
+    if site.in_docs(rel) and site.docs_dir != ".":
+        return True
+    references = {p for e in plan.entries("reference") for p in _paths_of(e, "file")}
+    return rel in references or rel == site.config
+
+
+def _validate_entries(context: PlanContext, couplings: list[dict[str, Any]]) -> None:
+    repo, site, plan, corpus = context.repo, context.site, context.plan, context.corpus
+    error = context.error
+    targets: dict[str, str] = {}
+    moved: dict[str, str] = {}
+    covered: set[str] = set()
+    covered_dirs: list[str] = []
+    references = {(e.get("file"), e.get("line")) for e in plan.entries("reference")}
+    stub_paths = {p for e in plan.entries("stub") for p in _paths_of(e, "path")}
+    merge_into = {p for e in plan.entries("merge") for p in _paths_of(e, "into")}
+
+    def claim(rel: str, what: str) -> None:
+        problem = _path_problem(repo, rel)
+        if problem:
+            error("plan-path", f"{what} {rel}: {problem}")
+            return
+        if not _writable(context, rel):
+            error("plan-path", f"{what} {rel}: outside {site.docs_dir}/ and not a reference or the site config")
+        lower = rel.lower()
+        clash = next((t for t in targets if t.lower() == lower), None)
+        if clash is not None:
+            error("plan-collision", f"{what} {rel} collides with {targets[clash]} {clash}" + (" (names differ only by case)" if clash != rel else ""))
+        targets[rel] = what
+        exists = repo.exists(rel) or bool(repo.lower_map.get(lower))
+        allowed = (what == "merge target") or (what == "stub" and rel in moved)
+        if exists and not allowed:
+            error("plan-collision", f"{what} {rel} already exists (an unexpected destination change)")
+
+    def needs_source(rel: str, what: str) -> bool:
+        problem = _path_problem(repo, rel)
+        if problem:
+            error("plan-path", f"{what} {rel}: {problem}")
+            return False
+        if rel not in repo.file_set:
+            error("plan-source", f"{what} {rel} does not exist")
+            return False
+        return True
+
+    for kind in ("move", "archive"):
+        for entry in plan.entries(kind):
+            source, target = str(entry.get("from", "")), str(entry.get("to", ""))
+            if needs_source(source, kind):
+                moved[source] = target
+                covered.add(source)
+            if kind == "archive" and not str(entry.get("status", "")).strip():
+                error("plan-entry", f"archive {source}: a status line is required")
+            if target:
+                claim(target, kind + " target")
+            else:
+                error("plan-entry", f"{kind} {source}: no 'to'")
+            if site.config and site.published(source):
+                landing = str(entry.get("redirect_to") or target)
+                if entry.get("redirect", True) is False:
+                    error("plan-redirect", f"{source} is published: redirect = false would break its URL")
+                elif not site.published(landing):
+                    error(
+                        "plan-redirect", f"{source} is published but {landing} is not: set redirect_to to the published page that takes its readers"
+                    )
+                elif site.kind == "mkdocs" and "redirects" not in site.plugins:
+                    error(
+                        "plan-redirect",
+                        f"{source} is published: moving it needs a redirect, and mkdocs.yml has no redirects plugin",
+                        suggestion="add the redirects plugin with an empty redirect_maps first",
+                    )
+    for entry in plan.entries("split"):
+        source, heading, target = str(entry.get("from", "")), str(entry.get("heading", "")), str(entry.get("to", ""))
+        if needs_source(source, "split"):
+            covered.add(source)
+            matches = [h for h in corpus.docs[source].headings if h.text == heading] if source in corpus.docs else []
+            if len(matches) != 1:
+                error("plan-entry", f"split {source}: heading {heading!r} occurs {len(matches)} times; it must occur once")
+        claim(target, "split target")
+    for entry in plan.entries("merge"):
+        sources, into = _paths_of(entry, "from"), str(entry.get("into", ""))
+        for source in sources:
+            if needs_source(source, "merge"):
+                covered.add(source)
+        if into not in repo.file_set and into not in {t for t, w in targets.items() if w != "merge target"}:
+            error("plan-entry", f"merge into {into}: the target must exist or be created by this plan")
+        if into in repo.file_set:
+            targets.setdefault(into, "merge target")
+    for entry in plan.entries("stub"):
+        path, target = str(entry.get("path", "")), str(entry.get("target", ""))
+        claim(path, "stub")
+        if target not in moved.values() and target not in repo.file_set:
+            error("plan-entry", f"stub {path}: target {target} is neither moved by the plan nor an existing file")
+    for entry in plan.entries("reference"):
+        rel, number, old = str(entry.get("file", "")), entry.get("line"), entry.get("old")
+        if needs_source(rel, "reference") and isinstance(number, int) and isinstance(old, str) and isinstance(entry.get("new"), str):
+            text, _ = repo.text(rel)
+            lines = (text or "").split("\n")
+            if not 1 <= number <= len(lines) or lines[number - 1].count(old) != 1:
+                error(
+                    "plan-reference",
+                    f"reference {rel}:{number}: the line must contain {old!r} exactly once",
+                    rel,
+                    number if isinstance(number, int) else 0,
+                )
+        else:
+            error("plan-reference", f"reference {rel}: needs file, line (an integer), old and new")
+    for entry in plan.entries("delete"):
+        rel = str(entry.get("path", ""))
+        if needs_source(rel, "delete"):
+            covered.add(rel)
+            if entry.get("approved") is not True or not str(entry.get("proof", "")).strip():
+                error("plan-delete", f"delete {rel}: needs approved = true and a proof (gate G5)")
+            elif not _deletion_proven(corpus, rel):
+                error("plan-delete", f"delete {rel}: not empty and not an exact duplicate of other docs, so deleting it could lose content")
+    for kind in ("freeze", "keep"):
+        for entry in plan.entries(kind):
+            for path in _paths_of(entry, "paths") + _paths_of(entry, "path"):
+                if path.endswith("/"):
+                    covered_dirs.append(path)
+                else:
+                    covered.add(path)
+    for entry in plan.entries("decision"):
+        if not str(entry.get("answer", "")).strip():
+            error("plan-decision", f"decision {entry.get('id', '?')} is open: {entry.get('question', '')}")
+    # every doc under docs_dir is covered (the plan's own directory excepted)
+    for rel in sorted(corpus.docs):
+        if site.in_docs(rel) and not rel.startswith(plan.directory + "/") and rel not in covered and not any(rel.startswith(d) for d in covered_dirs):
+            error(
+                "plan-uncovered",
+                f"{rel} is not covered by any entry (move, archive, split, merge, keep, freeze or delete)",
+                suggestion="add it to a [[keep]] entry if it stays as it is",
+            )
+    frozen = {p for e in plan.entries("freeze") for p in _paths_of(e, "paths") + _paths_of(e, "path")}
+    for rel in frozen & (set(moved) | {str(e.get("path", "")) for e in plan.entries("delete")}):
+        error("plan-frozen", f"{rel} is frozen by the plan itself but also moved or deleted")
+    _check_inbound(context, couplings, moved, references, stub_paths, merge_into)
+
+
+def _deletion_proven(corpus: Corpus, rel: str) -> bool:
+    doc = corpus.docs.get(rel)
+    text = "\n".join(doc.lines) if doc else ""
+    if not text.strip():
+        return True
+    others = Counter(_block_hash(b) for other, d in corpus.docs.items() if other != rel for b in d.blocks)
+    mine = Counter(_block_hash(b) for b in doc.blocks) if doc else Counter()
+    return bool(mine) and all(others[h] >= n for h, n in mine.items())
+
+
+def _check_inbound(
+    context: PlanContext, couplings: list[dict[str, Any]], moved: dict[str, str], references: set[tuple[Any, Any]], stubs: set[str], merged: set[str]
+) -> None:
+    """Every reference to a moved or split path or heading that a link rewrite cannot fix is handled."""
+    corpus = context.corpus
+    sections: dict[str, tuple[set[str], set[str], set[str]]] = {}
+    for split in context.plan.entries("split"):
+        source, heading = str(split.get("from")), str(split.get("heading"))
+        doc = corpus.docs.get(source)
+        if doc is None or sum(h.text == heading for h in doc.headings) != 1:
+            continue
+        first, end, _level = _section_bounds(doc, heading)
+        inside = [h for h in doc.headings if first < h.line <= end]
+        sections[source] = ({h.text.casefold() for h in inside}, {h.number for h in inside if h.number}, {h.gh_slug for h in inside})
+    deleted = {str(e.get("path", "")) for e in context.plan.entries("delete")}
+    own = context.plan.directory + "/"
+    for entry in couplings:
+        target = entry["target"]
+        if entry["source"].startswith(own):
+            continue  # the plan's own artifacts (plan, baselines, receipts) name every path it touches
+        moves = target in moved or target in deleted
+        if not moves and target in sections:
+            titles, numbers, slugs = sections[target]
+            detail = str(entry["detail"])
+            moves = (
+                (entry["ref"] == "heading" and heading_plain_text(detail).casefold().rstrip(":. ") in titles)
+                or (entry["ref"] == "section" and (number := re.search(r"\d+(?:\.\d+)*", detail)) is not None and number.group(0) in numbers)
+                or (entry["ref"] == "anchor" and detail.lstrip("#").lower() in slugs)
+            )
+        if not moves:
+            continue
+        if entry["status"] != "ok":
+            continue
+        source, line = entry["source"], entry["line"]
+        doc = corpus.docs.get(source)
+        if doc is not None and entry["ref"] in ("path", "anchor"):
+            base = str(PurePosixPath(source).parent)
+            linked = any(
+                link.line == line and normalize_path(base, unquote(link.target.split("#", 1)[0])) == target
+                for link in doc.links
+                if not SCHEME_RE.match(link.target)
+            )
+            if linked:
+                continue
+        if (source, line) in references:
+            continue
+        if target in stubs and entry["ref"] in ("path", "blob") and target not in deleted:
+            continue
+        pins = entry["kind"] in FREEZING_KINDS or entry["ref"] == "blob"
+        context.error(
+            "plan-frozen" if pins else "plan-inbound",
+            f"{source}:{line} cites {target} {entry['detail']} ({entry['kind']} {entry['ref']}); the plan moves it but has no reference entry for that line",
+            source,
+            line,
+            "freeze the path (gate G3), or add a [[reference]] edit for that line (gate G10)",
+        )
+
+
+# --- apply: preflight -------------------------------------------------------------------------
+
+
+class VirtualTree:
+    """The working tree as bytes, with the plan's edits applied in memory."""
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self.changed: dict[str, bytes | None] = {}
+        self.original: dict[str, bytes | None] = {}
+
+    def read(self, rel: str) -> bytes | None:
+        if rel in self.changed:
+            return self.changed[rel]
+        return self._disk(rel)
+
+    def _disk(self, rel: str) -> bytes | None:
+        if rel not in self.original:
+            path = self.root / rel
+            self.original[rel] = path.read_bytes() if path.is_file() and not path.is_symlink() else None
+        return self.original[rel]
+
+    def write(self, rel: str, data: bytes | None) -> None:
+        self._disk(rel)
+        self.changed[rel] = data
+
+    def text(self, rel: str) -> str:
+        data = self.read(rel)
+        return "" if data is None else data.decode("utf-8")
+
+    def operations(self) -> list[dict[str, Any]]:
+        ops = []
+        for rel in sorted(self.changed):
+            pre, post = self.original.get(rel), self.changed[rel]
+            if pre != post:
+                ops.append({"path": rel, "pre": _digest(pre), "post": _digest(post), "data": post, "old": pre})
+        return ops
+
+
+def _relative(from_dir: str, target: str) -> str:
+    return os.path.relpath(target, from_dir if from_dir else ".").replace(os.sep, "/") if target else ""
+
+
+def _rewrite_links(
+    text: str,
+    old_dir: str,
+    new_dir: str,
+    self_old: str,
+    self_new: str,
+    path_map: dict[str, str],
+    anchor_map: dict[tuple[str, str], tuple[str, str]],
+    section: set[str] | None = None,
+) -> str:
+    """Re-point every relative link of a Markdown text after the plan's moves (only changed links)."""
+    out_lines = []
+    fence: tuple[str, int] | None = None
+    for line in text.split("\n"):
+        fence, in_code = _fence_step(fence, line)
+        if in_code:
+            out_lines.append(line)
+            continue
+        out_lines.append(LINK_DEST_RE.sub(lambda m: _rewrite_one(m, (old_dir, new_dir, self_old, self_new), path_map, anchor_map, section), line))
+    return "\n".join(out_lines)
+
+
+def _fence_step(fence: tuple[str, int] | None, line: str) -> tuple[tuple[str, int] | None, bool]:
+    """(the open fence after this line, whether the line is code or a fence), by the scanner's rules."""
+    if fence is not None:
+        close = re.match(r"^[ \t]*(`+|~+)[ \t]*$", line)
+        if close and close.group(1)[0] == fence[0] and len(close.group(1)) >= fence[1]:
+            return None, True
+        return fence, True
+    opening = FENCE_RE.match(line)
+    if opening and not (opening.group("fence")[0] == "`" and "`" in opening.group("info")):
+        return (opening.group("fence")[0], len(opening.group("fence"))), True
+    return None, False
+
+
+def _rewrite_one(
+    match: re.Match[str],
+    where: tuple[str, str, str, str],
+    path_map: dict[str, str],
+    anchor_map: dict[tuple[str, str], tuple[str, str]],
+    section: set[str] | None,
+) -> str:
+    """One link destination re-pointed; the original text when nothing changes."""
+    old_dir, new_dir, self_old, self_new = where
+    prefix = match.group(1) or match.group(3) or match.group(5) or ""
+    dest = match.group(2) or match.group(4) or match.group(6) or ""
+    if not dest or SCHEME_RE.match(dest):
+        return match.group(0)
+    path_part, hash_mark, fragment = dest.partition("#")
+    resolved = normalize_path(old_dir, unquote(path_part)) if path_part else self_old
+    if resolved is None:
+        return match.group(0)
+    if not path_part and section is not None:
+        # a same-page anchor inside a split section: it stays when its heading moved along
+        if fragment.lower() in section:
+            return match.group(0)
+        return prefix + _relative(new_dir, path_map.get(self_old, self_old)) + "#" + fragment
+    else:
+        new_target, new_fragment = path_map.get(resolved, resolved), fragment
+        if fragment and (resolved, fragment.lower()) in anchor_map:
+            new_target, new_fragment = anchor_map[(resolved, fragment.lower())]
+    if new_target == resolved and new_dir == old_dir and new_fragment == fragment:
+        return match.group(0)
+    same_page = new_target == self_new
+    rebuilt = ("" if new_fragment else PurePosixPath(self_new).name) if same_page else _relative(new_dir, new_target)
+    return prefix + rebuilt + ("#" + new_fragment if new_fragment else hash_mark)
+
+
+def _status_line(text: str, status: str) -> str:
+    lines = text.split("\n")
+    note = f"> **Status:** {status}"
+    for index, line in enumerate(lines):
+        heading = ATX_RE.match(line)
+        if heading and len(heading.group(1)) == 1:
+            return "\n".join([*lines[: index + 1], "", note, *lines[index + 1 :]])
+    return "\n".join([note, "", *lines])
+
+
+def _section_bounds(doc: MarkdownDoc, heading: str) -> tuple[int, int, int]:
+    """(first line index, end line index, level) of the section a heading opens."""
+    match = next(h for h in doc.headings if h.text == heading)
+    end = next((h.line - 1 for h in doc.headings if h.line > match.line and h.level <= match.level), len(doc.lines))
+    while end > match.line and not doc.lines[end - 1].strip():
+        end -= 1
+    return match.line - 1, end, match.level
+
+
+def _promote(lines: list[str], by: int) -> list[str]:
+    if by <= 0:
+        return lines
+    out = []
+    fence: tuple[str, int] | None = None
+    for line in lines:
+        fence, in_code = _fence_step(fence, line)
+        heading = None if in_code else re.match(r"^(#{1,6})([ \t].*|)$", line)
+        out.append("#" * max(1, len(heading.group(1)) - by) + heading.group(2) if heading else line)
+    return out
+
+
+def preflight(context: PlanContext) -> tuple[list[dict[str, Any]], list[tuple[str, str]]]:
+    """Compute every write as exact before/after bytes. Returns (operations, redirects added)."""
+    repo, site, plan, corpus = context.repo, context.site, context.plan, context.corpus
+    tree = VirtualTree(repo.root)
+    path_map: dict[str, str] = {}
+    anchor_map: dict[tuple[str, str], tuple[str, str]] = {}
+    redirects: list[tuple[str, str]] = []
+    status_of: dict[str, str] = {}
+    for kind in ("move", "archive"):
+        for entry in plan.entries(kind):
+            source, target = str(entry["from"]), str(entry["to"])
+            path_map[source] = target
+            if kind == "archive":
+                status_of[source] = str(entry["status"])
+            landing = str(entry.get("redirect_to") or target)
+            if site.config and site.published(source) and site.published(landing):
+                redirects.append((site.docs_rel(source), site.docs_rel(landing)))
+    splits = []
+    for entry in plan.entries("split"):
+        source, heading, target = str(entry["from"]), str(entry["heading"]), str(entry["to"])
+        doc = corpus.docs[source]
+        first, end, level = _section_bounds(doc, heading)
+        section_headings = [h for h in doc.headings if first < h.line <= end]
+        for h in section_headings:
+            anchor_map[(source, h.gh_slug.lower())] = (target, h.gh_slug)
+        splits.append((source, heading, target, first, end, level, {h.gh_slug.lower() for h in section_headings}))
+        if site.config and site.published(source) and site.kind == "zensical":
+            for h in section_headings:
+                redirects.append((f"{site.docs_rel(source)}#{h.site_slug}", f"{site.docs_rel(target)}#{h.site_slug}"))
+    for entry in plan.entries("anchor"):
+        anchor_map[(str(entry["file"]), str(entry["from"]).lower())] = (path_map.get(str(entry["file"]), str(entry["file"])), str(entry["to"]))
+    # structural edits, with every Markdown file's links re-pointed
+    markdown = sorted(r for r in repo.files if r.endswith(MARKDOWN_EXTENSIONS))
+    split_sources = {s[0]: s for s in splits}
+    for rel in markdown:
+        text = tree.text(rel)
+        new_rel = path_map.get(rel, rel)
+        if rel in split_sources:
+            source, heading, target, first, end, level, inner = split_sources[rel]
+            lines = text.split("\n")
+            section = _promote(lines[first:end], level - 1)
+            pointer = [lines[first], "", f"Moved to [{heading}]({_relative(str(PurePosixPath(rel).parent), target)})."]
+            remaining = "\n".join([*lines[:first], *pointer, *lines[end:]])
+            moved_text = "\n".join(section) + "\n"
+            moved_text = _rewrite_links(
+                moved_text, str(PurePosixPath(rel).parent), str(PurePosixPath(target).parent), rel, target, path_map, {}, inner
+            )
+            tree.write(target, moved_text.encode())
+            text = remaining
+        rewritten = _rewrite_links(text, str(PurePosixPath(rel).parent), str(PurePosixPath(new_rel).parent), rel, new_rel, path_map, anchor_map)
+        if rel in status_of:
+            rewritten = _status_line(rewritten, status_of[rel])
+        if new_rel != rel:
+            tree.write(new_rel, rewritten.encode())
+            tree.write(rel, None)
+        elif rewritten != text or rel in split_sources:
+            tree.write(rel, rewritten.encode())
+    for entry in plan.entries("stub"):
+        path, target = str(entry["path"]), str(entry["target"])
+        title = str(entry.get("title") or PurePosixPath(target).stem.replace("-", " ").capitalize())
+        tree.write(path, f"# {title}\n\nThis page moved to [{title}]({_relative(str(PurePosixPath(path).parent), target)}).\n".encode())
+    for entry in plan.entries("delete"):
+        tree.write(str(entry["path"]), None)
+    for entry in plan.entries("reference"):
+        rel = str(entry["file"])
+        lines = tree.text(rel).split("\n")
+        lines[int(entry["line"]) - 1] = lines[int(entry["line"]) - 1].replace(str(entry["old"]), str(entry["new"]), 1)
+        tree.write(rel, "\n".join(lines).encode())
+    if redirects and site.config:
+        tree.write(site.config, _append_redirects(tree.text(site.config), site, redirects).encode())
+    return tree.operations(), redirects
+
+
+def _append_redirects(text: str, site: Site, redirects: list[tuple[str, str]]) -> str:
+    """The site config with redirect_maps entries added; re-parsed to prove the result."""
+    if site.kind == "zensical":
+        lines = [f"{json.dumps(src)} = {json.dumps(dst)}" for src, dst in redirects]
+        header = re.search(r"(?m)^\[project\.plugins\.redirects\.redirect_maps\][ \t]*$", text)
+        if header:
+            insert = text.index("\n", header.end()) + 1 if "\n" in text[header.end() :] else len(text)
+            updated = text[:insert] + "\n".join(lines) + "\n" + text[insert:]
+        else:
+            updated = text.rstrip("\n") + "\n\n[project.plugins.redirects.redirect_maps]\n" + "\n".join(lines) + "\n"
+        maps = tomllib.loads(updated).get("project", {}).get("plugins", {}).get("redirects", {}).get("redirect_maps", {})
+    else:
+        key = re.search(r"(?m)^([ \t]*)redirect_maps:[ \t]*$", text)
+        if not key:
+            raise UsageError("mkdocs.yml has no 'redirect_maps:' block to add redirects to")
+        child = re.match(r"([ \t]*)\S", text[key.end() + 1 :])
+        indent = child.group(1) if child and len(child.group(1)) > len(key.group(1)) else key.group(1) + "  "
+        lines = [f"{indent}{json.dumps(src)}: {json.dumps(dst)}" for src, dst in redirects]
+        insert = key.end() + 1
+        updated = text[:insert] + "\n".join(lines) + "\n" + text[insert:]
+        parsed = _plugins_from_mkdocs(yaml_load(updated).get("plugins"))
+        maps = parsed.get("redirects", {}).get("redirect_maps", {}) if isinstance(parsed.get("redirects"), dict) else {}
+    missing = [src for src, dst in redirects if maps.get(src) != dst]
+    if missing:
+        raise UsageError(f"the edited site config does not parse back with the new redirects: {', '.join(missing[:3])}")
+    return updated
+
+
+# --- apply: transaction and recovery --------------------------------------------------------------
+
+
+def _state_of(root: Path, entry: dict[str, Any]) -> str:
+    current = file_sha256(root / entry["path"])
+    if current == entry["post"]:
+        return "post"
+    if current == entry["pre"]:
+        return "pre"
+    return "other"
+
+
+def _read_json(path: Path) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _cleanup(art: Path, *, keep_log: bool = True) -> None:
+    for name in (STAGING_NAME, BACKUPS_NAME):
+        if (art / name).exists():
+            shutil.rmtree(art / name)
+    (art / (LOG_NAME + ".tmp")).unlink(missing_ok=True)
+    if not keep_log:
+        (art / LOG_NAME).unlink(missing_ok=True)
+
+
+def _restore(root: Path, art: Path, index: int, entry: dict[str, Any]) -> None:
+    target = root / entry["path"]
+    if entry["pre"] is None:
+        target.unlink(missing_ok=True)
+        return
+    backup = art / BACKUPS_NAME / str(index)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(target.name + ".docstool-restore")
+    shutil.copyfile(backup, temporary)
+    os.replace(temporary, target)
+
+
+def _finalise(root: Path, art: Path, journal: dict[str, Any]) -> None:
+    log = {
+        "status": "completed",
+        "plan_sha256": journal["plan_sha256"],
+        "paths": {e["path"]: {"pre": e["pre"], "post": e["post"]} for e in journal["ops"]},
+    }
+    temporary = art / (LOG_NAME + ".tmp")
+    _fsync_write(temporary, _json_bytes(log))
+    _crash_point("log-tmp")
+    os.replace(temporary, art / LOG_NAME)
+    _fsync_dir(art)
+    _crash_point("after-log")
+    if (art / STAGING_NAME).exists():
+        shutil.rmtree(art / STAGING_NAME)
+    _crash_point("after-staging")
+    if (art / BACKUPS_NAME).exists():
+        shutil.rmtree(art / BACKUPS_NAME)
+    _crash_point("after-backups")
+    (art / JOURNAL_NAME).unlink(missing_ok=True)
+    _fsync_dir(art)
+
+
+def _write_journal(art: Path, journal: dict[str, Any]) -> None:
+    temporary = art / (JOURNAL_NAME + ".tmp")
+    _fsync_write(temporary, _json_bytes(journal))
+    os.replace(temporary, art / JOURNAL_NAME)
+    _fsync_dir(art)
+
+
+def run_transaction(root: Path, art: Path, ops: list[dict[str, Any]], digest: str) -> None:
+    """Apply the operations with a write-ahead journal; roll back on any failure."""
+    staging, backups = art / STAGING_NAME, art / BACKUPS_NAME
+    if staging.exists() or backups.exists():
+        raise UsageError(f"{staging} or {backups} is left from an earlier run: run plan resume or plan rollback")
+    try:
+        for index, op in enumerate(ops):
+            if op["data"] is not None:
+                _fsync_write(staging / str(index), op["data"])
+            if op["old"] is not None:
+                _fsync_write(backups / str(index), op["old"])
+        journal: dict[str, Any] = {
+            "plan_sha256": digest,
+            "new_dirs": _new_dirs(root, [op["path"] for op in ops if op["post"] is not None]),
+            "ops": [{"path": op["path"], "pre": op["pre"], "post": op["post"], "status": "planned"} for op in ops],
+        }
+        _write_journal(art, journal)
+    except OSError as error:
+        # nothing in the tree has changed yet: drop the half-written staging and refuse
+        _cleanup(art)
+        (art / JOURNAL_NAME).unlink(missing_ok=True)
+        raise UsageError(f"apply failed while staging ({error}); nothing was changed") from error
+    try:
+        for index in range(len(ops)):
+            _apply_one(root, art, index, journal["ops"][index])
+            journal["ops"][index]["status"] = "done"
+            _write_journal(art, journal)
+            _crash_point("after-done", index)
+    except Exception as error:
+        for index in reversed(range(len(ops))):
+            entry = journal["ops"][index]
+            if _state_of(root, entry) == "post":
+                _restore(root, art, index, entry)
+        _remove_new_dirs(root, journal)
+        _cleanup(art)
+        (art / JOURNAL_NAME).unlink(missing_ok=True)
+        raise UsageError(f"apply failed ({error}); every completed operation was rolled back") from error
+    _finalise(root, art, journal)
+
+
+def _new_dirs(root: Path, paths: list[str]) -> list[str]:
+    """Directories an apply would create, deepest first, so a rollback can remove them again."""
+    made: set[str] = set()
+    for rel in paths:
+        parent = PurePosixPath(rel).parent
+        while str(parent) != "." and not (root / parent).exists():
+            made.add(parent.as_posix())
+            parent = parent.parent
+    return sorted(made, key=lambda d: (-d.count("/"), d))
+
+
+def _remove_new_dirs(root: Path, journal: dict[str, Any]) -> None:
+    for rel in journal.get("new_dirs", []):
+        directory = root / rel
+        if directory.is_dir() and not directory.is_symlink() and not any(directory.iterdir()):
+            directory.rmdir()
+
+
+def _apply_one(root: Path, art: Path, index: int, entry: dict[str, Any]) -> None:
+    _crash_point("before-change", index)
+    target = root / entry["path"]
+    if entry["post"] is None:
+        target.unlink()
+    else:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(art / STAGING_NAME / str(index), target)
+    _crash_point("after-change", index)
+
+
+def _plan_art(context: PlanContext) -> Path:
+    return context.repo.root / context.plan.directory
+
+
+def _approval_state(plan: Plan) -> str:
+    approval = plan.data.get("approval")
+    if not isinstance(approval, dict):
+        return "missing"
+    return "valid" if approval.get("plan_sha256") == plan_digest(plan.text) else "stale"
+
+
+def _recognise_applied(context: PlanContext) -> bool:
+    """True when apply-log.json says this plan is applied and every path is at its post-image."""
+    art = _plan_art(context)
+    log = _read_json(art / LOG_NAME)
+    if not isinstance(log, dict) or log.get("plan_sha256") != plan_digest(context.plan.text):
+        return False
+    states = {path: _state_of(context.repo.root, {"path": path, **hashes}) for path, hashes in log.get("paths", {}).items()}
+    if all(s == "post" for s in states.values()):
+        return True
+    for path, state in sorted(states.items()):
+        context.error(
+            "plan-mixed",
+            f"{path} is at its {'pre-image' if state == 'pre' else 'post-image' if state == 'post' else 'neither image (edited by hand)'}",
+            path,
+        )
+    raise _Refused
+
+
+class _Refused(Exception):
+    """The command stops; the findings already say why."""
+
+
+def cmd_plan(args: argparse.Namespace, report: Report) -> list[str]:
+    action = args.action
+    context = PlanContext(args, report)
+    required = ["config", "nav", "exclude_docs", "redirects", "markdown"]
+    art = _plan_art(context)
+    try:
+        if action in ("resume", "rollback"):
+            _recover(context, action)
+            return []
+        if action == "verify":
+            return _verify(context, args)
+        if action == "approve" and args.mappings:
+            _approve_mappings(context, args)
+            return ["conservation_baseline"]
+        if (art / JOURNAL_NAME).exists() and action == "apply":
+            context.error(
+                "plan-journal",
+                f"{context.plan.artifact(JOURNAL_NAME)} exists: an earlier apply did not finish",
+                suggestion="run plan resume or plan rollback",
+            )
+            return required
+        if action == "apply" and _recognise_applied(context):
+            report.data["state"] = "already applied, nothing to do"
+            return []
+        validate_plan(context)
+        report.data["approval"] = _approval_state(context.plan)
+        required.append("couplings")
+        blocking = [f for f in report.findings if f.severity == "Blocking"]
+        if action == "validate" or blocking:
+            if action == "approve" and blocking:
+                report.data["state"] = "not approved: validate fails"
+            return required
+        if action == "approve":
+            if not args.by:
+                raise UsageError("plan approve needs --by NAME (the person approving, gate G9)")
+            _write_approval(context, args.by)
+            return required
+        ops, redirects = preflight(context)
+        report.data["operations"] = [
+            {"path": op["path"], "change": "create" if op["pre"] is None else "delete" if op["post"] is None else "edit"} for op in ops
+        ]
+        report.data["redirects"] = [f"{src} -> {dst}" for src, dst in redirects]
+        if not args.write:
+            report.data["state"] = "dry run: nothing written (pass --write to apply)"
+            return required
+        if report.data["approval"] != "valid":
+            context.error("plan-approval", f"the plan's approval is {report.data['approval']}: run plan approve after the owner agrees (gate G9)")
+            return required
+        dirty = git(context.repo.root, "status", "--porcelain", "--", *[op["path"] for op in ops]) if ops else ""
+        if dirty and dirty.strip():
+            for line in dirty.strip().split("\n"):
+                context.error("plan-dirty", f"{line[3:]} has uncommitted changes; apply touches it")
+            return required
+        run_transaction(context.repo.root, art, ops, plan_digest(context.plan.text))
+        report.data["state"] = f"applied: {len(ops)} paths written"
+        return required
+    except _Refused:
+        return required
+
+
+def _write_approval(context: PlanContext, by: str) -> None:
+    plan = context.plan
+    text = plan.text
+    match = APPROVAL_RE.search(text)
+    if match:
+        rest = text[match.end() :]
+        following = re.search(r"(?m)^\[", rest)
+        text = text[: match.start()] + (rest[following.start() :] if following else "")
+    digest = plan_digest(text)
+    stamp = datetime.now(UTC).date().isoformat()
+    text = text.rstrip("\n") + f"\n\n[approval]\nplan_sha256 = {json.dumps(digest)}\napproved_by = {json.dumps(by)}\ndate = {json.dumps(stamp)}\n"
+    path = context.repo.root / plan.rel
+    temporary = path.with_name(path.name + ".tmp")
+    _fsync_write(temporary, text.encode())
+    os.replace(temporary, path)
+    context.report.data["state"] = f"approved by {by}"
+    context.report.data["plan_sha256"] = digest
+
+
+def _recover(context: PlanContext, action: str) -> None:
+    root, art = context.repo.root, _plan_art(context)
+    journal = _read_json(art / JOURNAL_NAME)
+    log = _read_json(art / LOG_NAME)
+    if not isinstance(journal, dict):
+        if (art / STAGING_NAME).exists() or (art / BACKUPS_NAME).exists():
+            # the journal is written before any change, so without one the tree is untouched
+            _cleanup(art)
+            context.report.data["state"] = "removed the staging of a run that stopped before changing anything"
+            return
+        if action == "rollback" and isinstance(log, dict):
+            raise UsageError("the apply completed and its backups are gone; revert it with git")
+        context.report.data["state"] = "nothing to recover: no journal"
+        return
+    entries = journal.get("ops", [])
+    states = [_state_of(root, e) for e in entries]
+    finished = isinstance(log, dict) and log.get("plan_sha256") == journal.get("plan_sha256")
+    if finished and action == "resume":
+        if any(s != "post" for s in states):
+            for entry, state in zip(entries, states, strict=True):
+                if state != "post":
+                    context.error("plan-conflict", f"{entry['path']} is not at its post-image although the apply log says completed", entry["path"])
+            return
+        _cleanup(art)
+        (art / JOURNAL_NAME).unlink(missing_ok=True)
+        context.report.data["state"] = "finished the interrupted cleanup; the plan is applied"
+        return
+    conflicts = [(e, s) for e, s in zip(entries, states, strict=True) if s == "other"]
+    if action == "resume":
+        conflicts += [
+            (e, "staged copy missing")
+            for i, (e, s) in enumerate(zip(entries, states, strict=True))
+            if s == "pre" and e["post"] is not None and not (art / STAGING_NAME / str(i)).is_file()
+        ]
+    else:
+        conflicts += [
+            (e, "backup missing")
+            for i, (e, s) in enumerate(zip(entries, states, strict=True))
+            if s == "post" and e["pre"] is not None and not (art / BACKUPS_NAME / str(i)).is_file()
+        ]
+    if conflicts:
+        for entry, state in conflicts:
+            context.error(
+                "plan-conflict",
+                f"{entry['path']}: {'changed after the crash (neither its pre- nor post-image)' if state == 'other' else state}; nothing was written",
+                entry["path"],
+            )
+        return
+    if action == "resume":
+        for index, (entry, state) in enumerate(zip(entries, states, strict=True)):
+            if state == "pre":
+                _apply_one(root, art, index, entry)
+                entry["status"] = "done"
+                _write_journal(art, journal)
+        _finalise(root, art, journal)
+        context.report.data["state"] = f"resumed: {states.count('pre')} pending operations done"
+    else:
+        for index, (entry, state) in reversed(list(enumerate(zip(entries, states, strict=True)))):
+            if state == "post":
+                _restore(root, art, index, entry)
+        _remove_new_dirs(root, journal)
+        _cleanup(art, keep_log=not finished)
+        (art / JOURNAL_NAME).unlink(missing_ok=True)
+        context.report.data["state"] = f"rolled back: {states.count('post')} operations undone"
+
+
+# --- verify: content conservation ------------------------------------------------------------------
+
+
+def _conservation_text(block: Block) -> str:
+    if block.type == "code":
+        return block.text
+    text = " ".join(block.text.split())
+    # Link destinations change when a restructure moves files; link text, emphasis and code stay.
+    text = re.sub(r"\]\(\s*<?[^)\s>]*>?(\s+\"[^\"]*\")?\s*\)", "]()", text)
+    return re.sub(r"^(\[[^\]]+\]:)\s*\S+", r"\1", text)
+
+
+def _block_hash(block: Block) -> str:
+    return hashlib.sha256(f"{block.type}\0{block.info}\0{_conservation_text(block)}".encode()).hexdigest()[:16]
+
+
+def _load_mappings(context: PlanContext) -> list[dict[str, Any]]:
+    path = context.repo.root / context.plan.artifact(MAPPINGS_NAME)
+    if not path.is_file():
+        return []
+    data = tomllib.loads(path.read_text(encoding="utf-8"))
+    out = []
+    for kind in MAPPING_TYPES:
+        for entry in data.get(kind, []) or []:
+            if isinstance(entry, dict):
+                out.append({"kind": kind, **entry})
+    return out
+
+
+def _entry_digest(entry: dict[str, Any]) -> str:
+    return sha256_bytes(json.dumps(entry, sort_keys=True, ensure_ascii=False).encode())
+
+
+def _destination_hashes(corpus: Corpus, entry: dict[str, Any]) -> list[str]:
+    if entry["kind"] != "rewritten":
+        return []
+    doc = corpus.docs.get(str(entry.get("to", "")))
+    if doc is None:
+        return []
+    heading = entry.get("heading")
+    return [_block_hash(b) for b in doc.blocks if not heading or heading in b.heading_path]
+
+
+def _approve_mappings(context: PlanContext, args: argparse.Namespace) -> None:
+    if not args.by:
+        raise UsageError("plan approve --mappings needs --by NAME (the person who reviewed the diff)")
+    baseline = _load_baseline(context)
+    if baseline is None:
+        return
+    by_hash = {b["hash"]: b for b in baseline}
+    receipts = []
+    review = []
+    for entry in _load_mappings(context):
+        missing = [h for h in entry.get("blocks", []) if h not in by_hash]
+        if missing or not entry.get("id"):
+            context.error(
+                "mapping-invalid",
+                f"mapping {entry.get('id', '?')}: needs an id and baseline block hashes ({', '.join(missing[:3])} not in the baseline)",
+            )
+            continue
+        destination = _destination_hashes(context.corpus, entry)
+        if entry["kind"] == "dropped" and not str(entry.get("proof") or "").strip():
+            context.error(
+                "mapping-invalid", f"mapping {entry['id']}: a dropped mapping needs proof (where the content lives on, or why it is obsolete)"
+            )
+            continue
+        if entry["kind"] == "rewritten" and not destination:
+            context.error("mapping-invalid", f"mapping {entry['id']}: destination {entry.get('to')} {entry.get('heading', '')} has no blocks")
+            continue
+        receipts.append(
+            {
+                "id": entry["id"],
+                "entry_sha256": _entry_digest(entry),
+                "baseline": entry.get("blocks", []),
+                "destination": destination,
+                "reviewer": args.by,
+                "date": datetime.now(UTC).date().isoformat(),
+            }
+        )
+        review.append(
+            {
+                "id": entry["id"],
+                "kind": entry["kind"],
+                "before": [by_hash[h]["text"] for h in entry.get("blocks", [])],
+                "to": entry.get("to"),
+                "proof": entry.get("proof"),
+            }
+        )
+    context.report.data["review"] = review
+    if [f for f in context.report.findings if f.severity == "Blocking"]:
+        return
+    path = context.repo.root / context.plan.artifact(RECEIPTS_NAME)
+    _fsync_write(path.with_name(path.name + ".tmp"), _json_bytes({"receipts": receipts}))
+    os.replace(path.with_name(path.name + ".tmp"), path)
+    context.report.data["state"] = f"{len(receipts)} review receipts written"
+
+
+def _load_baseline(context: PlanContext) -> list[dict[str, Any]] | None:
+    rel = context.plan.meta.get("blocks")
+    data = _read_json(context.repo.root / str(rel)) if isinstance(rel, str) else None
+    if not isinstance(data, dict) or not isinstance(data.get("blocks"), list):
+        context.report.coverage.append(CoverageRow("conservation_baseline", "failed", f"{rel}: missing or unreadable"))
+        return None
+    context.report.coverage.append(CoverageRow("conservation_baseline", "complete", f"{rel}: {len(data['blocks'])} blocks"))
+    return [b for b in data["blocks"] if isinstance(b, dict)]
+
+
+def _verify(context: PlanContext, args: argparse.Namespace) -> list[str]:
+    report, corpus = context.report, context.corpus
+    required = ["conservation_baseline", "markdown"]
+    baseline = _load_baseline(context)
+    if baseline is None:
+        return required
+    current = [(rel, b, _block_hash(b)) for rel in sorted(corpus.docs) for b in corpus.docs[rel].blocks]
+    occurrences: dict[str, list[int]] = defaultdict(list)
+    for index, (_rel, _block, digest) in enumerate(current):
+        occurrences[digest].append(index)
+    receipts = {r["id"]: r for r in (_read_json(context.repo.root / context.plan.artifact(RECEIPTS_NAME)) or {}).get("receipts", [])}
+    excused: Counter[str] = Counter()
+    for entry in _load_mappings(context):
+        receipt = receipts.get(entry.get("id"))
+        if receipt is None:
+            report.add(
+                Finding(
+                    "mapping-unreviewed",
+                    "P0",
+                    "verified",
+                    context.plan.artifact(MAPPINGS_NAME),
+                    0,
+                    f"mapping {entry.get('id')} has no review receipt",
+                    suggestion="show the diff to the owner, then run plan approve --mappings",
+                )
+            )
+            continue
+        valid = (
+            receipt.get("entry_sha256") == _entry_digest(entry)
+            and receipt.get("baseline") == entry.get("blocks", [])
+            and all(any(b["hash"] == h for b in baseline) for h in entry.get("blocks", []))
+            and receipt.get("destination") == _destination_hashes(corpus, entry)
+        )
+        if not valid:
+            report.add(
+                Finding(
+                    "receipt-invalid",
+                    "P0",
+                    "verified",
+                    context.plan.artifact(RECEIPTS_NAME),
+                    0,
+                    f"mapping {entry.get('id')}: the entry, its baseline blocks or its destination changed after review",
+                    suggestion="review it again",
+                )
+            )
+            continue
+        excused.update(entry.get("blocks", []))
+    used: set[int] = set()
+    matched: list[int | None] = []
+    for block in baseline:
+        digest = block["hash"]
+        free = [i for i in occurrences.get(digest, []) if i not in used]
+        if free and _sensitive(block):
+            # of identical copies, the one still in its section is the one this block became
+            free.sort(key=lambda i: not _place_kept(context.plan, block, current[i][0], current[i][1].heading_path))
+        if free:
+            used.add(free[0])
+            matched.append(free[0])
+        elif excused[digest] > 0:
+            excused[digest] -= 1
+            matched.append(None)
+        else:
+            matched.append(None)
+            report.add(
+                Finding(
+                    "block-unaccounted",
+                    "P0",
+                    "verified",
+                    block["file"],
+                    block["line"],
+                    f"{block['type']} not found after the restructure: {block['text'][:100]!r}",
+                    suggestion="restore it, or record a rewritten/dropped mapping and have it reviewed",
+                )
+            )
+    unaccounted = sum(1 for f in report.findings if f.check == "block-unaccounted")
+    groups: dict[tuple[Any, ...], list[int]] = defaultdict(list)
+    for block, found in zip(baseline, matched, strict=True):
+        if found is not None and block["type"] in ("list-item", "table-row"):
+            groups[(block["file"], tuple(block["heading_path"]), block["type"], block["depth"])].append(found)
+        if found is not None and _sensitive(block) and not _place_kept(context.plan, block, current[found][0], current[found][1].heading_path):
+            report.add(
+                Finding(
+                    "context-lost",
+                    "P1",
+                    "verified",
+                    current[found][0],
+                    current[found][1].line,
+                    f"{block['type']} {block['text'][:80]!r} left its section {block['file']}: {' > '.join(block['heading_path']) or '(top)'}",
+                    suggestion="keep warnings and requirements under the heading they qualify",
+                )
+            )
+    for (file, path, kind, _depth), indexes in sorted(groups.items()):
+        if indexes != sorted(indexes):
+            report.add(Finding("order-changed", "P1", "verified", file, 0, f"the order of the {kind}s under {' > '.join(path) or '(top)'} changed"))
+    report.data["conservation"] = {
+        "baseline_blocks": len(baseline),
+        "unaccounted": unaccounted,
+        "excused_by_mappings": sum(1 for i in matched if i is None) - unaccounted,
+    }
+    if args.urls:
+        if not args.built:
+            raise UsageError("plan verify --urls needs --built NEW_SITE")
+        urls = _read_json(Path(args.urls))
+        if not isinstance(urls, dict):
+            raise UsageError(f"{args.urls}: not a URL baseline")
+        built = load_built(args.built, context.repo, context.site)
+        if "routes" not in urls:
+            raise UsageError(f"{args.urls}: not a URL baseline written by check --save-baseline")
+        compare_url_baseline(urls, built["site"], report, args.urls)
+        report.coverage.append(_url_baseline_row(urls, built))
+        required.append("url_baseline")
+    return required
+
+
+def _place_kept(plan: Plan, block: dict[str, Any], now_file: str, now_path: list[str]) -> bool:
+    """Whether a block still sits under its full heading path, in the file the plan sent it to."""
+    file, path = str(block["file"]), [str(h) for h in block["heading_path"]]
+    now = [str(h) for h in now_path]
+    for split in plan.entries("split"):
+        heading = str(split.get("heading"))
+        if str(split.get("from")) == file and heading in path:
+            return now_file == str(split.get("to")) and now == path[path.index(heading) :]
+    for merge in plan.entries("merge"):
+        if file in _paths_of(merge, "from"):
+            # merged under the target's own title: the path below the source's title must survive
+            tail = path[1:]
+            return now_file == str(merge.get("into")) and (not tail or now[-len(tail) :] == tail)
+    moves = {str(e.get("from")): str(e.get("to")) for kind in ("move", "archive") for e in plan.entries(kind)}
+    return now_file == moves.get(file, file) and now == path
+
+
+def _sensitive(block: dict[str, Any]) -> bool:
+    kind = str(block["type"])
+    return kind.startswith(("admonition", "alert")) or (kind in ("paragraph", "list-item") and bool(SENSITIVE_RE.search(str(block["text"]))))
+
+
+# ---------------------------------------------------------------------------------------------
 # Command line
 # ---------------------------------------------------------------------------------------------
 
@@ -2952,10 +6324,11 @@ def _write_output(path: Path, content: str) -> None:
     target.write_text(content, encoding="utf-8")
 
 
-def _common(parser: argparse.ArgumentParser) -> None:
+def _common(parser: argparse.ArgumentParser, out: bool = True) -> None:
     parser.add_argument("--root", default=".", help="repository root (default: the current directory)")
     parser.add_argument("--format", choices=("text", "json"), default="text", help="output format")
-    parser.add_argument("--out", help="write the report to this file instead of stdout")
+    if out:
+        parser.add_argument("--out", help="write the report to this file instead of stdout")
     parser.add_argument("--max", type=int, default=50, help="findings shown in text output (default 50)")
     parser.add_argument("--fail-on", choices=SEVERITIES, default="P3", help="lowest severity that makes the exit code 1 (default P3)")
 
@@ -2976,6 +6349,42 @@ def build_parser() -> argparse.ArgumentParser:
     _common(check)
     check.add_argument("--scope", choices=("all", "docs", "repo"), default="all", help="which Markdown files to check")
     check.add_argument("--allow-partial", action="store_true", help="exit 0/1 even when coverage is incomplete (the summary says PARTIAL)")
+    check.add_argument("--built", help="a docstool site-build output directory (refused when stale or not built by docstool)")
+    check.add_argument("--save-baseline", help="write the URL and anchor baseline of --built (or, without it, a source-derived one) to this file")
+    check.add_argument("--baseline", help="check --built against a saved URL baseline: routes, redirects, anchors")
+    build = sub.add_parser("site-build", help="build the site with its generator into a fresh directory, with a stamp of its inputs")
+    _common(build, out=False)
+    build.add_argument("--out", dest="out_dir", required=True, help="fresh output directory (must not exist or be empty)")
+    build.add_argument("--ref", help="build this commit from git archive instead of the working tree")
+    build.add_argument("--generator", choices=("zensical", "mkdocs"), help="default: zensical for zensical.toml, mkdocs for mkdocs.yml")
+    build.add_argument("--generator-cmd", help=argparse.SUPPRESS)
+    plan = sub.add_parser("plan", help="validate, approve, apply, resume, roll back or verify a restructure plan")
+    _common(plan)
+    plan.add_argument("action", choices=("validate", "approve", "apply", "resume", "rollback", "verify"))
+    plan.add_argument("--plan", default="docs/internal/restructure/plan.toml", help="the plan file (default docs/internal/restructure/plan.toml)")
+    plan.add_argument("--write", action="store_true", help="apply: write the changes (the default is a dry run)")
+    plan.add_argument("--by", help="approve: who approves (gate G9)")
+    plan.add_argument("--mappings", action="store_true", help="approve: write review receipts for mappings.toml instead of the plan approval")
+    plan.add_argument("--urls", help="verify: also check a saved URL baseline against --built")
+    plan.add_argument("--built", help="verify --urls: the new site-build output")
+    drift = sub.add_parser("drift", help="find commands, flags, env vars and paths the docs name that the code no longer has")
+    _common(drift)
+    drift.add_argument("--scope", choices=("all", "docs", "repo"), default="all", help="which Markdown files to read")
+    drift.add_argument("--base", help="also report tokens removed or added since this commit (read-only git diff)")
+    drift.add_argument("--paths", action="store_true", help="also check repository paths quoted in inline code")
+    drift.add_argument("--leads", action="store_true", help="also report status claims, hand-maintained counts and stale docs as leads")
+    drift.add_argument("--allow-partial", action="store_true", help="exit 0/1 even when coverage is incomplete (the summary says PARTIAL)")
+    audit = sub.add_parser("site-audit", help="audit zensical.toml or mkdocs.yml for what Zensical ignores, misses or does differently")
+    _common(audit)
+    readme = sub.add_parser("readme", help="lint the README and compare it with the homepage")
+    _common(readme)
+    readme.add_argument("--file", default="README.md", help="the README to lint (default README.md)")
+    readme.add_argument("--home", help="the homepage (docs/index.md) whose tagline, features and install block the README must match")
+    readme.add_argument("--registry", action="store_true", help="the README is also shown on a package registry (relative images break there)")
+    contrast = sub.add_parser("contrast", help="check a brand colour against both page schemes and as a button fill")
+    _common(contrast)
+    contrast.add_argument("colour", help="the brand colour, #rrggbb")
+    contrast.add_argument("--slate", help="the dark-scheme override of the colour, when there is one")
     slug = sub.add_parser("slug", help="print GitHub's and the site's anchor for heading texts")
     _common(slug)
     slug.add_argument(
@@ -2988,7 +6397,18 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-COMMANDS = {"inventory": cmd_inventory, "check": cmd_check, "slug": cmd_slug}
+COMMANDS = {
+    "inventory": cmd_inventory,
+    "check": cmd_check,
+    "drift": cmd_drift,
+    "site-audit": cmd_site_audit,
+    "readme": cmd_readme,
+    "contrast": cmd_contrast,
+    "site-build": cmd_site_build,
+    "plan": cmd_plan,
+    "slug": cmd_slug,
+}
+TEXT_RENDERERS: dict[str, Callable[[Report], str]] = {"inventory": render_inventory_text, "contrast": render_contrast_text}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -3007,13 +6427,17 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "slug":
             output = "".join(f"{r['text']}\n  github: #{r['github']}\n  site ({r['style']}): #{r['site']}\n" for r in report.data["slugs"])
         else:
-            extra = render_inventory_text(report) if args.command == "inventory" else ""
+            extra = TEXT_RENDERERS[args.command](report) if args.command in TEXT_RENDERERS else ""
             output = extra + render_text(report, incomplete, args.max)
-        if args.out:
+        if getattr(args, "out", None):
             _write_output(Path(args.out), output)
         else:
             sys.stdout.write(output)
     except UsageError as error:
+        print(f"docstool: error: {error}", file=sys.stderr)
+        return EXIT_USAGE
+    except OSError as error:
+        # never exit 1 ("findings") on an I/O failure
         print(f"docstool: error: {error}", file=sys.stderr)
         return EXIT_USAGE
     return code

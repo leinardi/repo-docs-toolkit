@@ -47,3 +47,8 @@ updates:
     labels: ["dependencies", "ci"]
     cooldown:
       default-days: 7
+    # zensical-requirements.txt pins the Zensical the skills' claims were verified against
+    # (KNOWN_ZENSICAL); moving it is a deliberate upgrade with re-verification, not a routine bump.
+    ignore:
+      - dependency-name: "zensical"
+      - dependency-name: "zensical-ui"

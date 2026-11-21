@@ -58,6 +58,10 @@ else
 	@$(PYTHON) -m pytest
 endif
 
+.PHONY: test-zensical
+test-zensical: ## Run the tests that need the pinned Zensical (install zensical-requirements.txt first)
+	@DOCSTOOL_REQUIRE_ZENSICAL=1 $(PYTHON) -m pytest -m zensical
+
 .PHONY: sync-vendored
 sync-vendored: ## Copy skills/repo-docs/scripts/docstool.py into the other skills
 	@$(PYTHON) -I $(REPO_ROOT)/scripts/sync-vendored.py
