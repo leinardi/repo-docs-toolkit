@@ -3,7 +3,7 @@ name: repo-readme
 description: >-
   Writes and reviews a repository's README and community files (CONTRIBUTING, SECURITY,
   CODE_OF_CONDUCT, a short RELEASING cheat sheet and the CHANGELOG policy) in a lean, branded style:
-  50 to 100 lines, logo and tagline, at most four badges, emoji only as section prefixes, a gateway to
+  50 to 150 lines, logo and tagline, at most four badges, emoji only as section prefixes, a gateway to
   the docs rather than a copy of them, with every command and claim verified against the repository.
   Use when the user asks to create, rewrite, shorten or review a README, add badges or a logo header,
   add a contributing guide, security policy, code of conduct or release checklist, or make a
@@ -13,7 +13,7 @@ description: >-
 # README and repository files
 
 The README and the community files around it: CONTRIBUTING, SECURITY, CODE_OF_CONDUCT, a short
-RELEASING cheat sheet and the CHANGELOG policy. A README here is lean and branded: 50 to 100
+RELEASING cheat sheet and the CHANGELOG policy. A README here is lean and branded: 50 to 150
 lines, a centered logo and tagline, at most four badges, emoji only as section prefixes, and a
 gateway to the docs rather than a copy of them.
 
@@ -50,7 +50,7 @@ python3 -I <skill-dir>/scripts/docstool.py <command> --root <repo>
    user. Anything else is `TODO(verify: ...)`, never a guess.
 2. **Never invent** a logo, a feature, a support channel, a contact address, a response time or
    a badge for something that does not exist.
-3. **50 to 100 lines, no reference material.** Full install matrices, every command, configuration
+3. **50 to 150 lines, no reference material.** Most READMEs land near 100. Full install matrices, every command, configuration
    and changelogs go in the docs; the README links to them. When the repository has too few
    verifiable facts to reach 50 lines, a shorter README is right: report the `readme-length`
    finding with that reason, never pad.

@@ -35,7 +35,7 @@ def test_good_readme_passes_with_its_homepage(tmp_path: Path) -> None:
     repo = make_repo("readme-good", tmp_path)
     code, report = docstool_json(repo, "readme", "--home", "docs/index.md")
     assert code == 0, report["findings"]
-    assert 50 <= report["data"]["readme"]["lines"] <= 100
+    assert 50 <= report["data"]["readme"]["lines"] <= 150
 
 
 def test_bad_readme_planted_faults(tmp_path: Path) -> None:

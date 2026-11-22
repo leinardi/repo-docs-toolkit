@@ -3205,7 +3205,7 @@ PICTURE_RE = re.compile(r"<picture\b.*?</picture>", re.IGNORECASE | re.DOTALL)
 ALT_RE = re.compile(r"""\balt\s*=\s*(?:"([^"]*)"|'([^']*)')""", re.IGNORECASE)
 CARD_TITLE_RE = re.compile(r"^[ \t]*[-*+][ \t]+(?::[\w-]+:(?:\{[^}]*\})?[ \t]*)?(?:\*\*|__)(.+?)(?:\*\*|__)")
 FEATURE_BULLET_RE = re.compile(r"^[ \t]*[-*+][ \t]+(?:\S+[ \t]+)?(?:\*\*|__)(.+?)(?:\*\*|__)")
-README_LINE_BUDGET = (50, 100)
+README_LINE_BUDGET = (50, 150)
 MAX_BADGES = 4
 
 

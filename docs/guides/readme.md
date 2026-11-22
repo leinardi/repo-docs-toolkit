@@ -14,7 +14,7 @@ The skill detects the kind of project (a CLI, a GTK or Flatpak app, a library, a
 drafts from the matching template. It asks first whether to rewrite or edit in place, and moves
 anything it would remove into the docs before removing it. The result follows a few fixed rules:
 
-- 50 to 100 lines, with no reference material the docs already hold;
+- 50 to 150 lines, with no reference material the docs already hold;
 - a centred header with the logo (when one exists), a bold tagline, at most four badges in one
   style and a line of links;
 - emoji only as the first character of a section heading, from a fixed set;

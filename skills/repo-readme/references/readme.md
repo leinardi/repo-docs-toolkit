@@ -18,8 +18,10 @@ docs. Its shape here is the one the toolkit's checker tests (`docstool readme`).
 
 ## Budget
 
-50 to 100 lines. Under 50 usually means install or usage is missing; over 100 means reference
-material that belongs in the docs: full install matrices, every command or flag, configuration
+50 to 150 lines, and most READMEs land near 100. Under 50 usually means install or usage is
+missing. Past 100, check that every section is something a first-time visitor needs: screenshots,
+an install method per platform or a short configuration example can earn the space. Over 150
+means reference material that belongs in the docs: full install matrices, every command or flag, configuration
 reference, changelog, contributing rules. Link to them instead. Content you remove from a README
 must exist in the docs first (gate R4): move it, check the link, then cut it.
 
@@ -155,7 +157,7 @@ python3 -I <skill-dir>/scripts/docstool.py readme --root <repo> --home docs/inde
 
 | Check | Meaning |
 | --- | --- |
-| `readme-length` | Outside 50 to 100 lines |
+| `readme-length` | Outside 50 to 150 lines |
 | `readme-h1` | Not exactly one level-1 heading (Markdown or `<h1>`) |
 | `readme-badges` | More than 4 badges, or mixed shields.io styles |
 | `readme-emoji` | An emoji anywhere but the first character of a level-2 heading |
