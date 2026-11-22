@@ -25,7 +25,7 @@ standard-library checker behind every claim.
   that accounts for every block and old URL.
 - **Zensical sites with a landing page:** configuration, migration from MkDocs, GitHub Pages and a
   developer landing page.
-- **Lean READMEs:** 50 to 100 lines that match the homepage, plus the community files.
+- **Lean READMEs:** 50 to 150 lines that match the homepage, plus the community files.
 
 ## 📦 Installation
 

@@ -18,9 +18,11 @@ The skill starts from a template `zensical.toml` that sets:
 - GitHub alerts (`> [!NOTE]`) rendered as admonitions;
 - a three-entry palette (system, light, dark) with one brand colour.
 
-Zensical is pinned in `zensical-requirements.in` and installed from a hashed lock, locally and
-in CI. The skill adds a Pages workflow that builds every pull request and deploys from the default
-branch. Turning on Pages (Settings, Pages, Source "GitHub Actions") is yours to do.
+Zensical is pinned in a small uv project (`tools/docs/pyproject.toml` and its committed
+`uv.lock`) and runs through `uv run --locked`, locally and in CI, so nothing is installed into the
+system Python. A Dependabot `uv` entry proposes Zensical upgrades. The skill adds a Pages workflow
+that builds every pull request and deploys from the default branch. Turning on Pages (Settings,
+Pages, Source "GitHub Actions") is yours to do.
 
 ## Migrating from MkDocs
 

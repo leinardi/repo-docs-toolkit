@@ -56,7 +56,7 @@ def readme_report(repo: Path) -> tuple[int, dict[str, Any]]:
 def test_example_readme_is_clean_and_in_budget(name: str, tmp_path: Path) -> None:
     code, report = readme_report(example_repo(name, tmp_path))
     assert code == 0, report["findings"]
-    assert 50 <= report["data"]["readme"]["lines"] <= 100
+    assert 50 <= report["data"]["readme"]["lines"] <= 150
     assert report["data"]["readme"]["features"] == report["data"]["home"]["features"]
     assert report["data"]["readme"]["install"] == report["data"]["home"]["install"]
 

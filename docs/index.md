@@ -85,7 +85,7 @@ Findings:
 
     **Lean READMEs**
 
-    A README of 50 to 100 lines that matches the homepage, plus the community files a
+    A README of 50 to 150 lines that matches the homepage, plus the community files a
     repository actually needs.
 
 </div>

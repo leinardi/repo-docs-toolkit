@@ -127,21 +127,34 @@ nothing. That is why `check` and `site-audit` run as well.
 
 ## Pinning Zensical
 
-Zensical releases often, and its config and templates still change between 0.x versions. Pin it:
+Zensical releases often, and its config and templates still change between 0.x versions. Pin it
+in a small uv project, so nothing is installed into the system Python and Dependabot can propose
+upgrades:
 
-1. Copy `assets/zensical-requirements.in` (`zensical==0.1.3`) to the repository root.
-2. Compile a hashed lock and commit both files:
+1. Copy `assets/tools/docs/pyproject.toml` (`zensical==0.1.3`, no build system) to
+   `tools/docs/pyproject.toml`, and add `tools/docs/.venv/` to `.gitignore`.
+2. Lock it and commit `pyproject.toml` and `uv.lock`:
 
    ```sh
-   uv pip compile --universal --generate-hashes zensical-requirements.in -o zensical-requirements.txt
+   uv lock --project tools/docs
    ```
 
-   `pip-compile --generate-hashes` from pip-tools gives the same result. Writing the lock
-   resolves from PyPI and writes a file: tell the user first.
-3. Install with `pip install --require-hashes -r zensical-requirements.txt`, locally and in CI.
+   The lock records a hash for every file, for every platform. Writing it resolves from PyPI and
+   writes a file: tell the user first.
+3. Run Zensical through uv, locally and in CI: `uv run --project tools/docs --locked zensical
+   build --strict --clean`, or `zensical serve` to preview. `--locked` refuses a lock that no
+   longer matches `pyproject.toml`. docstool's `site-build` needs that `zensical` on its path:
+   `uv run --project tools/docs --locked python3 -I <skill-dir>/scripts/docstool.py site-build …`.
+4. Let Dependabot propose upgrades: a `package-ecosystem: "uv"` entry for `/tools/docs`, with
+   the repository's usual schedule and a `cooldown`. Treat each bump as an upgrade
+   ([upgrade-and-audit.md](upgrade-and-audit.md)), not a routine merge.
 
-A repository that includes make-common's `zensical.mk` already has lock and build targets
-(`make help` lists them); use those instead of new ones.
+A repository that uses make-common (`.mk/` and `MK_COMMON_FILES` in its `Makefile`) gets the
+same through `zensical.mk` in uv mode, from make-common v1.16.0 (older copies ignore
+`DOCS_UV_PROJECT`; run `make mk-common-update` first): add `zensical.mk` to `MK_COMMON_FILES` and set
+`DOCS_UV_PROJECT := tools/docs` before the include. Then `make docs-build`, `make docs-serve`
+(`DOCS_ADDR=IP:PORT` to change the address), `make docs-deps-lock`, `make docs-deps-upgrade`
+and `make docs-deps-outdated` run through uv; `make help` lists them.
 
 ## Checking a config
 

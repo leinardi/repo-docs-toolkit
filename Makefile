@@ -30,10 +30,12 @@ MK_COMMON_VERSION ?= v1
 
 MK_COMMON_DIR := $(REPO_ROOT)/.mk
 
-# Shared snippets coming from make-common. make-common's zensical.mk is not used: it expects a
-# pip-tools lock that also holds the tools, while this repository locks Zensical alone
-# (zensical-requirements.txt) and builds its site with docstool (make docs-build, .mk/test.mk).
-MK_COMMON_FILES := help.mk pre-commit.mk
+# Shared snippets coming from make-common.
+MK_COMMON_FILES := help.mk pre-commit.mk zensical.mk
+
+# zensical.mk in uv mode: Zensical from tools/docs/uv.lock, run through uv (nothing installed into
+# the system Python). Set before the include below.
+DOCS_UV_PROJECT := tools/docs
 
 MK_COMMON_BOOTSTRAP_SCRIPT := $(REPO_ROOT)/scripts/bootstrap-mk-common.sh
 MK_COMMON_BOOTSTRAP := $(shell "$(MK_COMMON_BOOTSTRAP_SCRIPT)" \

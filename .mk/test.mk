@@ -58,32 +58,45 @@ else
 	@$(PYTHON) -m pytest
 endif
 
+# The tests that need Zensical run in the docs uv environment (tools/docs/uv.lock, zensical.mk's
+# DOCS_UV_RUN), with the test dependencies added on top; nothing is installed into the system Python.
+DOCS_TEST_RUN = $(DOCS_UV_RUN) --with-requirements $(REPO_ROOT)/requirements-dev.txt
+DOCS_A11Y_RUN = $(DOCS_TEST_RUN) --with-requirements $(REPO_ROOT)/requirements/a11y.txt
+
 .PHONY: test-zensical
-test-zensical: ## Run the tests that need the pinned Zensical (install zensical-requirements.txt first)
-	@DOCSTOOL_REQUIRE_ZENSICAL=1 $(PYTHON) -m pytest -m zensical
+test-zensical: ## Run the tests that need the pinned Zensical (through uv, from tools/docs/uv.lock)
+	@DOCSTOOL_REQUIRE_ZENSICAL=1 $(DOCS_TEST_RUN) python -m pytest -m zensical
 
 .PHONY: test-landing
-test-landing: ## Build the landing examples strict and check their HTML (needs the pinned Zensical)
-	@DOCSTOOL_REQUIRE_ZENSICAL=1 $(PYTHON) -m pytest -m zensical $(REPO_ROOT)/tests/test_landing_build.py
+test-landing: ## Build the landing examples strict and check their HTML (through uv)
+	@DOCSTOOL_REQUIRE_ZENSICAL=1 $(DOCS_TEST_RUN) python -m pytest -m zensical $(REPO_ROOT)/tests/test_landing_build.py
+
+.PHONY: a11y-browser
+a11y-browser: ## Download the Chromium the accessibility tests use (Playwright; CI adds --with-deps)
+	@$(DOCS_A11Y_RUN) python -m playwright install $(A11Y_BROWSER_FLAGS) chromium
 
 .PHONY: test-a11y
-test-a11y: ## Run the landing page accessibility tests (needs Zensical and requirements/a11y.txt)
-	@DOCSTOOL_REQUIRE_ZENSICAL=1 DOCSTOOL_REQUIRE_A11Y=1 $(PYTHON) -m pytest -m a11y
+test-a11y: ## Run the landing page accessibility tests (through uv; run make a11y-browser once)
+	@DOCSTOOL_REQUIRE_ZENSICAL=1 DOCSTOOL_REQUIRE_A11Y=1 $(DOCS_A11Y_RUN) python -m pytest -m a11y
 
 DOCSTOOL := $(REPO_ROOT)/skills/repo-docs/scripts/docstool.py
 
 # The plugin's own site, built strict by docstool into a fresh temporary directory (removed on
 # exit) and checked the way the skills check a user's site. Any finding or incomplete coverage fails.
-.PHONY: docs-build
-docs-build: ## Build the plugin's own site strict and check it with docstool (needs the pinned Zensical)
+# docstool runs in the docs uv environment, so site-build finds that environment's zensical.
+# (zensical.mk's docs-build is the plain build; docs-serve serves it with live reload.)
+DOCSTOOL_RUN = $(DOCS_UV_RUN) python -I $(DOCSTOOL)
+
+.PHONY: docs-verify
+docs-verify: ## Build the plugin's own site strict and check it with docstool (through uv)
 	@out="$$(mktemp -d)" && trap 'rm -rf "$$out"' EXIT && cd $(REPO_ROOT) && \
-	$(PYTHON) -I $(DOCSTOOL) site-build --out "$$out" && \
-	$(PYTHON) -I $(DOCSTOOL) check --scope docs --built "$$out" && \
-	$(PYTHON) -I $(DOCSTOOL) check --scope repo && \
-	$(PYTHON) -I $(DOCSTOOL) site-audit && \
-	$(PYTHON) -I $(DOCSTOOL) drift --scope docs && \
-	$(PYTHON) -I $(DOCSTOOL) drift --scope repo && \
-	$(PYTHON) -I $(DOCSTOOL) readme --home docs/index.md
+	$(DOCSTOOL_RUN) site-build --out "$$out" && \
+	$(DOCSTOOL_RUN) check --scope docs --built "$$out" && \
+	$(DOCSTOOL_RUN) check --scope repo && \
+	$(DOCSTOOL_RUN) site-audit && \
+	$(DOCSTOOL_RUN) drift --scope docs && \
+	$(DOCSTOOL_RUN) drift --scope repo && \
+	$(DOCSTOOL_RUN) readme --home docs/index.md
 
 .PHONY: sync-vendored
 sync-vendored: ## Copy skills/repo-docs/scripts/docstool.py into the other skills

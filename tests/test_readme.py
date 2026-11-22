@@ -35,7 +35,7 @@ def test_good_readme_passes_with_its_homepage(tmp_path: Path) -> None:
     repo = make_repo("readme-good", tmp_path)
     code, report = docstool_json(repo, "readme", "--home", "docs/index.md")
     assert code == 0, report["findings"]
-    assert 50 <= report["data"]["readme"]["lines"] <= 100
+    assert 50 <= report["data"]["readme"]["lines"] <= 150
 
 
 def test_bad_readme_planted_faults(tmp_path: Path) -> None:
@@ -74,3 +74,24 @@ def test_missing_readme_is_failed_coverage(tmp_path: Path) -> None:
     repo = make_repo("clean", tmp_path)
     code, _ = docstool_json(repo, "readme", "--file", "NOPE.md")
     assert code == 3
+
+
+def test_wrapped_badges_count_and_the_flathub_button_does_not(tmp_path: Path) -> None:
+    repo = make_repo("readme-good", tmp_path)
+    readme = repo / "README.md"
+    _, before = docstool_json(repo, "readme")
+    text = readme.read_text(encoding="utf-8")
+    wrapped = (
+        '<p align="center">\n'
+        '  <a href="https://example.org/ci"><img alt="Docs"\n'
+        '    src="https://img.shields.io/badge/docs-site-blue?style=flat-square"></a>\n'
+        '  <a href="https://flathub.org/apps/org.example.App"><img width="200" alt="Get it on Flathub"\n'
+        '    src="https://flathub.org/api/badge?locale=en"></a>\n'
+        "</p>\n"
+    )
+    head, sep, rest = text.partition("</p>\n")
+    readme.write_text(head + sep + "\n" + wrapped + rest, encoding="utf-8")
+    _, after = docstool_json(repo, "readme")
+    assert after["data"]["readme"]["badges"] == before["data"]["readme"]["badges"] + 1
+    images = [f for f in after["findings"] if f["check"] == "readme-alt"]
+    assert images == []
