@@ -39,6 +39,11 @@ updates:
     labels: ["dependencies", "ci"]
     cooldown:
       default-days: 7
+    # lychee tags its releases lychee-vX.Y.Z, which Dependabot cannot compare ("comparison of
+    # Dependabot::PreCommit::Version with nil failed"), and that error fails every run of this
+    # entry. Bump its rev by hand (git ls-remote --tags https://github.com/lycheeverse/lychee).
+    ignore:
+      - dependency-name: "https://github.com/lycheeverse/lychee"
 
   - package-ecosystem: "pip"
     directory: "/"
