@@ -1,0 +1,80 @@
+# An example restructure plan: the format is in references/restructure.md, "The plan format".
+#
+# It is written for a small repository where docs/protocol.md is cited by code and tests,
+# docs/release.md is a maintainer runbook and docs/roadmap.md is a finished milestone list.
+# Replace every path, the commit and the hashes; plan validate names whatever is still wrong.
+
+[meta]
+schema = 1
+base_commit = "<base commit>"  # git rev-parse HEAD when the plan is written
+docs_dir = "docs"
+site_config = "zensical.toml"  # omit when the repository has no site
+blocks = "docs/internal/restructure/blocks.json"  # written by inventory --blocks
+
+[meta.sources]
+# Every file the plan reads or writes, with its SHA-256; plan validate prints the missing ones.
+# RELEASING.md is outside docs/: listing it lets apply rewrite its link to docs/release.md (G10).
+"RELEASING.md" = "<sha256>"
+"docs/internal/restructure/blocks.json" = "<sha256>"
+"docs/release.md" = "<sha256>"
+"docs/roadmap.md" = "<sha256>"
+"src/device.rs" = "<sha256>"
+"zensical.toml" = "<sha256>"
+
+# A finished record: archived with a status line, never rewritten (gate G7).
+[[archive]]
+from = "docs/roadmap.md"
+to = "docs/internal/history/roadmap.md"
+status = "Historical: milestones M1 to M5, finished in October 2026. Open work is tracked in GitHub issues."
+redirect_to = "docs/protocol.md"  # it was published: the page that took over its readers (or the home page)
+
+# A maintainer runbook: internal by the publication policy.
+[[move]]
+from = "docs/release.md"
+to = "docs/internal/release.md"
+redirect_to = "docs/protocol.md"
+
+# src/device.rs names the old path in a comment; links in Markdown are rewritten by apply, other
+# files need an exact line edit (gate G10).
+[[reference]]
+file = "src/device.rs"
+line = 3
+old = "docs/release.md"
+new = "docs/internal/release.md"
+
+# Cited by heading and section number from code and read by a test: it stays (gate G3).
+[[freeze]]
+paths = ["docs/protocol.md"]
+
+[[keep]]
+paths = ["docs/internal/"]
+
+[[decision]]
+id = "d1"
+question = "Is the release runbook published or internal?"
+answer = "Internal, confirmed by the owner; RELEASING.md stays at the root as the cheat sheet."
+
+# Other entry types, for reference:
+#
+# [[split]]                      # move one section to its own page
+# from = "docs/guide.md"
+# heading = "Troubleshooting"    # must occur exactly once in the file
+# to = "docs/troubleshooting.md"
+#
+# [[merge]]                      # declared here, done by hand after apply
+# from = ["docs/install-linux.md", "docs/install-macos.md"]
+# into = "docs/install.md"
+#
+# [[anchor]]                     # links to file#from now point at #to; rename the heading yourself
+# file = "docs/protocol.md"
+# from = "power-on-state"
+# to = "power"
+#
+# [[stub]]                       # only where something outside the site links to the old path
+# path = "docs/old-name.md"
+# target = "docs/new-name.md"
+#
+# [[delete]]                     # an empty file or an exact duplicate only (gate G5)
+# path = "docs/copy-of-release.md"
+# approved = true
+# proof = "every block also appears in docs/internal/release.md"
