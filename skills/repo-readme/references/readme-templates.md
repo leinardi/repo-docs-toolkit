@@ -117,7 +117,8 @@ Changes from the command-line skeleton:
 - **Badges:** CI, the container image or release, License.
 - **Installation:** the compose file or the container command from the repository, linked rather
   than copied when it is longer than a few lines (`compose.yaml`), with the required environment
-  variables named in one sentence and documented in the docs.
+  variables named in one sentence and documented in the docs. No compose file meant for users and
+  no published image: build from source, and link the deployment example in the docs.
 - **Usage:** how to reach it once running (port, URL, health endpoint), as the code defines it.
 - **🔒 Security:** one line linking SECURITY.md; a service gets one.
 
@@ -131,8 +132,8 @@ Changes from the command-line skeleton:
 | `<owner>`, `<repo>` | `git remote get-url origin` |
 | `<workflow>` | The workflow file that runs the tests, in `.github/workflows/` |
 | `<release-url>` | Releases exist: `gh release list --limit 1` |
-| `<docs-url>` | `site_url` in `zensical.toml` or `mkdocs.yml`, or the repository homepage field |
+| `<docs-url>` | `site_url` in `zensical.toml` or `mkdocs.yml`, or the repository homepage field; no site: the docs index in the repository (`docs/README.md`, `docs/index.md`) as a relative link, and no docs badge |
 | `<app-id>` | The metainfo or Flatpak manifest id |
-| Install and usage commands | The project's install docs, Makefile, manifest, `--help` when safe to run |
+| Install and usage commands | The Makefile, manifest, the code, `--help` when safe to run; the project's install docs only as a lead, each command confirmed in the code first |
 | Features | The homepage's feature cards; otherwise capabilities the code has, each traceable to it |
 | `<licence name>` | The LICENSE file's text, or the manifest's licence field |

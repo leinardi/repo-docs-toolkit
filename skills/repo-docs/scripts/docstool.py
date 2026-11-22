@@ -3197,9 +3197,9 @@ def render_contrast_text(report: Report) -> str:
 # readme
 # ---------------------------------------------------------------------------------------------
 
-BADGE_RE = re.compile(
-    r"img\.shields\.io|badgen\.net|badge\.svg|/badges?/|flathub\.org/api/badge|badge\.fury\.io|codecov\.io/.+/graph/badge", re.IGNORECASE
-)
+BADGE_RE = re.compile(r"img\.shields\.io|badgen\.net|badge\.svg|/badges?/|badge\.fury\.io|codecov\.io/.+/graph/badge", re.IGNORECASE)
+# The official "Get it on Flathub" button is the install action the Installation section shows, not a badge
+FLATHUB_BUTTON_RE = re.compile(r"flathub\.org/api/badge", re.IGNORECASE)
 HTML_IMG_RE = re.compile(r"<img\b[^>]*>", re.IGNORECASE)
 PICTURE_RE = re.compile(r"<picture\b.*?</picture>", re.IGNORECASE | re.DOTALL)
 ALT_RE = re.compile(r"""\balt\s*=\s*(?:"([^"]*)"|'([^']*)')""", re.IGNORECASE)
@@ -3336,11 +3336,16 @@ IMG_SRC_RE = re.compile(r"""<(?:img|source)\b[^>]*?\b(?:src|srcset)\s*=\s*["']([
 def _readme_images(body: str) -> list[Link]:
     """Every image of a README, nested in links or not: Markdown images, <img> and <source>."""
     images = []
+    masked_lines = []
     for number, line in enumerate(body.split("\n"), 1):
         masked = mask_code_spans(line)
+        masked_lines.append(masked)
         images += [Link("image", m.group(2), number, m.group(1)) for m in MD_IMAGE_RE.finditer(masked)]
-        images += [Link("html-src", m.group(1), number) for m in IMG_SRC_RE.finditer(masked)]
-    return images
+    # an <img> or <source> tag may be wrapped over several lines (alt on one, src on the next)
+    masked_body = "\n".join(masked_lines)
+    for m in IMG_SRC_RE.finditer(masked_body):
+        images.append(Link("html-src", m.group(1), masked_body.count("\n", 0, m.start()) + 1))
+    return sorted(images, key=lambda link: link.line)
 
 
 def cmd_readme(args: argparse.Namespace, report: Report) -> list[str]:
@@ -3374,7 +3379,7 @@ def cmd_readme(args: argparse.Namespace, report: Report) -> list[str]:
     if len(h1) != 1:
         report.add(Finding("readme-h1", "P2", "verified", rel, (sorted(h1)[1:] or [1])[0], f"{len(h1)} level-1 headings; a README has exactly one"))
     images = _readme_images(body)
-    badges = [link for link in images if BADGE_RE.search(link.target)]
+    badges = [link for link in images if BADGE_RE.search(link.target) and not FLATHUB_BUTTON_RE.search(link.target)]
     if len(badges) > MAX_BADGES:
         report.add(
             Finding(
@@ -3956,6 +3961,23 @@ SHELL_ENV_RE = re.compile(r"\$\{?([A-Z][A-Z0-9_]*)")
 COMPOSE_ENV_RE = re.compile(r"^[ \t]*-?[ \t]*([A-Z][A-Z0-9_]*)[ \t]*[=:]", re.MULTILINE)
 DOCKER_ENV_RE = re.compile(r"^[ \t]*(?:ENV|ARG)[ \t]+([A-Z][A-Z0-9_]*)", re.MULTILINE)
 DOTENV_RE = re.compile(r"^[ \t]*(?:export[ \t]+)?([A-Z][A-Z0-9_]*)=", re.MULTILINE)
+# VAR=value before a command, or export VAR=value, anywhere on a shell or recipe line
+SHELL_ASSIGN_RE = re.compile(r"(?:^|[\s;&|(])(?:export[ \t]+)?([A-Z][A-Z0-9_]*)=(?!=)", re.MULTILINE)
+# Config loaders that map every variable under a prefix onto config keys (RUNHOLD_AUTH__MODE ->
+# auth.mode): the code never names the full variable, so it cannot be matched by name.
+# (pattern, separator): the loader joins prefix and key with the separator (viper, envconfig,
+# config-rs), or uses the prefix as written (figment, pydantic-settings, koanf).
+ENV_PREFIX_CALLS = (
+    (re.compile(r"\bSetEnvPrefix\(\s*\"([A-Za-z][A-Za-z0-9_]*)\""), "_"),  # viper
+    (re.compile(r"\benvconfig\.(?:Process|MustProcess)\(\s*\"([A-Za-z][A-Za-z0-9_]*)\""), "_"),  # kelseyhightower/envconfig
+    (re.compile(r"\bEnvironment::with_prefix\(\s*\"([A-Za-z][A-Za-z0-9_]*)\""), "_"),  # config-rs
+    (re.compile(r"\bEnv::prefixed\(\s*\"([A-Za-z][A-Za-z0-9_]*)\""), ""),  # figment
+    (re.compile(r"\benv_prefix\s*[=:]\s*[\"']([A-Za-z][A-Za-z0-9_]*)[\"']"), ""),  # pydantic-settings
+)
+# koanf's env provider: the prefix is the first argument of env.Provider / env.ProviderWithValue,
+# or the Prefix field of env.Opt, as a literal or a constant of the same file
+KOANF_ENV_RE = re.compile(r"\benv\.(?:Provider|ProviderWithValue)\(\s*([^,)]+)|\benv\.Opt\s*\{[^}]*?\bPrefix\s*:\s*([^,}]+)", re.DOTALL)
+KOANF_IMPORT_RE = re.compile(r"koanf(?:/v\d)?/providers/env")
 LANG_OF = {
     ".rs": "rust",
     ".go": "go",
@@ -4173,7 +4195,9 @@ def project_binaries(repo: Repo) -> dict[str, str]:
 def _is_test_path(rel: str) -> bool:
     path = PurePosixPath(rel)
     return bool(
-        set(path.parts[:-1]) & {"test", "tests", "testdata", "__tests__", "spec"} or re.search(r"(^test_|_test\.|\.test\.|\.spec\.)", path.name)
+        set(path.parts[:-1]) & {"test", "tests", "testdata", "__tests__", "spec"}
+        or re.search(r"(^test_|_test\.|\.test\.|\.spec\.)", path.name)
+        or path.name == "tests.rs"  # a Rust #[cfg(test)] module in its own file
     )
 
 
@@ -4326,12 +4350,32 @@ def env_mentions(rel: str, text: str) -> set[str]:
     found: set[str] = set()
     if name.endswith((".sh", ".bash", ".zsh", ".mk")) or name in ("Makefile", "GNUmakefile", "justfile", "Justfile") or rel.startswith(".github/"):
         found.update(SHELL_ENV_RE.findall(text))
+        found.update(SHELL_ASSIGN_RE.findall(re.sub(r"(?m)^[ \t]*#.*$", "", text)))
     if re.match(r"(docker-)?compose.*\.ya?ml$", name) or name.startswith("Dockerfile") or name.endswith(".env") or ".env." in name or name == ".env":
         found.update(SHELL_ENV_RE.findall(text))
         found.update(COMPOSE_ENV_RE.findall(text))
         found.update(DOCKER_ENV_RE.findall(text))
         found.update(DOTENV_RE.findall(text))
     return found
+
+
+def env_prefixes(rel: str, text: str) -> set[str]:
+    """Prefixes a config loader in the file maps onto config keys, each ending in _."""
+    found: set[str] = set()
+    for pattern, separator in ENV_PREFIX_CALLS:
+        for match in pattern.finditer(text):
+            prefix = match.group(1).upper()
+            found.add(prefix.rstrip("_") + "_" if separator else prefix)
+    if KOANF_IMPORT_RE.search(text):
+        for match in KOANF_ENV_RE.finditer(text):
+            argument = (match.group(1) or match.group(2) or "").strip()
+            literal = re.fullmatch(r"\"([A-Za-z][A-Za-z0-9_]*)\"", argument)
+            if literal is None and re.fullmatch(r"[A-Za-z_]\w*", argument):
+                const = re.search(rf"\b{re.escape(argument)}\s*(?::?=|=)\s*\"([A-Za-z][A-Za-z0-9_]*)\"", text)
+                literal = const
+            if literal is not None:
+                found.add(literal.group(1).upper())
+    return {p for p in found if len(p) > 1}
 
 
 def _implicit_env(name: str) -> bool:
@@ -4405,6 +4449,7 @@ def cmd_drift(args: argparse.Namespace, report: Report) -> list[str]:
     flags: dict[str, set[str]] = defaultdict(set)
     readers: dict[str, list[str]] = defaultdict(list)
     mentioned: set[str] = set()
+    prefixes: dict[str, str] = {}
     flatten_unknown: list[str] = []
     rust_structs: set[str] = set()
     constants: dict[str, str] = {}
@@ -4427,6 +4472,8 @@ def cmd_drift(args: argparse.Namespace, report: Report) -> list[str]:
             if not _is_test_path(rel):
                 for name in env_readers(rel, text):
                     readers[name].append(rel)
+                for prefix in env_prefixes(rel, text):
+                    prefixes.setdefault(prefix, rel)
                 for argument in sorted(set(env_dynamic(rel, text))):
                     resolved = resolve_env_argument(repo, rel, argument, declared)
                     if resolved is not None:
@@ -4466,6 +4513,7 @@ def cmd_drift(args: argparse.Namespace, report: Report) -> list[str]:
             "env",
             "partial" if unresolved else "complete",
             f"{len(readers)} variables read through language APIs"
+            + (f"; prefix mappings {', '.join(f'{p}* ({f})' for p, f in sorted(prefixes.items()))}" if prefixes else "")
             + (f"; {len(unresolved)} reads through a name docstool cannot resolve ({', '.join(unresolved[:5])})" if unresolved else ""),
         )
     )
@@ -4525,7 +4573,22 @@ def cmd_drift(args: argparse.Namespace, report: Report) -> list[str]:
                     add,
                 )
     for name, (rel, number) in sorted(documented_env.items()):
-        if name not in readers and name not in mentioned and not _implicit_env(name):
+        if name in readers or name in mentioned or _implicit_env(name):
+            continue
+        mapped = next((p for p in sorted(prefixes, key=len, reverse=True) if name.startswith(p) and len(name) > len(p)), None)
+        if mapped is not None:
+            add(
+                Finding(
+                    "env-unknown",
+                    "P3",
+                    "unverified",
+                    rel,
+                    number,
+                    f"{name} falls under the {mapped} prefix that {prefixes[mapped]} maps onto config keys; docstool cannot check the key",
+                    suggestion="check the key it maps to against the config type the loader fills",
+                )
+            )
+        else:
             add(
                 Finding(
                     "env-unknown",

@@ -191,6 +191,18 @@ owner decision.
 The restructure is done when all of these pass, or when each remaining item is listed in the
 report with the owner's decision.
 
+### After the run
+
+Commit the result: the moved and rewritten pages, the redirects, the site config. The files in
+`docs/internal/restructure/` are not reused: the approval is bound to one base commit and to the
+bytes of every source, so the next commit that touches them makes the plan stale, and no later
+command reads them. Keeping the docs current afterwards needs no saved state (maintain mode,
+`drift --base`). What they still are is the record of what the owner approved and reviewed, so
+ask the owner what to keep (rule 3, G5). By default, commit `report.md`, `plan.toml`,
+`mappings.toml` and `review-receipts.json`; the machine baselines (`blocks.json`, `urls.json`,
+`apply-log.json`) only served the run, and the owner may drop them. Remove nothing without that
+answer.
+
 ## The plan format
 
 `plan.toml` is TOML. `[meta]`:

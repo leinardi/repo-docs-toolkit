@@ -47,7 +47,9 @@ python3 -I <skill-dir>/scripts/docstool.py <command> --root <repo>
 
 1. **Facts come from the repository.** Every command, flag, version, badge, channel and claim
    comes from the code, the manifest, the workflows, `--help` output that is safe to run, or the
-   user. Anything else is `TODO(verify: ...)`, never a guess.
+   user. Anything else is `TODO(verify: ...)`, never a guess. The project's own docs are leads,
+   not evidence: they drift, so confirm every command, key and variable a doc gives in the code
+   before copying it.
 2. **Never invent** a logo, a feature, a support channel, a contact address, a response time or
    a badge for something that does not exist.
 3. **50 to 150 lines, no reference material.** Most READMEs land near 100. Full install matrices, every command, configuration

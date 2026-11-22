@@ -48,7 +48,8 @@ GitHub strips `style` and `class`; layout comes from `align` and image sizes onl
 ```
 
 - **One `<h1>`**: the logo and the project name. No other level-1 heading.
-- **The logo** comes from the repository (`docs/assets/`, `data/icons/`, the app icon). No logo:
+- **The logo** comes from the repository (`docs/assets/`, `data/icons/`, the app icon). A
+  screenshot or design preview that happens to show the logo is not a logo asset. No logo:
   the header is `<h1 align="center"><project></h1>`, and you ask before making one (gate R2).
   Never draw one.
 - **`<picture>` always ends with an `<img>`**: it is what renders where `<source>` is not
@@ -59,13 +60,18 @@ GitHub strips `style` and `class`; layout comes from `align` and image sizes onl
 - Leave out a paragraph that would be empty: no badges, no badge row.
 - **Line length.** In a repository whose markdownlint sets `line_length`, break the header's
   long lines inside the tags: the tagline over two lines inside `<strong>`, the nav links one per
-  line inside `<p align="center">`. HTML collapses the line breaks; the checker reads the
-  wrapped tagline.
+  line inside `<p align="center">`, and a badge whose line is still too long between the
+  attributes of its `<img>` (`alt` on the first line, `src` on the next). A badge URL itself is
+  never broken. HTML collapses the line breaks; the checker reads the wrapped tagline.
 
 ## Sections and emoji
 
 4 to 6 level-2 sections, each with exactly one emoji as its first character, from this fixed
-list so every repository reads the same:
+list so every repository reads the same. When a template asks for more, first leave out a
+section with nothing to say yet (🌍 Translations when the project has no translations, Usage for
+a desktop app opened like any other). Then fold 🤝 Contributing into 📖 Documentation, keeping its
+links (CONTRIBUTING.md, the issue tracker, SECURITY.md) as bullets there. Never drop a line that
+exists nowhere else (gate R4).
 
 | Emoji | Section |
 | --- | --- |
@@ -73,6 +79,7 @@ list so every repository reads the same:
 | 📦 | Installation |
 | 🚀 | Usage, Quick start |
 | 📖 | Documentation |
+| 🔧 | Configuration |
 | 🛠️ | Building from source, Development |
 | 🌍 | Translations |
 | 🤝 | Contributing |
@@ -96,6 +103,9 @@ repository's own section names when it has them; the emoji is a prefix, not a re
   building from source with the repository's own commands; no build commands either: ask, and
   leave the section as a question for the owner rather than guessing a command. With a homepage, the first code block of
   this section is the homepage's first install command, exactly.
+- **Configuration**: only when a first run needs it (a required key, a mode with no default): the
+  smallest working example, every key checked against the type the loader fills, and a link to
+  the full reference in the docs.
 - **Usage**: the shortest real example: two or three commands, or a 10 to 20 line code example
   for a library. Every command and flag comes from the code (repo-docs' facts gate); run it only
   when it is safe and the user agreed.
@@ -134,8 +144,10 @@ the Installation section:
   `#-installation`. An emoji written with a variation selector (🛠️, ❤️) leaves that invisible
   character in the anchor, so never type an anchor by hand: copy the `github:` line of
   `docstool slug "<heading>"`, and prefer linking sections whose emoji has none (📦, 🚀, 📖).
+  🛠️ Building from source is one that has it.
 - The docs URL appears at most three times: the nav line, where usage points to the docs, and the
-  Documentation section. The checker counts every occurrence of it, including deeper URLs that
+  Documentation section. A docs badge that links the site counts too, so with one, link the
+  badge to the docs workflow run instead or keep deep links to the Documentation section. The checker counts every occurrence of it, including deeper URLs that
   start with it, badge links and reference definitions; one `[docs]:` definition used several
   times counts once.
 - Reference-style links (`[docs]: https://...`) at the bottom keep long URLs out of the prose.

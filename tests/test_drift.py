@@ -291,3 +291,65 @@ def test_make_with_no_makefile_anywhere(tmp_path: Path) -> None:
     got = {(f["check"], f["severity"], f["line"]) for f in report["findings"]}
     # a block is a command to run here; inline code is only a lead (it may be another project's)
     assert {("make-missing", "P2", 4), ("make-missing", "P3", 7)} <= got
+
+
+def test_env_set_in_a_recipe_or_read_through_a_prefix_mapping(tmp_path: Path) -> None:
+    repo = make_repo("go-service", tmp_path)
+    (repo / "internal" / "loader").mkdir(parents=True)
+    (repo / "internal" / "loader" / "config.go").write_text(
+        'package config\n\nimport "github.com/knadh/koanf/providers/env"\n\nconst envPrefix = "SVC_"\n\nvar provider = env.Provider(envPrefix, ".", nil)\n',
+        encoding="utf-8",
+    )
+    (repo / "run.mk").write_text("run:\n\tSVC_LOG__LEVEL=debug ./svc\n", encoding="utf-8")
+    usage = repo / "docs" / "usage.md"
+    lines = usage.read_text(encoding="utf-8").splitlines()
+    lines += ["", "Set the environment variable `SVC_LOG__LEVEL=info` or `SVC_AUTH__MODE=none`, never `OTHER_FLAG=1`."]
+    usage.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "config loader")
+    _, report = docstool_json(repo, "drift")
+    unknown = {f["message"].split(" ", 1)[0]: (f["severity"], f["confidence"]) for f in report["findings"] if f["check"] == "env-unknown"}
+    # set by a recipe: a known variable; under the loader's prefix: unverified, not "likely" wrong
+    assert "SVC_LOG__LEVEL" not in unknown
+    assert unknown["SVC_AUTH__MODE"] == ("P3", "unverified")
+    assert unknown["OTHER_FLAG"] == ("P2", "likely")
+    env_row = next(r for r in report["coverage"] if r["input"] == "env")
+    assert "SVC_* (internal/loader/config.go)" in env_row["reason"]
+
+
+@pytest.mark.parametrize(
+    ("source", "name", "line", "prefix"),
+    [
+        ("internal/a/conf.go", "conf.go", 'viper.SetEnvPrefix("svc")', "SVC_"),
+        ("internal/a/conf.go", "conf.go", 'envconfig.Process("svc", &cfg)', "SVC_"),
+        ("internal/a/conf.go", "conf.go", 'k.Load(env.Provider("SVC_", ".", nil), nil) // koanf/providers/env', "SVC_"),
+        ("src/conf.rs", "conf.rs", 'Environment::with_prefix("SVC")', "SVC_"),
+        ("src/conf.rs", "conf.rs", 'Env::prefixed("SVC_")', "SVC_"),
+        ("app/conf.py", "conf.py", 'model_config = SettingsConfigDict(env_prefix="SVC_")', "SVC_"),
+    ],
+)
+def test_each_prefix_loader(tmp_path: Path, source: str, name: str, line: str, prefix: str) -> None:
+    repo = make_repo("go-service", tmp_path)
+    path = repo / source
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(line + "\n", encoding="utf-8")
+    usage = repo / "docs" / "usage.md"
+    usage.write_text(usage.read_text(encoding="utf-8") + "\nSet the environment variable `SVC_AUTH__MODE=none`.\n", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "loader")
+    _, report = docstool_json(repo, "drift")
+    unknown = {f["message"].split(" ", 1)[0]: f["severity"] for f in report["findings"] if f["check"] == "env-unknown"}
+    assert unknown["SVC_AUTH__MODE"] == "P3"
+    env_row = next(r for r in report["coverage"] if r["input"] == "env")
+    assert f"{prefix}* ({source})" in env_row["reason"]
+
+
+def test_a_commented_assignment_does_not_make_a_variable_known(tmp_path: Path) -> None:
+    repo = make_repo("go-service", tmp_path)
+    (repo / "run.mk").write_text("# OLD_VAR=1 was removed\nrun:\n\t./svc\n", encoding="utf-8")
+    usage = repo / "docs" / "usage.md"
+    usage.write_text(usage.read_text(encoding="utf-8") + "\nSet the environment variable `OLD_VAR=1`.\n", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "comment")
+    _, report = docstool_json(repo, "drift")
+    assert any(f["check"] == "env-unknown" and f["message"].startswith("OLD_VAR ") and f["severity"] == "P2" for f in report["findings"])
