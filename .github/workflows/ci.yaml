@@ -1,6 +1,6 @@
 name: CI
 
-# The authoritative checks (pre-commit-all, test, plugin-validate) run on every pull request, every
+# The authoritative checks (pre-commit-all, test, zensical, plugin-validate) run on every pull request, every
 # push to main, every dispatch and every weekly scheduled run. The reviewdog jobs only annotate pull
 # requests. ci-result is the one job that stands for all of them.
 on:
@@ -103,6 +103,34 @@ jobs:
       # PYTHON= on the command line makes .mk/test.mk use this interpreter instead of uv.
       - name: Run the unit tests
         run: make test PYTHON=python
+
+  # The docstool tests that run the real generator (pytest -m zensical), against the Zensical version
+  # the skills are tested with, installed from the hash-pinned lock. DOCSTOOL_REQUIRE_ZENSICAL turns
+  # a missing zensical into a failure instead of a skip.
+  zensical:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.11"
+
+      - name: Install Zensical from the lock and the test dependencies
+        run: |
+          python -m pip install --disable-pip-version-check --require-hashes -r zensical-requirements.txt
+          python -m pip install --disable-pip-version-check -r requirements-dev.txt
+
+      - name: Run the Zensical tests
+        env:
+          DOCSTOOL_REQUIRE_ZENSICAL: "1"
+        run: python -m pytest -m zensical
 
   # Claude Code's own manifest and skill checks. The validator needs no login (it ran with an empty
   # HOME in the P0 spike). The CLI is pinned to the release the manifests were last checked with;
@@ -368,6 +396,7 @@ jobs:
     needs:
       - pre-commit-all
       - test
+      - zensical
       - plugin-validate
       - conventional-commits
     runs-on: ubuntu-latest
