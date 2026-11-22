@@ -39,7 +39,8 @@ breaks a reference.
    analyse is reported as incomplete coverage (exit 3), never as clean.
 3. **The copies of docstool.py never drift.** Edit `skills/repo-docs/scripts/docstool.py`, then run
    `make sync-vendored`. The `check-vendored` hook and `tests/test_vendored.py` fail on any
-   difference.
+   difference. The same holds for `docs/stylesheets/home.css`, the site's copy of the shipped
+   `skills/zensical-site/assets/stylesheets/home.css`.
 4. **Shipped text stays agent-shaped.** `SKILL.md` frontmatter has only `name` and `description`;
    the description says what the skill does *and* when to use it, under 1024 characters. `SKILL.md`
    bodies stay short and route to references; references open with "Read this when", carry a
@@ -57,7 +58,8 @@ breaks a reference.
 | `skills/repo-docs/scripts/docstool.py` | The canonical checker; copied into the other skills. |
 | `scripts/sync-vendored.py` | Writes (`make sync-vendored`) and checks (`--check`) the copies. |
 | `tests/` | pytest suite: docstool, the vendored copies, the skill lint, the release bump. |
-| `.mk/test.mk` | Local make targets (`test`, `sync-vendored`, `check-vendored`, `validate-plugin`). |
+| `zensical.toml`, `docs/` | The plugin's own site, built from the zensical-site skill's template and landing page; `docs/internal/` is not published. |
+| `.mk/test.mk` | Local make targets (`test`, `docs-build`, `sync-vendored`, `check-vendored`, `validate-plugin`). |
 | `.mk/release.mk`, `scripts/release_bump.py` | `make release-bump VERSION=X.Y.Z`: writes the version into `.claude-plugin/plugin.json` for the Release workflow. |
 | `.mk/help.mk`, `.mk/pre-commit.mk`, `scripts/bootstrap-mk-common.sh` | Fetched from `leinardi/make-common`; change them upstream. |
 
@@ -69,6 +71,7 @@ make pre-commit-install
 make check            # pre-commit on every file
 make test             # the unit tests
 make sync-vendored    # copy the canonical docstool.py into the other skills
+make docs-build       # the plugin's own site, built strict and checked with docstool
 make validate-plugin  # claude plugin validate . --strict
 ```
 
@@ -84,6 +87,7 @@ Run before considering an edit done. `make check` applies to every row.
 | `.claude-plugin/**`, `skills/*/SKILL.md` frontmatter | `make validate-plugin`, `make test` |
 | `tests/**`, `scripts/**`, `.mk/**` | `make test`; for the bump, `make release-bump VERSION=<higher>` shows a one-line diff (then restore the file) |
 | `.github/workflows/**`, `.github/dependabot.yml` | `pre-commit run actionlint --all-files`; reason through each trigger the workflow has |
+| `docs/**`, `zensical.toml`, `README.md` | `make docs-build` (needs `zensical-requirements.txt`); `make test` for `docs/reference/docstool.md`, which must cover every docstool option |
 | `**/*.md` | `make check` (markdownlint, lychee); prose wrapped at 100 columns outside `skills/` |
 
 ## Commits

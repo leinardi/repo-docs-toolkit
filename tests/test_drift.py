@@ -217,6 +217,24 @@ def test_env_reads_docstool_cannot_resolve_make_env_partial(tmp_path: Path, name
     assert {r["input"]: r["state"] for r in report["coverage"]}["env"] == "partial"
 
 
+def test_a_test_fixture_manifest_is_not_a_project_binary(tmp_path: Path) -> None:
+    repo = make_repo("clean", tmp_path)
+    fixture = repo / "tests" / "fixtures" / "demo"
+    (fixture / "src").mkdir(parents=True)
+    (fixture / "Cargo.toml").write_text('[package]\nname = "demo"\nversion = "0.1.0"\n', encoding="utf-8")
+    (fixture / "src" / "main.rs").write_text("fn main() {}\n", encoding="utf-8")
+    code, report = docstool_json(repo, "drift")
+    assert code == 0, report["coverage"]
+    assert {r["input"]: r["state"] for r in report["coverage"]}["flags"] != "partial"
+    # the same manifest at the root is the project's binary, and a binary with no flags found is partial
+    for rel in ("Cargo.toml", "src/main.rs"):
+        (repo / rel).parent.mkdir(parents=True, exist_ok=True)
+        (repo / rel).write_bytes((fixture / rel).read_bytes())
+    code, report = docstool_json(repo, "drift")
+    assert code == 3
+    assert {r["input"]: r["state"] for r in report["coverage"]}["flags"] == "partial"
+
+
 def test_a_constant_in_another_file_does_not_resolve_a_parameter(tmp_path: Path) -> None:
     repo = make_repo("clean", tmp_path)
     (repo / "other.py").write_text('key = "HOME"\n', encoding="utf-8")
