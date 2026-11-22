@@ -161,6 +161,11 @@ def test_no_symlinks_in_a_skill(skill: Path) -> None:
 @pytest.mark.parametrize("skill", SKILLS, ids=lambda p: p.name)
 def test_relative_links_resolve(skill: Path) -> None:
     for md in skill.rglob("*.md"):
+        # Assets are copied into other repositories (templates, example READMEs), so their links
+        # point at files of that repository; the landing examples' links are checked by their
+        # strict builds in test_landing_build.
+        if "assets" in md.relative_to(skill).parts:
+            continue
         # A link inside a fenced block is an example for the reader to adapt, not a link.
         for target in LINK_RE.findall(FENCE_RE.sub("", md.read_text(encoding="utf-8"))):
             if "://" in target or target.startswith("mailto:"):

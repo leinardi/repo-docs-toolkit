@@ -3234,33 +3234,58 @@ def readme_facts(doc: MarkdownDoc, text: str) -> dict[str, Any]:
 
 
 def home_facts(doc: MarkdownDoc) -> dict[str, Any]:
-    """Tagline, feature card titles and first install block of a homepage built on home.html."""
+    """Tagline, feature card titles and first install block of a homepage built on home.html.
+
+    A card is a bullet at the grid's own indentation; nested bullets belong to a card's body. Its
+    title is the bold text on the bullet line (`- **Title**`) or, after an icon on the bullet
+    line, the item's first line when that line is all bold (`    **Title**`). untitled_cards counts
+    the cards with neither, so a caller can refuse to compare a partial list."""
     home = doc.front_matter.get("home") if isinstance(doc.front_matter, dict) else None
     tagline = _strip_inline(str(home["tagline"])) if isinstance(home, dict) and home.get("tagline") else None
     features: list[str] = []
     install = None
+    untitled = 0
     region: str | None = None
     depth = 0
     start = 0
+    card_indent: int | None = None
+    awaiting_title = False
     for number, line in enumerate(doc.lines, 1):
         opening = re.search(r'<div\b[^>]*class="([^"]*)"', line)
         if region is None and opening:
             classes = opening.group(1).split()
             if "cards" in classes:
-                region, depth, start = "cards", 0, number
+                region, depth, start, card_indent = "cards", 0, number, None
             elif "rdt-install" in classes:
                 region, depth, start = "install", 0, number
         if region is not None:
             depth += len(re.findall(r"<div\b", line)) - len(re.findall(r"</div>", line))
             if region == "cards":
-                match = CARD_TITLE_RE.match(line)
-                if match:
-                    features.append(_strip_inline(match.group(1)).rstrip(":"))
+                bullet = re.match(r"^([ \t]*)[-*+][ \t]+", line)
+                indent = len(bullet.group(1).expandtabs(4)) if bullet else -1
+                if bullet and (card_indent is None or indent == card_indent):
+                    card_indent = indent
+                    if awaiting_title:
+                        untitled += 1
+                    match = CARD_TITLE_RE.match(line)
+                    if match:
+                        features.append(_strip_inline(match.group(1)).rstrip(":"))
+                    awaiting_title = match is None
+                elif awaiting_title and line.strip():
+                    bold = re.match(r"^[ \t]+(?:\*\*|__)(.+?)(?:\*\*|__)[ \t]*$", line)
+                    if bold:
+                        features.append(_strip_inline(bold.group(1)).rstrip(":"))
+                    else:
+                        untitled += 1
+                    awaiting_title = False
             if depth <= 0 and number >= start:
+                if region == "cards" and awaiting_title:
+                    untitled += 1
+                    awaiting_title = False
                 if region == "install" and install is None:
                     install = next((b.text.strip() for b in doc.blocks if b.type == "code" and start < b.line < number), None)
                 region = None
-    return {"tagline": tagline, "features": features, "install": install}
+    return {"tagline": tagline, "features": features, "install": install, "untitled_cards": untitled}
 
 
 def _published_package(repo: Repo) -> str | None:
@@ -3406,6 +3431,19 @@ def cmd_readme(args: argparse.Namespace, report: Report) -> list[str]:
                     f"the docs URL appears {count} times; link it once in the header and once where it helps",
                 )
             )
+    for number, line in enumerate(body.split("\n"), 1):
+        if "TODO(verify" in line:
+            report.add(
+                Finding(
+                    "readme-todo",
+                    "P2",
+                    "verified",
+                    rel,
+                    number,
+                    "an unverified TODO(verify) is still in the README",
+                    suggestion="settle it with the owner, or leave the claim out",
+                )
+            )
     alerts = [n for n, line in enumerate(lines, 1) if ALERT_RE.match(line)]
     if len(alerts) > 2:
         report.add(Finding("readme-alerts", "P3", "verified", rel, alerts[2], f"{len(alerts)} alerts; keep at most two so they still stand out"))
@@ -3439,6 +3477,12 @@ def cmd_readme(args: argparse.Namespace, report: Report) -> list[str]:
             report.coverage.append(CoverageRow("home", "failed", f"{home_rel}: {home_status}"))
             return [*required, "home"]
         home = home_facts(parse_markdown(home_rel, home_text, None, True))
+        untitled = home.pop("untitled_cards")
+        if untitled:
+            # comparing the README with a shorter feature list than the homepage has would look clean
+            report.coverage.append(CoverageRow("home", "partial", f"{home_rel}: {untitled} feature cards with no recognised title"))
+            report.data["home"] = home
+            return [*required, "home"]
         report.coverage.append(CoverageRow("home", "complete", home_rel))
         report.data["home"] = home
         required.append("home")
@@ -4601,6 +4645,19 @@ def _check_command(
         if model is None:
             if targets and origin == "block":
                 add(Finding("make-missing", "P2", "likely", rel, number, f"make {' '.join(targets)}: no Makefile at {directory}"))
+            elif targets and not models:
+                # inline code can name another project's make; with no Makefile anywhere it is a lead
+                add(
+                    Finding(
+                        "make-missing",
+                        "P3",
+                        "unverified",
+                        rel,
+                        number,
+                        f"make {' '.join(targets)}: the repository has no Makefile",
+                        suggestion="if it is another project's command, ignore this lead",
+                    )
+                )
             return
         for target in targets:
             if target not in model.targets:

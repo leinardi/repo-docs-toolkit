@@ -260,3 +260,16 @@ def test_artifact_paths_are_relative_to_root(tmp_path: Path) -> None:
     assert (repo / "docs/internal/restructure/blocks.json").is_file()
     assert (repo / "docs/internal/restructure/urls.json").is_file()
     assert not any(elsewhere.iterdir())
+
+
+def test_make_with_no_makefile_anywhere(tmp_path: Path) -> None:
+    repo = tmp_path / "nomake"
+    repo.mkdir()
+    (repo / "README.md").write_text("# X\n\n```sh\nmake release\n```\n\nThen run `make docs`.\n", encoding="utf-8")
+    git(repo, "init", "-q", "-b", "main")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "x")
+    _, report = docstool_json(repo, "drift")
+    got = {(f["check"], f["severity"], f["line"]) for f in report["findings"]}
+    # a block is a command to run here; inline code is only a lead (it may be another project's)
+    assert {("make-missing", "P2", 4), ("make-missing", "P3", 7)} <= got
