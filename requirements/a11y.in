@@ -1,0 +1,5 @@
+# The landing page accessibility tests (tests/a11y, make test-a11y, the CI a11y job): Playwright for
+# Python. Dev-only; the skills and docstool never need it. Lock with:
+#   uv pip compile --universal --generate-hashes --python-version 3.11 requirements/a11y.in -o requirements/a11y.txt
+# then download the browser with: python -m playwright install chromium
+playwright==1.65.2

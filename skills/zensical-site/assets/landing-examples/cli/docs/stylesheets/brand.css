@@ -1,0 +1,19 @@
+/* Brand colour for this example. Checked with: docstool contrast #c2410c --slate #fb923c */
+
+:root > * {
+  --md-primary-fg-color: #c2410c;
+  --md-primary-fg-color--light: #c2410c;
+  --md-primary-fg-color--dark: #c2410c;
+  --md-accent-fg-color: #c2410c;
+  --md-typeset-a-color: #c2410c;
+}
+
+[data-md-color-scheme="slate"] {
+  --md-primary-fg-color: #fb923c;
+  --md-primary-fg-color--light: #fb923c;
+  --md-primary-fg-color--dark: #fb923c;
+  --md-primary-bg-color: #0b0c0f;
+  --md-accent-fg-color: #fb923c;
+  --md-accent-bg-color: #0b0c0f;
+  --md-typeset-a-color: #fb923c;
+}

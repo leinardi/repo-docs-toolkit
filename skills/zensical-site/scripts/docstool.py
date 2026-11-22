@@ -224,6 +224,10 @@ def render_text(report: Report, incomplete: list[str], limit: int) -> str:
     counts = Counter(f.severity for f in report.findings)
     summary = ", ".join(f"{s}: {counts[s]}" for s in SEVERITIES if counts[s]) or "none"
     state = "PARTIAL: " + ", ".join(incomplete) + " incomplete" if incomplete else "coverage complete"
+    # rows this command does not require can still be partial; say so in the summary line too
+    others = [r.input for r in report.coverage if not r.complete and r.input not in incomplete]
+    if others:
+        state += "; not required but partial: " + ", ".join(others)
     out = [f"docstool {report.command}: {len(report.findings)} findings ({summary}); {state}", "", "Coverage:"]
     width = max((len(r.input) for r in report.coverage), default=8)
     out += [f"  {r.input:<{width}}  {r.state:<14}  {r.reason}".rstrip() for r in report.coverage]
@@ -1080,7 +1084,7 @@ def _strip_comment(text: str) -> str:
 
 
 KEY_RE = re.compile(
-    r"""^(?P<key>"(?:[^"\\]|\\.)*"|'(?:[^']|'')*'|[^\s"'#\-?:,\[\]{}&*!|>%@`][^:#]*?|-[^\s:][^:#]*?)[ \t]*:(?:[ \t]+(?P<rest>.*)|$)"""
+    r"""^(?P<key>"(?:[^"\\]|\\.)*"|'(?:[^']|'')*'|[^\s"'#\-?:,\[\]{}&*!|>%@`](?:[^:#]|(?<=\S)\#)*?|-[^\s:](?:[^:#]|(?<=\S)\#)*?)[ \t]*:(?:[ \t]+(?P<rest>.*)|$)"""
 )
 
 
@@ -1410,6 +1414,8 @@ class GitignoreSpec:
 
 # Zensical's built-in plugins (0.1.3); anything else in a config is silently ignored by it.
 KNOWN_ZENSICAL = "0.1.3"
+# The anchor styles docstool emulates (slug --style; a site's toc.slugify maps to one of them).
+SLUG_STYLES = ("pymdownx-lower", "pymdownx-none", "python-markdown", "python-markdown-unicode")
 DEFAULT_EXCLUDES = GitignoreSpec(".*\n/templates/\n")
 # The extensions Zensical enables when markdown_extensions is absent (zensical/config.py,
 # DEFAULT_MARKDOWN_EXTENSIONS); setting the key replaces the whole list.
@@ -1568,8 +1574,11 @@ def _flatten_nav(value: Any, path: list[str], out: list[NavEntry], problems: lis
         problems.append(f"unsupported nav item {value!r}")
 
 
-def load_site(repo: Repo, report: Report) -> Site:
-    """Read the site config and add the config, nav, exclude_docs, redirects and slug-style rows."""
+def load_site(repo: Repo, report: Report, prefer_mkdocs: bool = False) -> Site:
+    """Read the site config and add the config, nav, exclude_docs, redirects and slug-style rows.
+
+    Zensical reads zensical.toml when both configs exist; prefer_mkdocs reads mkdocs.yml instead,
+    for a build with MkDocs (site-build --generator mkdocs)."""
     site = Site()
     if repo.symlinks:
         outside = sorted(name for name, target in repo.symlinks.items() if target is None)
@@ -1586,8 +1595,10 @@ def load_site(repo: Repo, report: Report) -> Site:
         for name in rows:
             report.coverage.append(CoverageRow(name, "not_applicable", "no zensical.toml or mkdocs.yml"))
         return site
-    chosen = toml_path if repo.exists(toml_path) else yaml_path
+    chosen = toml_path if repo.exists(toml_path) and not (prefer_mkdocs and repo.exists(yaml_path)) else yaml_path
     note = f" (zensical.toml is used; {yaml_path} is ignored by Zensical)" if chosen == toml_path and repo.exists(yaml_path) else ""
+    if chosen == yaml_path and repo.exists(toml_path):
+        note = f" (read for MkDocs; Zensical would read {toml_path})"
     site.config = chosen
     text, status = repo.text(chosen)
     data: Any = None
@@ -2785,7 +2796,7 @@ def cmd_check(args: argparse.Namespace, report: Report) -> list[str]:
             if built.get("dependencies") == "complete":
                 report.coverage.append(CoverageRow("url_baseline", "complete", f"built by {built.get('generator')} {built.get('generator_version')}"))
             else:
-                report.coverage.append(_url_baseline_row(baseline, built))
+                report.coverage.append(_url_baseline_row(baseline, {"dependencies": "complete"}))
         else:
             baseline = {"kind": "source", **source_url_baseline(corpus)}
             report.coverage.append(CoverageRow("url_baseline", "partial", "source-derived (no --built): preservation partially verified"))
@@ -3000,16 +3011,26 @@ def render_inventory_text(report: Report) -> str:
 
 
 def cmd_slug(args: argparse.Namespace, report: Report) -> list[str]:
+    unknown = False
+    if args.style is None:
+        # The site's own slugify (from --root), or the toolkit template's when there is no site.
+        site = load_site(Repo(Path(args.root)), report)
+        if site.config is None:
+            args.style = "pymdownx-lower"
+        elif site.slug_style in SLUG_STYLES:
+            args.style = site.slug_style
+        else:
+            # a slugify docstool cannot emulate: no site anchor, and the run is incomplete
+            unknown = True
     github = GithubSlugger()
     used: set[str] = set()
     rows = []
     for text in args.text:
         plain = heading_plain_text(text)
-        rows.append(
-            {"text": text, "github": github.slug(plain), "site": unique_site_id(site_slug_base(plain, args.style), used), "style": args.style}
-        )
+        site_id = None if unknown else unique_site_id(site_slug_base(plain, str(args.style)), used)
+        rows.append({"text": text, "github": github.slug(plain), "site": site_id, "style": "unknown" if unknown else args.style})
     report.data["slugs"] = rows
-    return []
+    return ["slug_style"] if unknown else []
 
 
 # ---------------------------------------------------------------------------------------------
@@ -3500,6 +3521,10 @@ NATIVE_PLUGINS = frozenset({"section-index"})
 NOOP_FEATURES = frozenset({"search.suggest", "search.share"})
 INCOMPATIBLE_FEATURES = (("navigation.indexes", "toc.integrate"), ("navigation.prune", "navigation.expand"))
 SEARCH_OPTIONS = frozenset({"enabled", "separator"})
+# The [project.validation] checks Zensical 0.1.3 marks deprecated in their current form.
+DEPRECATED_VALIDATION = frozenset(
+    {"unresolved_references", "unresolved_footnotes", "unused_definitions", "unused_footnotes", "shadowed_definitions", "shadowed_footnotes"}
+)
 FEATURE_SYNTAX = (
     ("admonition", re.compile(r"^[ \t]*!!!\s", re.MULTILINE), "!!! admonitions"),
     ("pymdownx.details", re.compile(r"^[ \t]*\?\?\?\+?\s", re.MULTILINE), "??? collapsible blocks"),
@@ -3530,6 +3555,20 @@ def _lock_pins(repo: Repo) -> dict[str, str]:
         if uv:
             pins[rel] = uv.group(1)
     return pins
+
+
+def _zensical_requirement(repo: Repo) -> tuple[str, int, str] | None:
+    """The first committed requirement line that names zensical: (path, line, the requirement)."""
+    for rel in repo.files:
+        name = PurePosixPath(rel).name
+        if not (name.endswith((".in", ".txt")) and "requirements" in name) and name != "pyproject.toml":
+            continue
+        text, _ = repo.text(rel)
+        for number, line in enumerate((text or "").split("\n"), 1):
+            match = re.match(r"""^\s*["']?(zensical(?![\w-])[^"'#,]*)""", line)
+            if match:
+                return rel, number, match.group(1).strip()
+    return None
 
 
 def installed_zensical() -> str | None:
@@ -3588,7 +3627,13 @@ def cmd_site_audit(args: argparse.Namespace, report: Report) -> list[str]:
             add("feature-noop", "P2", f"feature {feature} does nothing in Zensical {KNOWN_ZENSICAL}", feature, "remove it")
     for first, second in INCOMPATIBLE_FEATURES:
         if first in features and second in features:
-            add("feature-conflict", "P2", f"features {first} and {second} do not work together", second)
+            add(
+                "feature-conflict",
+                "P2",
+                f"features {first} and {second} do not work together",
+                second,
+                "keep the one the site is built around and remove the other; ask the owner which",
+            )
     if site.slug_style not in GITHUB_STYLES:
         add(
             "slugify",
@@ -3618,7 +3663,13 @@ def cmd_site_audit(args: argparse.Namespace, report: Report) -> list[str]:
     for key_path, value in walk_values(raw):
         if isinstance(value, Tagged):
             if value.tag.startswith("!ENV"):
-                add("yaml-env", "P2", f"{key_path}: !ENV is read by MkDocs only", key_path.rsplit(".", 1)[-1])
+                add(
+                    "yaml-env",
+                    "P2",
+                    f"{key_path}: !ENV is read by MkDocs only",
+                    key_path.rsplit(".", 1)[-1],
+                    "write the value as a literal (or have CI write it before the build), then check the built page uses it",
+                )
             elif value.tag.startswith("!!python/name:material"):
                 add(
                     "yaml-python-name",
@@ -3644,8 +3695,40 @@ def cmd_site_audit(args: argparse.Namespace, report: Report) -> list[str]:
     validation = raw.get("validation")
     if validation is False or (isinstance(validation, dict) and validation and not any(validation.values())):
         add("validation", "P2", "link validation is turned off", "validation")
+    if isinstance(validation, dict):
+        for option in sorted(k for k, v in validation.items() if k in DEPRECATED_VALIDATION and v):
+            add(
+                "validation-deprecated",
+                "P3",
+                f"validation.{option} is deprecated in its current form (Zensical {KNOWN_ZENSICAL})",
+                option,
+                "keep only invalid_links and invalid_link_anchors",
+            )
+    has_internal = any(site.in_docs(r) and site.docs_rel(r).startswith("internal/") for r in repo.files)
+    if not has_internal and site.published(PurePosixPath(site.docs_dir, "internal", "README.md").as_posix()):
+        add(
+            "exclude-internal",
+            "P3",
+            "exclude_docs does not exclude internal/: a maintainer page added to docs/internal/ later would be published",
+            "exclude_docs",
+            'set exclude_docs = "internal/"',
+        )
     pins = _lock_pins(repo)
-    if not pins:
+    requirement = None if pins else _zensical_requirement(repo)
+    if requirement:
+        path, number, spec = requirement
+        report.add(
+            Finding(
+                "lock",
+                "P2",
+                "verified",
+                path,
+                number,
+                f"zensical is required as '{spec}' but no committed hash-pinned lock pins it",
+                suggestion=f"pin zensical=={KNOWN_ZENSICAL} there, compile a --generate-hashes lock and commit it (an ignored lock pins nothing)",
+            )
+        )
+    elif not pins:
         add("lock", "P2", "no hash-pinned lock pins zensical", suggestion="add zensical-requirements.in and a pip-compile --generate-hashes lock")
     for path, version in pins.items():
         if version != KNOWN_ZENSICAL:
@@ -5013,10 +5096,14 @@ def cmd_site_build(args: argparse.Namespace, report: Report) -> list[str]:
         else:
             _copy_worktree(repo, source)
         built_repo = Repo(source)
-        site = load_site(built_repo, report)
+        site = load_site(built_repo, report, prefer_mkdocs=args.generator == "mkdocs")
         if site.config is None or not {r.input: r for r in report.coverage}["config"].complete:
             raise UsageError("no readable zensical.toml or mkdocs.yml to build")
         generator = args.generator or ("zensical" if site.kind == "zensical" else "mkdocs")
+        if repo.is_git and any("git-" in name for name in site.plugins):
+            # git-revision-date-localized and similar plugins read the history: lend it to the staged
+            # tree (read-only; the clone's own .git lives in the staging directory)
+            _lend_history(repo, source, commit or (git(repo.root, "rev-parse", "--verify", "--quiet", "HEAD") or "").strip())
         command = shlex.split(args.generator_cmd) if args.generator_cmd else [shutil.which(generator) or ""]
         if not command[0]:
             raise UsageError(f"{generator} is not installed: {GENERATOR_HINTS[generator]}")
@@ -5028,14 +5115,19 @@ def cmd_site_build(args: argparse.Namespace, report: Report) -> list[str]:
         if result.returncode != 0:
             lines = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", result.stdout + result.stderr).strip().split("\n")
             # the generator's own diagnostics first: a traceback's tail alone hides the cause
-            diagnostics = [line for line in lines if re.search(r"\b(?:error|warning|does not exist|not found|failed)\b", line, re.IGNORECASE)]
+            diagnostics = [
+                line
+                for line in lines
+                if re.search(r"\b(?:error|warning|does not exist|not found|failed)\b", line, re.IGNORECASE) or re.search(r"[\w./-]+\.md:\d+", line)
+            ]
             shown = list(dict.fromkeys([*diagnostics[:15], *lines[-10:]]))
             raise UsageError(f"{generator} build --strict failed (exit {result.returncode}); no stamp written:\n" + "\n".join(shown))
         site_dir = str(site.raw.get("site_dir", "site"))
         built = source / site_dir
         if not built.is_dir():
             raise UsageError(f"{generator} build wrote no {site_dir}/ directory")
-        inputs, partial = build_inputs(Repo(source), site) if args.ref else build_inputs(repo, _reload_site(repo))
+        # built_repo was listed before the history was lent, so --ref inputs are the archive's files
+        inputs, partial = build_inputs(built_repo, site) if args.ref else build_inputs(repo, _reload_site(repo, args.generator == "mkdocs"))
         out.mkdir(parents=True, exist_ok=True)
         shutil.copytree(built, out, dirs_exist_ok=True, symlinks=True)
     stamp = {
@@ -5057,8 +5149,31 @@ def cmd_site_build(args: argparse.Namespace, report: Report) -> list[str]:
     return []
 
 
-def _reload_site(repo: Repo) -> Site:
-    return load_site(repo, Report(command="site-build", root=str(repo.root)))
+def _reload_site(repo: Repo, prefer_mkdocs: bool = False) -> Site:
+    return load_site(repo, Report(command="site-build", root=str(repo.root)), prefer_mkdocs)
+
+
+def _lend_history(repo: Repo, source: Path, commit: str) -> None:
+    """Make the staged tree a git repository at commit, borrowing the objects of the real one.
+
+    The staged .git lists the repository's object directory as an alternate, so nothing is copied
+    and nothing in the repository is written; only git plumbing that writes inside source runs."""
+    if not commit:
+        return
+    common = git(repo.root, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    if not common:
+        raise UsageError("cannot locate the repository's git directory for the build's history")
+    git_dir = source / ".git"
+    # No inherited GIT_DIR or GIT_WORK_TREE can point these at the real repository, no template
+    # or hook from the user's configuration runs, and nothing outside source is written.
+    environment = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    for command in (["init", "--quiet", "--template=", str(source)], ["--git-dir", str(git_dir), "update-ref", "--no-deref", "HEAD", commit]):
+        if command[0] == "--git-dir":
+            alternates = git_dir / "objects" / "info" / "alternates"
+            alternates.write_text(str(Path(common.strip()) / "objects") + "\n", encoding="utf-8")
+        run = subprocess.run(["git", "-c", "core.hooksPath=/dev/null", *command], capture_output=True, text=True, check=False, env=environment)
+        if run.returncode != 0:
+            raise UsageError(f"git {command[0]} for the build's history failed: {run.stderr.strip()}")
 
 
 def load_built(path: str, repo: Repo, site: Site) -> dict[str, Any]:
@@ -5075,7 +5190,8 @@ def load_built(path: str, repo: Repo, site: Site) -> dict[str, Any]:
         if (current or "").strip() != stamp.get("commit"):
             raise UsageError(f"{path} was built from {stamp['ref']} at {stamp.get('commit')}, which now names another commit")
     else:
-        inputs, _ = build_inputs(repo, site)
+        # a MkDocs build read mkdocs.yml even where Zensical would read zensical.toml
+        inputs, _ = build_inputs(repo, _reload_site(repo, prefer_mkdocs=True) if stamp.get("generator") == "mkdocs" else site)
         if inputs != stamp.get("inputs"):
             changed = sorted(k for k in set(inputs) | set(stamp.get("inputs", {})) if inputs.get(k) != stamp.get("inputs", {}).get(k))
             raise UsageError(f"{path} is stale: {len(changed)} build inputs changed since it was built ({', '.join(changed[:5])})")
@@ -6590,9 +6706,9 @@ def build_parser() -> argparse.ArgumentParser:
     _common(slug)
     slug.add_argument(
         "--style",
-        default="pymdownx-lower",
-        choices=("pymdownx-lower", "pymdownx-none", "python-markdown", "python-markdown-unicode"),
-        help="the site's slugify",
+        default=None,
+        choices=SLUG_STYLES,
+        help="the site's slugify (default: read from the --root site config)",
     )
     slug.add_argument("text", nargs="+", help="heading texts, in document order")
     return parser
@@ -6640,7 +6756,12 @@ def main(argv: list[str] | None = None) -> int:
         if args.format == "json":
             output = render_json(report, incomplete)
         elif args.command == "slug":
-            output = "".join(f"{r['text']}\n  github: #{r['github']}\n  site ({r['style']}): #{r['site']}\n" for r in report.data["slugs"])
+            output = "".join(
+                f"{r['text']}\n  github: #{r['github']}\n  site ({r['style']}): "
+                + (f"#{r['site']}" if r["site"] is not None else "not computed: pass --style")
+                + "\n"
+                for r in report.data["slugs"]
+            )
         else:
             extra = TEXT_RENDERERS[args.command](report) if args.command in TEXT_RENDERERS else ""
             output = extra + render_text(report, incomplete, args.max)

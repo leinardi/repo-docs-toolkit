@@ -33,8 +33,10 @@ breaks a reference.
 2. **docstool is fail-closed and side-effect free.** It uses only the standard library and Python
    3.11 or newer. It never executes project code (the one exception is `site-build`, which runs
    the site generator after the user agreed), never sends repository content over the network,
-   runs only read-only git commands, and writes only the paths its command documents. An input it
-   cannot analyse is reported as incomplete coverage (exit 3), never as clean.
+   runs only read-only git commands against the repository (`site-build` may create a git
+   repository inside its own temporary staging directory, borrowing the objects, for plugins
+   that read history), and writes only the paths its command documents. An input it cannot
+   analyse is reported as incomplete coverage (exit 3), never as clean.
 3. **The copies of docstool.py never drift.** Edit `skills/repo-docs/scripts/docstool.py`, then run
    `make sync-vendored`. The `check-vendored` hook and `tests/test_vendored.py` fail on any
    difference.
@@ -78,6 +80,7 @@ Run before considering an edit done. `make check` applies to every row.
 | --- | --- |
 | `skills/repo-docs/scripts/docstool.py` | `make sync-vendored`, `make test` |
 | `skills/**` guidance or references | `make test` (skill lint); verify every tool claim you touched (rule 1) |
+| `skills/zensical-site/assets/**` (config template, landing page, examples) | `make test-landing` and `make test-a11y` (need `zensical-requirements.txt` and `requirements/a11y.txt`); screenshots at 1440, 768 and 390 px in both schemes for a layout change |
 | `.claude-plugin/**`, `skills/*/SKILL.md` frontmatter | `make validate-plugin`, `make test` |
 | `tests/**`, `scripts/**`, `.mk/**` | `make test`; for the bump, `make release-bump VERSION=<higher>` shows a one-line diff (then restore the file) |
 | `.github/workflows/**`, `.github/dependabot.yml` | `pre-commit run actionlint --all-files`; reason through each trigger the workflow has |

@@ -1,0 +1,5 @@
+---
+# The landing examples are Zensical pages: content tabs (=== "pip") indent their fenced blocks by
+# four spaces, which plain Markdown reads as indented code. Settings merge with skills/ and the root.
+config:
+  code-block-style: false
