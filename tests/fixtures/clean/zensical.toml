@@ -1,0 +1,18 @@
+[project]
+site_name = "Clean"
+site_url = "https://example.org/clean/"
+repo_url = "https://github.com/example/clean"
+exclude_docs = """
+internal/
+"""
+nav = [
+  { "Home" = "index.md" },
+  { "Guide" = "guide.md" },
+  { "Reference" = "reference.md" },
+]
+
+[project.markdown_extensions.attr_list]
+[project.markdown_extensions.md_in_html]
+[project.markdown_extensions.toc]
+permalink = true
+slugify = { object = "pymdownx.slugs.slugify", kwds = { case = "lower" } }

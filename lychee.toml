@@ -3,4 +3,6 @@
 # expressions matched against the path.
 exclude_path = [
   "(^|/)node_modules/",
+  # The docstool fixtures hold planted broken links on purpose (tests/test_check.py).
+  "^(\\./)?tests/fixtures/",
 ]

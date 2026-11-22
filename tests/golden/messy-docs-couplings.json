@@ -1,0 +1,155 @@
+[
+ {
+  "source": ".agents/skills/review/SKILL.md",
+  "line": 8,
+  "kind": "agent",
+  "ref": "path",
+  "target": "docs/protocol.md",
+  "detail": "docs/protocol.md",
+  "status": "ok"
+ },
+ {
+  "source": ".agents/skills/review/SKILL.md",
+  "line": 8,
+  "kind": "agent",
+  "ref": "path",
+  "target": "docs/removed-page.md",
+  "detail": "docs/removed-page.md",
+  "status": "missing"
+ },
+ {
+  "source": "README.md",
+  "line": 9,
+  "kind": "root-doc",
+  "ref": "anchor",
+  "target": "docs/protocol.md",
+  "detail": "#no-such-heading",
+  "status": "missing"
+ },
+ {
+  "source": "README.md",
+  "line": 9,
+  "kind": "root-doc",
+  "ref": "anchor",
+  "target": "docs/protocol.md",
+  "detail": "#udev-rule",
+  "status": "ok"
+ },
+ {
+  "source": "README.md",
+  "line": 9,
+  "kind": "root-doc",
+  "ref": "path",
+  "target": "docs/protocol.md",
+  "detail": "docs/protocol.md",
+  "status": "ok"
+ },
+ {
+  "source": "RELEASING.md",
+  "line": 3,
+  "kind": "root-doc",
+  "ref": "path",
+  "target": "docs/release.md",
+  "detail": "docs/release.md",
+  "status": "ok"
+ },
+ {
+  "source": "docs/release.md",
+  "line": 7,
+  "kind": "doc",
+  "ref": "path",
+  "target": "docs/internal/notes.md",
+  "detail": "internal/notes.md",
+  "status": "ok"
+ },
+ {
+  "source": "src/device.rs",
+  "line": 1,
+  "kind": "code",
+  "ref": "heading",
+  "target": "docs/protocol.md",
+  "detail": "udev rule",
+  "status": "ok"
+ },
+ {
+  "source": "src/device.rs",
+  "line": 1,
+  "kind": "code",
+  "ref": "path",
+  "target": "docs/protocol.md",
+  "detail": "docs/protocol.md",
+  "status": "ok"
+ },
+ {
+  "source": "src/device.rs",
+  "line": 2,
+  "kind": "code",
+  "ref": "heading",
+  "target": "docs/protocol.md",
+  "detail": "Virtual-mouse loop",
+  "status": "bold-label"
+ },
+ {
+  "source": "src/device.rs",
+  "line": 2,
+  "kind": "code",
+  "ref": "path",
+  "target": "docs/protocol.md",
+  "detail": "docs/protocol.md",
+  "status": "ok"
+ },
+ {
+  "source": "src/device.rs",
+  "line": 3,
+  "kind": "code",
+  "ref": "heading",
+  "target": "docs/release.md",
+  "detail": "Flathub by hand",
+  "status": "missing"
+ },
+ {
+  "source": "src/device.rs",
+  "line": 3,
+  "kind": "code",
+  "ref": "path",
+  "target": "docs/release.md",
+  "detail": "docs/release.md",
+  "status": "ok"
+ },
+ {
+  "source": "src/device.rs",
+  "line": 4,
+  "kind": "code",
+  "ref": "path",
+  "target": "docs/protocol.md",
+  "detail": "docs/protocol.md",
+  "status": "ok"
+ },
+ {
+  "source": "src/device.rs",
+  "line": 4,
+  "kind": "code",
+  "ref": "section",
+  "target": "docs/protocol.md",
+  "detail": "section 5",
+  "status": "ok"
+ },
+ {
+  "source": "src/device.rs",
+  "line": 4,
+  "kind": "code",
+  "ref": "section",
+  "target": "docs/protocol.md",
+  "detail": "section 9",
+  "status": "missing"
+ },
+ {
+  "source": "tests/docs_test.rs",
+  "line": 2,
+  "kind": "test",
+  "ref": "path",
+  "target": "docs/protocol.md",
+  "detail": "../docs/protocol.md",
+  "status": "ok"
+ }
+]

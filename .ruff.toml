@@ -22,7 +22,10 @@ ignore = [
 [lint.per-file-ignores]
 # docstool carries a shebang for the reader, but its documented invocation is
 # `python3 -I <skill-dir>/scripts/docstool.py` (isolated mode, named in every SKILL.md), so it is not executable.
-"skills/*/scripts/docstool.py" = ["EXE001"]
+# docstool is one stdlib file by design (each skill vendors it). Its Markdown scanner and YAML
+# reader are state machines whose branches mirror the grammar, so the size rules are off there;
+# RUF001: the citation patterns match typographic quote marks on purpose.
+"skills/*/scripts/docstool.py" = ["EXE001", "PLR0911", "PLR0912", "PLR0915", "RUF001"]
 # Tests use bare asserts and literal values by design.
 "tests/**" = ["PLR2004", "S101"]
 
