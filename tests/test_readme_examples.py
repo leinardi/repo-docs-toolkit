@@ -145,3 +145,19 @@ def test_bullets_inside_a_card_are_not_cards(tmp_path: Path) -> None:
 def test_example_readme_names_no_missing_command(name: str, tmp_path: Path) -> None:
     _, report = docstool_json(example_repo(name, tmp_path), "drift", "--scope", "repo")
     assert [f for f in report["findings"] if f["file"] == "README.md"] == []
+
+
+def test_a_tagline_wrapped_over_two_lines_is_read_whole(tmp_path: Path) -> None:
+    # a repository with a line-length rule wraps the header's <strong> tagline
+    repo = example_repo("cli", tmp_path)
+    readme = repo / "README.md"
+    tagline = "Rename thousands of files safely, with a preview of every change."
+    text = readme.read_text(encoding="utf-8")
+    assert f"<strong>{tagline}</strong>" in text
+    readme.write_text(
+        text.replace(f"<strong>{tagline}</strong>", "<strong>Rename thousands of files safely,\nwith a preview of every change.</strong>"),
+        encoding="utf-8",
+    )
+    code, report = readme_report(repo)
+    assert code == 0, report["findings"]
+    assert report["data"]["readme"]["tagline"] == report["data"]["home"]["tagline"]

@@ -55,6 +55,10 @@ GitHub strips `style` and `class`; layout comes from `align` and image sizes onl
   front matter (`home.tagline` in `docs/index.md`) is canonical: copy it verbatim.
 - **The nav line** links the docs, the install section and CONTRIBUTING, separated by ` · `.
 - Leave out a paragraph that would be empty: no badges, no badge row.
+- **Line length.** In a repository whose markdownlint sets `line_length`, break the header's
+  long lines inside the tags: the tagline over two lines inside `<strong>`, the nav links one per
+  line inside `<p align="center">`. HTML collapses the line breaks; the checker reads the
+  wrapped tagline.
 
 ## Sections and emoji
 
