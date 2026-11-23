@@ -34,7 +34,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from conftest import DOCSTOOL, GIT_ENV, docstool_code, docstool_json, git, load_module, make_repo
+from conftest import DOCSTOOL, GIT_ENV, docstool_code, docstool_json, git, load_module, make_repo, run_script
+from test_site_build import build, prebuilt
 
 ART = "docs/internal/restructure"
 
@@ -855,3 +856,177 @@ def test_an_archive_status_skips_a_fenced_comment_and_front_matter() -> None:
     text = "---\ntitle: x\n# yaml comment\n---\n\nIntro.\n\n```sh\n# not a title\n```\n"
     assert module._status_line(text, "Old.") == "---\ntitle: x\n# yaml comment\n---\n> **Status:** Old.\n\n\nIntro.\n\n```sh\n# not a title\n```\n"
     assert module._status_line("Title\n===\nBody.\n", "Old.") == "Title\n===\n\n> **Status:** Old.\n\nBody.\n"
+
+
+def no_site_repo(tmp_path: Path) -> Path:
+    """A repository with no site config, a block baseline and a source URL baseline."""
+    repo = make_repo("clean", tmp_path)
+    (repo / "zensical.toml").unlink()
+    (repo / "docs" / "old.md").write_text("# Old\n\nIntro text.\n\n## Details\n\nBody text.\n", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "no site")
+    write_plan(repo, {"keep": [{"paths": ["docs/"]}]})
+    docstool_json(repo, "check", "--save-baseline", f"{ART}/urls.json")
+    assert json.loads((repo / ART / "urls.json").read_text(encoding="utf-8"))["routes"] == {}
+    return repo
+
+
+def verify_urls(repo: Path) -> tuple[int, dict[str, Any]]:
+    return docstool_json(repo, "plan", "verify", "--urls", f"{ART}/urls.json")
+
+
+def rows(report: dict[str, Any]) -> dict[str, str]:
+    return {r["input"]: r["state"] for r in report["coverage"]}
+
+
+def test_no_site_verify_checks_github_urls_not_site_routes(tmp_path: Path) -> None:
+    repo = no_site_repo(tmp_path)
+    code, report = verify_urls(repo)
+    assert code == 0, report["findings"]
+    assert rows(report)["url_baseline"] == "not_applicable"
+    assert rows(report)["github_urls"] == "complete"
+
+
+def test_no_site_verify_without_urls_says_github_is_unchecked(tmp_path: Path) -> None:
+    repo = no_site_repo(tmp_path)
+    code, report = docstool_json(repo, "plan", "verify")
+    assert code == 3
+    assert rows(report)["github_urls"] == "partial"
+
+
+@pytest.mark.parametrize(
+    "change",
+    [{"routes": None}, {"routes": []}, {"routes": {"a/": {"type": "page", "ids": []}}}, {"kind": "built"}],
+)
+def test_no_site_verify_refuses_any_other_baseline(tmp_path: Path, change: dict[str, Any]) -> None:
+    repo = no_site_repo(tmp_path)
+    path = repo / ART / "urls.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data.update(change)
+    path.write_text(json.dumps(data), encoding="utf-8")
+    assert docstool_code(repo, "plan", "verify", "--urls", f"{ART}/urls.json") == 2
+
+
+def test_no_site_verify_refuses_a_baseline_with_no_routes_key(tmp_path: Path) -> None:
+    repo = no_site_repo(tmp_path)
+    path = repo / ART / "urls.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    del data["routes"]
+    path.write_text(json.dumps(data), encoding="utf-8")
+    assert docstool_code(repo, "plan", "verify", "--urls", f"{ART}/urls.json") == 2
+
+
+@pytest.mark.parametrize("built", [False, True])
+@pytest.mark.parametrize("github", [None, [], {"docs/old.md": "details"}, {"docs/old.md": [1]}])
+def test_a_malformed_github_table_is_refused_with_or_without_built(tmp_path: Path, built: bool, github: Any) -> None:
+    repo = no_site_repo(tmp_path)
+    path = repo / ART / "urls.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["github"] = github
+    path.write_text(json.dumps(data), encoding="utf-8")
+    extra = ["--built", str(tmp_path / "unused")] if built else []
+    result = run_script(DOCSTOOL, "plan", "verify", "--urls", f"{ART}/urls.json", *extra, "--root", str(repo), "--format", "json")
+    assert result.returncode == 2
+    assert "github table" in result.stderr
+
+
+def test_a_site_added_later_still_compares_the_github_urls(tmp_path: Path) -> None:
+    repo = no_site_repo(tmp_path)
+    git(repo, "checkout", "-q", "HEAD~1", "--", "zensical.toml")
+    page = repo / "docs" / "old.md"
+    page.write_text(page.read_text(encoding="utf-8").replace("## Details", "## More"), encoding="utf-8")
+    prebuilt(repo, {"index.html": "<h1 id='home'>Home</h1>"})
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "site")
+    out = tmp_path / "site"
+    code, built_report = build(repo, out)
+    assert code == 0, built_report
+    _, report = docstool_json(repo, "plan", "verify", "--urls", f"{ART}/urls.json", "--built", str(out))
+    assert rows(report)["github_urls"] == "complete"
+    assert "github-url-lost" in {f["check"] for f in report["findings"]}
+
+
+def test_a_page_loss_entry_does_not_excuse_anchors_of_a_surviving_page(tmp_path: Path) -> None:
+    repo = no_site_repo(tmp_path)
+    page = repo / "docs" / "old.md"
+    page.write_text(page.read_text(encoding="utf-8").replace("## Details", "## More"), encoding="utf-8")
+    entry = '[[github_loss]]\nid = "g1"\npath = "docs/old.md"\npage = true\nreason = "owner decision"\n'
+    (repo / ART / "mappings.toml").write_text(entry, encoding="utf-8")
+    assert docstool_json(repo, "plan", "approve", "--mappings", "--by", "Owner")[0] == 0
+    code, report = verify_urls(repo)
+    assert code == 1
+    assert "github-url-lost" in {f["check"] for f in report["findings"]}
+
+
+def test_a_page_loss_entry_accepts_a_missing_page(tmp_path: Path) -> None:
+    repo = no_site_repo(tmp_path)
+    old = repo / "docs" / "old.md"
+    (repo / "docs" / "new.md").write_text(old.read_text(encoding="utf-8"), encoding="utf-8")
+    old.unlink()
+    entry = '[[github_loss]]\nid = "g1"\npath = "docs/old.md"\npage = true\nreason = "owner moved it"\n'
+    (repo / ART / "mappings.toml").write_text(entry, encoding="utf-8")
+    assert docstool_json(repo, "plan", "approve", "--mappings", "--by", "Owner")[0] == 0
+    code, report = verify_urls(repo)
+    assert code == 0, report["findings"]
+
+
+def test_a_renamed_github_anchor_needs_a_reviewed_loss(tmp_path: Path) -> None:
+    repo = no_site_repo(tmp_path)
+    page = repo / "docs" / "old.md"
+    page.write_text(page.read_text(encoding="utf-8").replace("## Details", "## More"), encoding="utf-8")
+    code, report = verify_urls(repo)
+    assert code == 1
+    assert [f["check"] for f in report["findings"]] == ["github-url-lost"]
+    mappings = repo / ART / "mappings.toml"
+    entry = '[[github_loss]]\nid = "g1"\npath = "docs/old.md"\nanchors = ["details"]\nreason = "owner renamed it"\n'
+    mappings.write_text(entry, encoding="utf-8")
+    assert verify_urls(repo)[0] == 1  # not reviewed yet
+    assert docstool_json(repo, "plan", "approve", "--mappings", "--by", "Owner")[0] == 0
+    code, report = verify_urls(repo)
+    assert code == 0, report["findings"]
+    mappings.write_text(entry.replace("owner renamed it", "changed"), encoding="utf-8")
+    assert "receipt-invalid" in {f["check"] for f in verify_urls(repo)[1]["findings"]}
+
+
+@pytest.mark.parametrize("stub", [False, True])
+def test_a_moved_page_loses_its_github_url_even_with_a_stub(tmp_path: Path, stub: bool) -> None:
+    repo = no_site_repo(tmp_path)
+    old = repo / "docs" / "old.md"
+    (repo / "docs" / "new.md").write_text(old.read_text(encoding="utf-8"), encoding="utf-8")
+    if stub:
+        old.write_text("# Old\n\nThis page moved to [New](new.md).\n", encoding="utf-8")
+    else:
+        old.unlink()
+    code, report = verify_urls(repo)
+    assert code == 1
+    lost = [f for f in report["findings"] if f["check"] == "github-url-lost"]
+    assert len(lost) == 1
+    assert ("#details" in lost[0]["message"]) is stub
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        'path = "docs/old.md"\nanchors = ["details"]\nreason = "  "\n',
+        'path = "docs/old.md"\nreason = "x"\n',
+        'anchors = ["details"]\nreason = "x"\n',
+        'path = "docs/old.md"\npage = "yes"\nreason = "x"\n',
+    ],
+)
+def test_a_malformed_github_loss_cannot_be_approved(tmp_path: Path, entry: str) -> None:
+    repo = no_site_repo(tmp_path)
+    (repo / ART / "mappings.toml").write_text(f'[[github_loss]]\nid = "g1"\n{entry}', encoding="utf-8")
+    code, report = docstool_json(repo, "plan", "approve", "--mappings", "--by", "Owner")
+    assert code == 1
+    assert "mapping-invalid" in {f["check"] for f in report["findings"]}
+
+
+def test_a_github_loss_cannot_excuse_content(tmp_path: Path) -> None:
+    repo = no_site_repo(tmp_path)
+    blocks = json.loads((repo / ART / "blocks.json").read_text(encoding="utf-8"))["blocks"]
+    digest = next(b["hash"] for b in blocks if b["text"] == "Body text.")
+    entry = f'[[github_loss]]\nid = "g1"\nblocks = ["{digest}"]\npath = "docs/old.md"\npage = true\nreason = "x"\n'
+    (repo / ART / "mappings.toml").write_text(entry, encoding="utf-8")
+    code, report = docstool_json(repo, "plan", "approve", "--mappings", "--by", "Owner")
+    assert code == 1
+    assert "mapping-invalid" in {f["check"] for f in report["findings"]}

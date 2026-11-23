@@ -5498,7 +5498,7 @@ def compare_url_baseline(baseline: dict[str, Any], new: dict[str, Any], report: 
 
 PLAN_SCHEMA = 1
 PLAN_TYPES = ("move", "archive", "split", "merge", "anchor", "reference", "freeze", "keep", "stub", "delete", "decision")
-MAPPING_TYPES = ("rewritten", "dropped")
+MAPPING_TYPES = ("rewritten", "dropped", "github_loss")
 JOURNAL_NAME = ".apply-journal.json"
 LOG_NAME = "apply-log.json"
 STAGING_NAME = ".staging"
@@ -6685,6 +6685,10 @@ def _approve_mappings(context: PlanContext, args: argparse.Namespace) -> None:
                 f"mapping {entry.get('id', '?')}: needs an id and baseline block hashes ({', '.join(missing[:3])} not in the baseline)",
             )
             continue
+        problem = _github_loss_problem(entry) if entry["kind"] == "github_loss" else None
+        if problem:
+            context.error("mapping-invalid", f"mapping {entry['id']}: {problem}")
+            continue
         destination = _destination_hashes(context.corpus, entry)
         if entry["kind"] == "dropped" and not str(entry.get("proof") or "").strip():
             context.error(
@@ -6711,6 +6715,7 @@ def _approve_mappings(context: PlanContext, args: argparse.Namespace) -> None:
                 "before": [by_hash[h]["text"] for h in entry.get("blocks", [])],
                 "to": entry.get("to"),
                 "proof": entry.get("proof"),
+                **({k: entry.get(k) for k in ("path", "page", "anchors", "reason")} if entry["kind"] == "github_loss" else {}),
             }
         )
     context.report.data["review"] = review
@@ -6720,6 +6725,68 @@ def _approve_mappings(context: PlanContext, args: argparse.Namespace) -> None:
     _fsync_write(path.with_name(path.name + ".tmp"), _json_bytes({"receipts": receipts}))
     os.replace(path.with_name(path.name + ".tmp"), path)
     context.report.data["state"] = f"{len(receipts)} review receipts written"
+
+
+def _github_loss_problem(entry: dict[str, Any]) -> str | None:
+    """Why a [[github_loss]] entry cannot be reviewed, or None."""
+    if entry.get("blocks"):
+        return "a github_loss entry accepts a lost URL and cannot excuse content blocks"
+    path, page, anchors = entry.get("path"), entry.get("page", False), entry.get("anchors", [])
+    if not isinstance(path, str) or not path.strip():
+        return "a github_loss entry needs a path"
+    if not isinstance(page, bool) or not isinstance(anchors, list) or not all(isinstance(a, str) and a for a in anchors):
+        return "page must be a boolean and anchors a list of fragments"
+    if not page and not anchors:
+        return "a github_loss entry must name the page or at least one anchor"
+    if not str(entry.get("reason") or "").strip():
+        return "a github_loss entry needs a reason (the owner's decision)"
+    return None
+
+
+def _github_loss_keys(entry: dict[str, Any]) -> set[tuple[str, str]]:
+    """(path, fragment) pairs an entry accepts; the empty fragment is the whole page."""
+    if _github_loss_problem(entry):
+        return set()
+    path = str(entry["path"])
+    return {(path, str(a)) for a in entry.get("anchors", [])} | ({(path, "")} if entry.get("page") else set())
+
+
+def _compare_github(context: PlanContext, table: dict[str, Any], accepted: set[tuple[str, str]]) -> CoverageRow:
+    """Every old GitHub path and fragment must exist at its original path, or be an accepted loss."""
+    kept = 0
+    for rel, anchors in sorted(table.items()):
+        doc = context.corpus.docs.get(rel)
+        if doc is None:
+            if (rel, "") not in accepted:
+                context.report.add(
+                    Finding(
+                        "github-url-lost",
+                        "P1",
+                        "verified",
+                        rel,
+                        0,
+                        f"{rel} no longer exists at this path, so its GitHub URL breaks",
+                        suggestion="keep a page there with the same anchors, or record a reviewed [[github_loss]] entry in mappings.toml",
+                    )
+                )
+            continue
+        have = {a.lower() for a in doc.anchors()}
+        # a surviving page needs each lost anchor named: the whole-page key applies only to a missing page
+        gone = [a for a in anchors if a.lower() not in have and (rel, a) not in accepted]
+        kept += len(anchors) - len(gone)
+        if gone:
+            context.report.add(
+                Finding(
+                    "github-url-lost",
+                    "P1",
+                    "verified",
+                    rel,
+                    0,
+                    f"{len(gone)} GitHub anchors of {rel} are gone: {', '.join('#' + a for a in gone[:8])}",
+                    suggestion="keep the headings, or record a reviewed [[github_loss]] entry in mappings.toml",
+                )
+            )
+    return CoverageRow("github_urls", "complete", f"{len(table)} paths compared at their original location, {kept} anchors kept or accepted")
 
 
 def _load_baseline(context: PlanContext) -> list[dict[str, Any]] | None:
@@ -6744,6 +6811,7 @@ def _verify(context: PlanContext, args: argparse.Namespace) -> list[str]:
         occurrences[digest].append(index)
     receipts = {r["id"]: r for r in (_read_json(context.repo.root / context.plan.artifact(RECEIPTS_NAME)) or {}).get("receipts", [])}
     excused: Counter[str] = Counter()
+    accepted: set[tuple[str, str]] = set()
     # a block a reviewed rewritten mapping sends to another page sits where the owner agreed
     relocated: dict[str, str] = {}
     for entry in _load_mappings(context):
@@ -6779,6 +6847,9 @@ def _verify(context: PlanContext, args: argparse.Namespace) -> list[str]:
                     suggestion="review it again",
                 )
             )
+            continue
+        if entry["kind"] == "github_loss":
+            accepted.update(_github_loss_keys(entry))
             continue
         excused.update(entry.get("blocks", []))
         if entry["kind"] == "rewritten":
@@ -6849,21 +6920,35 @@ def _verify(context: PlanContext, args: argparse.Namespace) -> list[str]:
         "excused_by_mappings": sum(1 for i in matched if i is None) - unaccounted,
     }
     if args.urls:
-        if not args.built:
-            raise UsageError("plan verify --urls needs --built NEW_SITE")
         urls = _read_json(_root_path(args, args.urls))
         if not isinstance(urls, dict):
             raise UsageError(f"{args.urls}: not a URL baseline")
-        built = load_built(args.built, context.repo, context.site)
         if "routes" not in urls:
             raise UsageError(f"{args.urls}: not a URL baseline written by check --save-baseline")
-        compare_url_baseline(urls, built["site"], report, args.urls)
-        report.coverage.append(_url_baseline_row(urls, built))
-        required.append("url_baseline")
+        # an empty object, from a tree with no site: its GitHub paths and anchors still need checking
+        no_site = urls.get("kind") == "source" and urls["routes"] == {}
+        github = urls.get("github")
+        table: dict[str, Any] = github if isinstance(github, dict) else {}
+        if no_site and (table is not github or not all(isinstance(a, list) and all(isinstance(x, str) for x in a) for a in table.values())):
+            raise UsageError(f"{args.urls}: the github table of a no-site baseline is missing or malformed")
+        if args.built:
+            built = load_built(args.built, context.repo, context.site)
+            compare_url_baseline(urls, built["site"], report, args.urls)
+            report.coverage.append(_url_baseline_row(urls, built))
+            required.append("url_baseline")
+        elif no_site:
+            report.coverage.append(CoverageRow("url_baseline", "not_applicable", "the baseline has no built-site routes"))
+        else:
+            raise UsageError("plan verify --urls needs --built NEW_SITE unless the baseline is a source baseline with no site routes")
+        if no_site:
+            report.coverage.append(_compare_github(context, table, accepted))
+            required.append("github_urls")
     elif context.site.config:
         report.coverage.append(CoverageRow("url_baseline", "partial", "not checked: pass --urls and --built to verify URL preservation"))
     else:
-        report.coverage.append(CoverageRow("url_baseline", "not_applicable", "no site config: no URLs to preserve"))
+        report.coverage.append(CoverageRow("url_baseline", "not_applicable", "no site config: no built-site routes"))
+        report.coverage.append(CoverageRow("github_urls", "partial", "not compared: pass --urls with the baseline from check --save-baseline"))
+        required.append("github_urls")
     return required
 
 
