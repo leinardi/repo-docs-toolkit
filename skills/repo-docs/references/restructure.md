@@ -60,6 +60,12 @@ python3 -I <skill-dir>/scripts/docstool.py check --root <repo> --built <scratch>
   A failed build exits 2 and its message quotes the generator's diagnostics. That baseline is
   source-derived (GitHub URLs and slugs); its coverage row is `partial` and the final report must
   say "URL preservation partially verified".
+- With no site, that baseline has no routes but records every page's GitHub path and anchors. Its
+  `partial` row is superseded when no site is created and Stage 6 reports `github_urls` complete:
+  the report then says the GitHub URLs were verified and that there were no site URLs to preserve.
+  When the restructure will create a site, also run `check --root <repo> --site-planned`: it reports
+  links that would break once `docs/` is published (`planned-leaves-docs`,
+  `planned-links-internal`) and changes no baseline.
 - A build whose stamp says `dependencies: partial` (hooks, macros, unknown plugins) gives a partial
   URL baseline too. Say so.
 - Read the inventory's `couplings`, `frozen`, `generated_regions`, `enum_headings` and
@@ -127,7 +133,8 @@ python3 -I <skill-dir>/scripts/docstool.py plan apply --root <repo> --write
 
 docstool computes every write first, checks that each touched file is clean, then applies them
 under a journal; a failure rolls every completed operation back. It does: moves and archives
-(with the status line), splits (the section moves; a pointer stays under the old heading), stubs,
+(with the status line), splits (the section moves, with its status line if the entry sets one; a
+pointer stays under the old heading), stubs,
 approved deletions, `reference` line edits, link and anchor rewrites (in the docs, and in declared
 files outside them), and
 redirects appended to the site config. Running it again right away reports "already applied";
@@ -143,8 +150,10 @@ exists in the target),
 rewrite pages that need it, rename headings named by `anchor` entries, update the nav, and add
 anything the report promised. Record every block you reword or drop on purpose in
 `mappings.toml` as you go. The link rewrites and the `reference` edits apply made need no
-mapping. Apply rewrites link targets, not link text: fix link texts that spell an old path (a
-mapping, since the text changed).
+mapping. Apply also respells a link label that is exactly its target's old path. It leaves two
+kinds alone, and the dry run lists them under "Link labels that spell an old path": labels in
+headings, because they set the anchor, and reference-style labels. Fix those by hand (a mapping,
+since the text changed; a heading also needs an `[[anchor]]` decision).
 
 Three fixes almost every restructure needs after apply:
 
@@ -155,7 +164,8 @@ Three fixes almost every restructure needs after apply:
 - **Lines apply made longer.** Rewritten paths and `reference` edits can push a line past the
   repository's wrap width (`house_style.wrap_p95`, the markdownlint `line_length`). Rewrap
   those paragraphs and list items; whitespace changes need no mapping. A line that holds only an
-  unbreakable URL may stay long.
+  unbreakable URL may stay long. When the repository sets a markdownlint `line_length`, the dry run
+  lists these lines under "Wrap warnings", judged by MD013's default options.
 - **README content moved into the docs** (repo-readme, gate R4). The README is in the baseline,
   so what leaves it needs a `rewritten` mapping to its new page, even when the text is unchanged:
   the mapping is what tells verify that a warning moved there on purpose.
@@ -172,16 +182,40 @@ python3 -I <skill-dir>/scripts/docstool.py plan verify --root <repo> --urls docs
 python3 -I <skill-dir>/scripts/docstool.py drift --root <repo> --scope docs
 ```
 
+When the repository had no site and still has none, there is nothing to build. Skip `site-build`
+and `check --built`, and verify against the source baseline alone:
+
+```sh
+python3 -I <skill-dir>/scripts/docstool.py check --root <repo>
+python3 -I <skill-dir>/scripts/docstool.py plan verify --root <repo> --urls docs/internal/restructure/urls.json
+python3 -I <skill-dir>/scripts/docstool.py drift --root <repo> --scope docs
+```
+
+`--urls` without `--built` is accepted only for a source baseline with no routes. `url_baseline` is
+then `not_applicable`, and `github_urls` compares every old path and anchor at its original path.
+Without `--urls`, a repository with no site exits 3, because its GitHub URLs went unchecked.
+
+When the repository had no site and this restructure creates one, use the main commands above.
+`plan verify --urls ... --built` then always exits 3, because a source baseline leaves
+`url_baseline` `partial`. That result is acceptable only when `plan verify` reports no findings,
+`github_urls` is `complete` and `url_baseline` is the only incomplete row. The final report must
+say "URL preservation partially verified".
+
 1. `check --baseline` reports every old route that is neither a page nor a redirect to one, every
    lost fragment, redirect loops and dangling redirects, and chains longer than one hop. It
    refuses a build whose inputs changed after it was built: rebuild after every edit.
-2. Show the owner each mapping with its before and after text. When they confirm, run
-   `plan approve --mappings --by "<owner's name>"`.
-3. `plan verify` exits 0 only when every baseline block is found again or covered by a reviewed
+2. `plan mappings` prints a skeleton of what is still unaccounted for. With a no-site baseline, add
+   `--urls` to include GitHub losses; a baseline with routes also needs `--built` and has no GitHub
+   comparison. Fill it in, then show the owner each mapping with its before and after text. When they
+   confirm, run `plan approve --mappings --by "<owner's name>"`.
+3. Apart from the site-created case above, `plan verify` exits 0 only when every baseline block is found again or covered by a reviewed
    mapping, list items and table rows keep their order, and every warning or requirement
    (admonitions, and paragraphs with "never", "must not", "do not", "before you", "requires") sits
-   under the same heading path in the file the plan sent it to.
-4. Run the repository's own doc checks and tests that read docs (SKILL.md rule 6); one that cannot
+   under the same heading path in the file the plan sent it to. With a no-site baseline, every old
+   GitHub path and anchor must also still exist where it was, or be a reviewed `[[github_loss]]`.
+4. `drift` does not read `docs/internal/restructure/` or `docs/internal/history/`, which describe the
+   past on purpose; its `records` coverage row gives the count, and `--include-records` reads them.
+5. Run the repository's own doc checks and tests that read docs (SKILL.md rule 6); one that cannot
    run goes under "Not tested".
 
 Pages moved out of the site keep their URL through a redirect, but their anchors cannot survive on
@@ -222,7 +256,7 @@ Entries are arrays of tables; paths are relative to the repository root:
 | --- | --- | --- |
 | `[[move]]` | `from`, `to`, optional `redirect_to` | Moves the file, rewrites links, adds a redirect when the source was published |
 | `[[archive]]` | `from`, `to`, `status`, optional `redirect_to` | A move plus the status line `> **Status:** <status>` under the title |
-| `[[split]]` | `from`, `heading`, `to` | Moves the section under a heading (which must occur once) to a new file, promoted to a title |
+| `[[split]]` | `from`, `heading`, `to`, optional `status` | Moves the section under a heading (which must occur once) to a new file, promoted to a title; `status` writes the status line under it, which a section going to `internal/history/` needs |
 | `[[merge]]` | `from` (list), `into` | Declares a merge you do by hand after apply; apply itself leaves both files alone |
 | `[[anchor]]` | `file`, `from`, `to` | Re-points links to `file#from` at `#to`; you rename the heading |
 | `[[stub]]` | `path`, `target`, optional `title` | Writes a one-line "This page moved" page |
@@ -274,6 +308,23 @@ mapping needs a `proof`. `plan approve --mappings` prints each mapping's before 
 writes a receipt binding the mapping, its baseline blocks and the destination blocks as they are
 now. Editing any of them afterwards invalidates that receipt, and `plan verify` fails until it is
 reviewed again. Mappings never touch the plan's own approval.
+
+`plan mappings` prints a skeleton of this file to stdout, one entry per block occurrence still
+unaccounted for, with `to` left empty. It writes no file, so redirect it to a scratch path and merge
+it by hand. An entry with an empty `to` or `reason` cannot be approved.
+
+A GitHub URL that a no-site restructure loses on purpose is accepted with a `[[github_loss]]` entry,
+reviewed like a mapping. `page = true` accepts a path that no longer exists; for a page that still
+exists, `anchors` names each lost fragment. A moved page's old URL needs this even with a stub,
+unless the stub keeps the anchors:
+
+```toml
+[[github_loss]]
+id = "m3"
+path = "docs/old.md"
+anchors = ["details"]
+reason = "the owner renamed this section"
+```
 
 ## Recovery
 

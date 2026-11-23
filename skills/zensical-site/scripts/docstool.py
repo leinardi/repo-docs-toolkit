@@ -7772,7 +7772,7 @@ def build_parser() -> argparse.ArgumentParser:
     plan.add_argument("--by", help="approve: who approves (gate G9)")
     plan.add_argument("--mappings", action="store_true", help="approve: write review receipts for mappings.toml instead of the plan approval")
     plan.add_argument("--urls", help="verify, mappings: also check a saved URL baseline (a site's needs --built)")
-    plan.add_argument("--built", help="verify --urls: the new site-build output")
+    plan.add_argument("--built", help="verify or mappings with --urls: the new site-build output")
     drift = sub.add_parser("drift", help="find commands, flags, env vars and paths the docs name that the code no longer has")
     _common(drift)
     drift.add_argument("--scope", choices=("all", "docs", "repo"), default="all", help="which Markdown files to read")

@@ -94,6 +94,9 @@ Common options: `--root`, `--format`, `--out`, `--max`, `--fail-on`.
 route must still be a page, or a redirect whose chain ends at one, and every old anchor must still
 exist on its destination.
 
+`--site-planned` is for a repository with no site yet. It reports links from pages that would be
+published to files outside `docs/` or under `docs/internal/`, and it never changes a saved baseline.
+
 ## site-build
 
 Build the site with its generator into a fresh directory, with a stamp of its inputs.
@@ -122,7 +125,7 @@ Validate, approve, apply, resume, roll back or verify a restructure plan.
 | `--by` | `NAME` |  | approve: who approves (gate G9) |
 | `--mappings` | flag |  | approve: write review receipts for mappings.toml instead of the plan approval |
 | `--urls` | `PATH` |  | verify, mappings: also check a saved URL baseline (a site's needs --built) |
-| `--built` | `DIR` |  | verify --urls: the new site-build output |
+| `--built` | `DIR` |  | verify or mappings with --urls: the new site-build output |
 
 Common options: `--root`, `--format`, `--out`, `--max`, `--fail-on`.
 
@@ -135,7 +138,8 @@ The actions, in the order a restructure uses them:
 | `apply` | Prints what would change; with `--write`, applies it as one journalled transaction that rolls back on failure |
 | `resume` | Finishes an interrupted apply |
 | `rollback` | Undoes an interrupted apply |
-| `verify` | Checks that every block of the baseline is accounted for, that every mapping has a valid receipt and, with `--urls` and `--built`, that old URLs still resolve |
+| `mappings` | Prints a `mappings.toml` skeleton to stdout for what is still unaccounted for; it writes no file and refuses `--out` |
+| `verify` | Checks that every block of the baseline is accounted for, that every mapping has a valid receipt and, with `--urls`, that old URLs still resolve: site routes with `--built`, GitHub paths and anchors for a baseline with no site routes |
 
 The file format is in [The plan format](plan-format.md).
 
@@ -153,6 +157,11 @@ Find commands, flags, env vars and paths the docs name that the code no longer h
 | `--allow-partial` | flag |  | exit 0/1 even when coverage is incomplete (the summary says PARTIAL) |
 
 Common options: `--root`, `--format`, `--out`, `--max`, `--fail-on`.
+
+`drift` skips `docs/internal/restructure/` and `docs/internal/history/` unless `--include-records`
+is set, because those pages describe the past on purpose; the `records` coverage row gives the count.
+An environment variable nothing reads stays a P2 and says that dependencies were not scanned. One
+read through a traced Rust callback or forwarding function is a P3.
 
 ## site-audit
 

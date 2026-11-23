@@ -943,7 +943,9 @@ def test_a_site_added_later_still_compares_the_github_urls(tmp_path: Path) -> No
     out = tmp_path / "site"
     code, built_report = build(repo, out)
     assert code == 0, built_report
-    _, report = docstool_json(repo, "plan", "verify", "--urls", f"{ART}/urls.json", "--built", str(out))
+    code, report = docstool_json(repo, "plan", "verify", "--urls", f"{ART}/urls.json", "--built", str(out))
+    assert code == 3  # a source baseline leaves url_baseline partial
+    assert rows(report)["url_baseline"] == "partial"
     assert rows(report)["github_urls"] == "complete"
     assert "github-url-lost" in {f["check"] for f in report["findings"]}
 
