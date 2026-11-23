@@ -6766,8 +6766,9 @@ def _verify(context: PlanContext, args: argparse.Namespace) -> list[str]:
         if free:
             used.add(free[0])
             matched.append(free[0])
-        elif excused[digest] > 0:
-            excused[digest] -= 1
+        elif excused[block["hash"]] > 0:
+            # mappings and their receipts name baseline hashes, never the post-edit digest
+            excused[block["hash"]] -= 1
             matched.append(None)
         else:
             matched.append(None)

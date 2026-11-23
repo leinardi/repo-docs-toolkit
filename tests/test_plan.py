@@ -757,3 +757,35 @@ def test_links_outside_the_docs_are_rewritten_only_when_declared(tmp_path: Path)
     releasing.write_text(releasing.read_text(encoding="utf-8") + "\nmore\n", encoding="utf-8")
     code, report = docstool_json(repo, "plan", "validate")
     assert ("plan-stale", "RELEASING.md") in {(f["check"], f["file"]) for f in report["findings"]}
+
+
+def reference_repo(tmp_path: Path) -> tuple[Path, str]:
+    """A plan with a [[reference]] edit outside the docs, applied; returns the repo and the block's hash."""
+    repo = make_repo("clean", tmp_path)
+    (repo / "NOTES.md").write_text("# Notes\n\nRead old/path before you start.\n", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "notes")
+    write_plan(
+        repo,
+        {"keep": [{"paths": ["docs/"]}], "reference": [{"file": "NOTES.md", "line": 3, "old": "old/path", "new": "new/path"}]},
+        ["NOTES.md"],
+    )
+    approve(repo)
+    assert docstool_json(repo, "plan", "apply", "--write")[0] == 0
+    blocks = json.loads((repo / ART / "blocks.json").read_text(encoding="utf-8"))["blocks"]
+    return repo, next(b["hash"] for b in blocks if b["file"] == "NOTES.md" and "old/path" in b["text"])
+
+
+def test_a_reviewed_mapping_covers_a_block_with_a_reference_edit(tmp_path: Path) -> None:
+    repo, digest = reference_repo(tmp_path)
+    (repo / "NOTES.md").write_text("# Notes\n\nStart by reading new/path.\n", encoding="utf-8")
+    (repo / ART / "mappings.toml").write_text(
+        f'[[rewritten]]\nid = "m1"\nblocks = ["{digest}"]\nto = "NOTES.md"\nheading = "Notes"\n', encoding="utf-8"
+    )
+    assert docstool_json(repo, "plan", "approve", "--mappings", "--by", "Owner")[0] == 0
+    code, report = docstool_json(repo, "plan", "verify")
+    assert code == 0, report["findings"]
+    (repo / ART / "review-receipts.json").write_text('{"receipts": []}', encoding="utf-8")
+    code, report = docstool_json(repo, "plan", "verify")
+    assert code == 1
+    assert {"block-unaccounted", "mapping-unreviewed"} <= {f["check"] for f in report["findings"]}
