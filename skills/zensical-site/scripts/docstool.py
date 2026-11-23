@@ -2465,7 +2465,16 @@ def _blob_suggestion(site: Site, repo: Repo, target: str) -> str:
     return f"link to {base.rstrip('/')}/blob/main/{target} (outside docs_dir the site cannot serve it)"
 
 
-def check_links(corpus: Corpus, report: Report, scope: set[str]) -> dict[str, int]:
+def _would_publish(site: Site, rel: str, is_dir: bool = False) -> bool:
+    """Whether a file or directory would be on a site planned for a repository that has none yet."""
+    if not site.in_docs(rel):
+        return False
+    # normalize_path strips a directory link's slash; the exclude patterns need it back
+    inner = site.docs_rel(rel) + ("/" if is_dir else "")
+    return not (inner.startswith("internal/") or DEFAULT_EXCLUDES.match(inner))
+
+
+def check_links(corpus: Corpus, report: Report, scope: set[str], planned: bool = False) -> dict[str, int]:
     repo, site = corpus.repo, corpus.site
     stats: Counter[str] = Counter()
     for rel in sorted(scope):
@@ -2535,6 +2544,31 @@ def check_links(corpus: Corpus, report: Report, scope: set[str]) -> dict[str, in
                     )
                     continue
             if not published:
+                if planned and _would_publish(site, rel):
+                    if not site.in_docs(resolved):
+                        report.add(
+                            Finding(
+                                "planned-leaves-docs",
+                                "P2",
+                                "likely",
+                                rel,
+                                link.line,
+                                f"{target} points outside {site.docs_dir}/: it works on GitHub but would break once {site.docs_dir}/ is published",
+                                suggestion=_blob_suggestion(site, repo, resolved),
+                            )
+                        )
+                    elif not _would_publish(site, resolved, resolved in repo.all_dirs):
+                        report.add(
+                            Finding(
+                                "planned-links-internal",
+                                "P2",
+                                "likely",
+                                rel,
+                                link.line,
+                                f"{target} points at {resolved}, which would not be published with the planned site",
+                                suggestion="move the fact to a page that will be published, or link to the file on GitHub",
+                            )
+                        )
                 continue
             if not site.in_docs(resolved):
                 report.add(
@@ -2787,7 +2821,9 @@ def cmd_check(args: argparse.Namespace, report: Report) -> list[str]:
     )
     scope = select_scope(corpus, args.scope)
     report.data["files_checked"] = len(scope)
-    report.data["links"] = check_links(corpus, report, scope)
+    if args.site_planned and site.config:
+        raise UsageError(f"--site-planned is for a repository with no site, and {site.config} exists")
+    report.data["links"] = check_links(corpus, report, scope, planned=args.site_planned)
     check_structure(corpus, report, scope)
     if args.scope != "repo":
         check_site(corpus, report)
@@ -7051,6 +7087,11 @@ def build_parser() -> argparse.ArgumentParser:
     check.add_argument("--built", help="a docstool site-build output directory (refused when stale or not built by docstool)")
     check.add_argument("--save-baseline", help="write the URL and anchor baseline of --built (or, without it, a source-derived one) to this file")
     check.add_argument("--baseline", help="check --built against a saved URL baseline: routes, redirects, anchors")
+    check.add_argument(
+        "--site-planned",
+        action="store_true",
+        help="with no site config: also report links that would break once docs/ is published (changes no baseline)",
+    )
     build = sub.add_parser("site-build", help="build the site with its generator into a fresh directory, with a stamp of its inputs")
     _common(build, out=False)
     build.add_argument("--out", dest="out_dir", required=True, help="fresh output directory (must not exist or be empty)")

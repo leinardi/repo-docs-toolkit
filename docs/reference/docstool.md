@@ -85,6 +85,7 @@ Find broken links, anchors, images, nav entries and publication problems.
 | `--built` | `DIR` |  | a docstool site-build output directory (refused when stale or not built by docstool) |
 | `--save-baseline` | `PATH` |  | write the URL and anchor baseline of --built (or, without it, a source-derived one) to this file |
 | `--baseline` | `PATH` |  | check --built against a saved URL baseline: routes, redirects, anchors |
+| `--site-planned` | flag |  | with no site config: also report links that would break once docs/ is published (changes no baseline) |
 
 Common options: `--root`, `--format`, `--out`, `--max`, `--fail-on`.
 
