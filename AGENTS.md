@@ -57,6 +57,7 @@ breaks a reference.
 | `skills/*/references/*.md` | Topic references loaded on demand. |
 | `skills/repo-docs/scripts/docstool.py` | The canonical checker; copied into the other skills. |
 | `scripts/sync-vendored.py` | Writes (`make sync-vendored`) and checks (`--check`) the copies. |
+| `scripts/sync_pins.py` | `make sync-pins`: copies the `requirements-dev.txt` pins into `.pre-commit-config.yaml`; `tests/test_pins.py` fails on drift. |
 | `tests/` | pytest suite: docstool, the vendored copies, the skill lint, the release bump. |
 | `zensical.toml`, `docs/` | The plugin's own site, built from the zensical-site skill's template and landing page; `docs/internal/` is not published. |
 | `.mk/test.mk` | Local make targets (`test`, `docs-verify`, `sync-vendored`, `check-vendored`, `validate-plugin`). |
@@ -69,12 +70,17 @@ breaks a reference.
 make help             # every target
 make pre-commit-install
 make check            # pre-commit on every file
-make test             # the unit tests
+make test             # the unit tests, in parallel (PYTEST_WORKERS=1 to debug a failure)
 make sync-vendored    # copy the canonical docstool.py into the other skills
+make sync-pins        # copy the requirements-dev.txt pins into .pre-commit-config.yaml
 make docs-serve       # preview the plugin's own site with live reload (uv, tools/docs/uv.lock)
 make docs-verify      # the plugin's own site, built strict and checked with docstool (uv)
 make validate-plugin  # claude plugin validate . --strict
 ```
+
+A behaviour change needs a test that fails on the old code. `make check` only sees files git
+already knows about: run `git add -N` on every new file first, and check `git status --short`
+afterwards, because it also runs hooks that fix files.
 
 ## Validation matrix
 
@@ -86,6 +92,7 @@ Run before considering an edit done. `make check` applies to every row.
 | `skills/**` guidance or references | `make test` (skill lint); verify every tool claim you touched (rule 1) |
 | `skills/zensical-site/assets/**` (config template, landing page, examples) | `make test-landing` and `make test-a11y` (through uv, from `tools/docs/uv.lock` and `requirements/a11y.txt`; `make a11y-browser` once); screenshots at 1440, 768 and 390 px in both schemes for a layout change |
 | `.claude-plugin/**`, `skills/*/SKILL.md` frontmatter | `make validate-plugin`, `make test` |
+| `requirements-dev.txt`, pins in `.pre-commit-config.yaml` | `make sync-pins`, `make test` |
 | `tests/**`, `scripts/**`, `.mk/**` | `make test`; for the bump, `make release-bump VERSION=<higher>` shows a one-line diff (then restore the file) |
 | `.github/workflows/**`, `.github/dependabot.yml` | `pre-commit run actionlint --all-files`; reason through each trigger the workflow has |
 | `docs/**`, `zensical.toml`, `README.md`, `tools/docs/**` | `make docs-verify` (needs uv); `make test` for `docs/reference/docstool.md`, which must cover every docstool option |
