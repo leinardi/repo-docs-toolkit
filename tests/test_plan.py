@@ -31,6 +31,7 @@ import json
 import subprocess
 from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -1030,3 +1031,168 @@ def test_a_github_loss_cannot_excuse_content(tmp_path: Path) -> None:
     code, report = docstool_json(repo, "plan", "approve", "--mappings", "--by", "Owner")
     assert code == 1
     assert "mapping-invalid" in {f["check"] for f in report["findings"]}
+
+
+def label_repo(tmp_path: Path, page: str, extra: dict[str, list[dict[str, Any]]] | None = None) -> Path:
+    repo = make_repo("clean", tmp_path)
+    (repo / "docs" / "old.md").write_text("# Old\n\nOld body.\n", encoding="utf-8")
+    (repo / "docs" / "page.md").write_text(page, encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "labels")
+    entries: dict[str, list[dict[str, Any]]] = {
+        "keep": [{"paths": ["docs/"]}],
+        "move": [{"from": "docs/old.md", "to": "docs/guide/new.md"}],
+        **(extra or {}),
+    }
+    write_plan(repo, entries, ["docs/old.md", "docs/page.md"])
+    approve(repo)
+    code, report = docstool_json(repo, "plan", "apply", "--write")
+    assert code == 0, report["findings"]
+    return repo
+
+
+def test_a_label_that_spells_the_old_path_moves_with_the_link(tmp_path: Path) -> None:
+    page = "# Page\n\nSee [`docs/old.md`](old.md), [old.md](old.md) and [the guide](old.md).\n"
+    repo = label_repo(tmp_path, page)
+    text = (repo / "docs" / "page.md").read_text(encoding="utf-8")
+    assert "[`docs/guide/new.md`](guide/new.md), [guide/new.md](guide/new.md) and [the guide](guide/new.md)" in text
+    code, report = docstool_json(repo, "plan", "verify")
+    assert code == 0, report["findings"]
+
+
+@pytest.mark.parametrize(
+    "line",
+    ["![old.md](old.md)", "[docs/old.md and more](old.md)"],
+)
+def test_other_labels_stay(tmp_path: Path, line: str) -> None:
+    repo = label_repo(tmp_path, f"# Page\n\n{line}\n")
+    text = (repo / "docs" / "page.md").read_text(encoding="utf-8")
+    assert "guide/new.md" not in text.split("](")[0]
+
+
+def test_labels_in_code_stay(monkeypatch: pytest.MonkeyPatch) -> None:
+    # validate refuses a real plan whose docs quote a moved path in code, so this calls the rewrite itself
+    module = load_module("docstool_labels", DOCSTOOL)
+    monkeypatch.setattr(module, "_link_rewritable", lambda _context, _rel: True)
+    context = SimpleNamespace(plan=module.Plan("plan.toml", "", {}, "."), site=module.Site())
+    moves = {"docs/old.md": "docs/guide/new.md"}
+    for text in ("`[old.md](old.md)` in code\n", "```md\n[old.md](old.md)\n```\n"):
+        assert module._planned_lines(context, "docs/page.md", text, moves) == text
+    assert module._planned_lines(context, "docs/page.md", "[old.md](old.md)\n", moves) == "[guide/new.md](old.md)\n"
+
+
+def test_a_heading_label_keeps_its_anchor_and_context(tmp_path: Path) -> None:
+    page = "# Page\n\n## [old.md](old.md)\n\nNever do this here.\n\nSee [page](page.md#oldmd).\n"
+    repo = label_repo(tmp_path, page)
+    text = (repo / "docs" / "page.md").read_text(encoding="utf-8")
+    assert "## [old.md](guide/new.md)" in text
+    assert "page.md#oldmd" in text or "#oldmd" in text
+    code, report = docstool_json(repo, "plan", "verify")
+    assert code == 0, report["findings"]
+
+
+def test_the_dry_run_names_heading_labels_it_leaves(tmp_path: Path) -> None:
+    repo = make_repo("clean", tmp_path)
+    (repo / "docs" / "old.md").write_text("# Old\n\nOld body.\n", encoding="utf-8")
+    (repo / "docs" / "page.md").write_text("# Page\n\n## [old.md](old.md)\n\nText.\n", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "labels")
+    write_plan(repo, {"keep": [{"paths": ["docs/"]}], "move": [{"from": "docs/old.md", "to": "docs/guide/new.md"}]}, ["docs/old.md", "docs/page.md"])
+    result = run_script(DOCSTOOL, "plan", "apply", "--root", str(repo))
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Link labels that spell an old path, left for you (1):" in result.stdout
+    assert "docs/page.md:3 (heading" in result.stdout
+
+
+def test_a_reference_edit_in_a_multiline_block_replaces_its_own_line(tmp_path: Path) -> None:
+    repo = make_repo("clean", tmp_path)
+    (repo / "NOTES.md").write_text("# Notes\n\nThe old/path stays here,\nand the old/path moves.\n", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "notes")
+    write_plan(
+        repo, {"keep": [{"paths": ["docs/"]}], "reference": [{"file": "NOTES.md", "line": 4, "old": "old/path", "new": "new/path"}]}, ["NOTES.md"]
+    )
+    approve(repo)
+    assert docstool_json(repo, "plan", "apply", "--write")[0] == 0
+    assert (repo / "NOTES.md").read_text(encoding="utf-8") == "# Notes\n\nThe old/path stays here,\nand the new/path moves.\n"
+    code, report = docstool_json(repo, "plan", "verify")
+    assert code == 0, report["findings"]
+
+
+@pytest.mark.parametrize("delete_second", [False, True])
+def test_an_edit_that_splits_a_block_has_no_expected_hash(tmp_path: Path, delete_second: bool) -> None:
+    repo = make_repo("clean", tmp_path)
+    (repo / "NOTES.md").write_text("# Notes\n\nFirst half. SPLIT Second half.\n", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "notes")
+    write_plan(repo, {"keep": [{"paths": ["docs/"]}], "reference": [{"file": "NOTES.md", "line": 3, "old": " SPLIT ", "new": "\n\n"}]}, ["NOTES.md"])
+    approve(repo)
+    assert docstool_json(repo, "plan", "apply", "--write")[0] == 0
+    if delete_second:
+        (repo / "NOTES.md").write_text("# Notes\n\nFirst half.\n", encoding="utf-8")
+    code, report = docstool_json(repo, "plan", "verify")
+    assert code == 1
+    assert "block-unaccounted" in {f["check"] for f in report["findings"]}
+
+
+def test_a_label_follows_a_fragment_into_a_split_section(tmp_path: Path) -> None:
+    repo = make_repo("clean", tmp_path)
+    (repo / "docs" / "old.md").write_text("# Old\n\nOld body.\n\n## Part\n\nPart body.\n", encoding="utf-8")
+    (repo / "docs" / "page.md").write_text("# Page\n\n[docs/old.md](old.md#part), [old.md](old.md#part), [old.md](old.md)\n", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "labels")
+    entries: dict[str, list[dict[str, Any]]] = {
+        "keep": [{"paths": ["docs/"]}],
+        "move": [{"from": "docs/old.md", "to": "docs/guide/new.md"}],
+        "split": [{"from": "docs/old.md", "heading": "Part", "to": "docs/part.md"}],
+    }
+    write_plan(repo, entries, ["docs/old.md", "docs/page.md"])
+    approve(repo)
+    code, report = docstool_json(repo, "plan", "apply", "--write")
+    assert code == 0, report["findings"]
+    text = (repo / "docs" / "page.md").read_text(encoding="utf-8")
+    assert "[docs/part.md](part.md#part), [part.md](part.md#part), [guide/new.md](guide/new.md)" in text
+    code, report = docstool_json(repo, "plan", "verify")
+    assert code == 0, report["findings"]
+
+
+def test_a_heading_label_after_a_multiline_reference_edit_stays(tmp_path: Path) -> None:
+    repo = make_repo("clean", tmp_path)
+    (repo / "docs" / "old.md").write_text("# Old\n\nOld body.\n", encoding="utf-8")
+    (repo / "NOTES.md").write_text("# Notes\n\nFirst. SPLIT Second.\n\n## [docs/old.md](docs/old.md)\n\nBody.\n", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "notes")
+    entries: dict[str, list[dict[str, Any]]] = {
+        "keep": [{"paths": ["docs/"]}],
+        "move": [{"from": "docs/old.md", "to": "docs/guide/new.md"}],
+        "reference": [{"file": "NOTES.md", "line": 3, "old": " SPLIT ", "new": "\n\n"}],
+    }
+    write_plan(repo, entries, ["docs/old.md", "NOTES.md"])
+    result = run_script(DOCSTOOL, "plan", "apply", "--root", str(repo))
+    assert "NOTES.md:7 (heading" in result.stdout, result.stdout
+    approve(repo)
+    assert docstool_json(repo, "plan", "apply", "--write")[0] == 0
+    assert "## [docs/old.md](docs/guide/new.md)" in (repo / "NOTES.md").read_text(encoding="utf-8")
+
+
+def test_multiline_setext_and_reference_style_labels_are_held(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = load_module("docstool_held", DOCSTOOL)
+    monkeypatch.setattr(module, "_link_rewritable", lambda _context, _rel: True)
+    context = SimpleNamespace(plan=module.Plan("plan.toml", "", {}, "."), site=module.Site())
+    moves = {"docs/old.md": "docs/guide/new.md"}
+    held: list[str] = []
+    setext = "Intro\n[old.md](old.md)\nmore\n---\n"
+    assert module._planned_lines(context, "docs/page.md", setext, moves, held) == setext
+    assert held == ["docs/page.md:2 (heading: the label sets its anchor)"]
+    held.clear()
+    reference = "See [old.md][ref].\n\n[ref]: old.md\n"
+    assert module._planned_lines(context, "docs/page.md", reference, moves, held) == reference
+    assert held == ["docs/page.md:1 (reference-style link)"]
+
+
+def test_a_moved_page_with_a_label_in_a_split_section_uses_the_new_directory(tmp_path: Path) -> None:
+    page = "# Page\n\nIntro.\n\n## Part\n\nSee [old.md](old.md).\n"
+    repo = label_repo(tmp_path, page, {"split": [{"from": "docs/page.md", "heading": "Part", "to": "docs/archive/part.md"}]})
+    assert "[../guide/new.md](../guide/new.md)" in (repo / "docs" / "archive" / "part.md").read_text(encoding="utf-8")
+    code, report = docstool_json(repo, "plan", "verify")
+    assert code == 0, report["findings"]

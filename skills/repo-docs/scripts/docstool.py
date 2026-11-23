@@ -5898,6 +5898,8 @@ RECEIPTS_NAME = "review-receipts.json"
 MAPPINGS_NAME = "mappings.toml"
 APPROVAL_RE = re.compile(r"(?m)^\[approval\][ \t]*$")
 SENSITIVE_RE = re.compile(r"\b(?:warning|caution|never|must not|do not|don't|before you|requires?)\b", re.IGNORECASE)
+REF_LABEL_RE = re.compile(r"(?<!!)\[(`?)([^\]`\n]+)\1\]\[([^\]\n]*)\]")
+LABEL_LINK_RE = re.compile(r"(?<!!)\[(`?)([^\]`\n]+)\1\]\(\s*<?([^)\s>]+)")
 LINK_DEST_RE = re.compile(
     r"(\]\(\s*<?)([^)\s>]+)|(^[ \t]{0,3}\[[^\]]+\]:[ \t]*<?)(\S+?)(?=>|\s|$)|(\b(?:href|src)\s*=\s*[\"'])([^\"']+)", re.MULTILINE
 )
@@ -6573,6 +6575,131 @@ def _promote(lines: list[str], by: int) -> list[str]:
     return out
 
 
+def _plan_moves(plan: Plan) -> dict[str, str]:
+    return {str(e["from"]): str(e["to"]) for kind in ("move", "archive") for e in plan.entries(kind) if "from" in e and "to" in e}
+
+
+def _respell_labels(line: str, old_dir: str, new_dir: str, path_map: dict[str, str], split_targets: dict[tuple[str, str], str]) -> str:
+    """The line with each link label that is exactly its own target's old path spelled with the final one."""
+    masked = mask_code_spans(line)
+
+    def swap(match: re.Match[str]) -> str:
+        whole, label, dest = match.group(0), match.group(2), match.group(3)
+        if masked[match.start()] != "[" or SCHEME_RE.match(dest):
+            return whole
+        path_part, _, fragment = dest.partition("#")
+        path = unquote(path_part)
+        resolved = normalize_path(old_dir, path) if path else None
+        if resolved is None:
+            return whole
+        # a fragment in a split section opens the split's file, wherever the rest of the page went
+        target = split_targets.get((resolved, unquote(fragment).lower())) or path_map.get(resolved)
+        if target is None or target == resolved:
+            return whole
+        if label == resolved:
+            spelled = target
+        elif label == path:
+            spelled = _relative(new_dir, target)
+        else:
+            return whole
+        begin, end = match.start(2) - match.start(), match.end(2) - match.start()
+        return whole[:begin] + spelled + whole[end:]
+
+    return LABEL_LINK_RE.sub(swap, line)
+
+
+def _reference_label_spells(line: str, doc: MarkdownDoc, old_dir: str, path_map: dict[str, str]) -> bool:
+    """Whether a reference-style link on this line has a label spelling its definition's moved path."""
+    masked = mask_code_spans(line)
+    for match in REF_LABEL_RE.finditer(line):
+        definition = doc.ref_defs.get(normalize_label(match.group(3) or match.group(2)))
+        if masked[match.start()] != "[" or definition is None or SCHEME_RE.match(definition[0]):
+            continue
+        path = unquote(definition[0].partition("#")[0])
+        resolved = normalize_path(old_dir, path) if path else None
+        if resolved in path_map and match.group(2) in (resolved, path):
+            return True
+    return False
+
+
+def _split_anchor_targets(context: PlanContext, read: Callable[[str], str | None]) -> dict[tuple[str, str], str]:
+    """(source, lowercase anchor) -> the file a [[split]] sends that heading to."""
+    out: dict[tuple[str, str], str] = {}
+    for entry in context.plan.entries("split"):
+        source, heading = str(entry.get("from")), str(entry.get("heading"))
+        text = read(source)
+        if text is None:
+            continue
+        doc = _parse_like_corpus(context, source, text)
+        if sum(h.text == heading for h in doc.headings) != 1:
+            continue
+        first, end, _ = _section_bounds(doc, heading)
+        for h in doc.headings:
+            if first < h.line <= end:
+                out[(source, h.gh_slug.lower())] = str(entry.get("to"))
+    return out
+
+
+def _parse_like_corpus(context: PlanContext, rel: str, text: str) -> MarkdownDoc:
+    site = context.site
+    return parse_markdown(rel, text, site.slug_style if site.config else None, site.config is None or "attr_list" in site.extensions)
+
+
+def _planned_lines(
+    context: PlanContext,
+    rel: str,
+    text: str,
+    path_map: dict[str, str],
+    held: list[str] | None = None,
+    split_targets: dict[tuple[str, str], str] | None = None,
+) -> str:
+    """The file after the plan's line edits: its [[reference]] entries, then the link labels that spell an old path.
+
+    A label in a heading stays: changing it would change the anchor and the heading path below it.
+    """
+    plan = context.plan
+    lines = text.split("\n")
+    for entry in plan.entries("reference"):
+        number, old, new = entry.get("line"), entry.get("old"), entry.get("new")
+        if str(entry.get("file")) == rel and isinstance(number, int) and 1 <= number <= len(lines) and isinstance(old, str) and isinstance(new, str):
+            lines[number - 1] = lines[number - 1].replace(old, new, 1)
+    split_targets = split_targets or {}
+    # a replacement may hold newlines: number the lines as the parser will
+    lines = "\n".join(lines).split("\n")
+    if not (path_map or split_targets) or not rel.endswith(MARKDOWN_EXTENSIONS) or not _link_rewritable(context, rel):
+        return "\n".join(lines)
+    doc = _parse_like_corpus(context, rel, "\n".join(lines))
+    # every physical line of a heading: a setext title may span several, up to its underline
+    heading_lines: set[int] = set()
+    for h in doc.headings:
+        last = _title_end(lines, h.line - 1)
+        heading_lines.update(range(h.line - 1, (h.line - 1 if last is None else last) + 1))
+    base = str(PurePosixPath(rel).parent)
+    default_dir = str(PurePosixPath(path_map.get(rel, rel)).parent)
+    sections = []
+    for entry in plan.entries("split"):
+        if str(entry.get("from")) == rel and sum(h.text == str(entry.get("heading")) for h in doc.headings) == 1:
+            first, end, _ = _section_bounds(doc, str(entry["heading"]))
+            sections.append((first, end, str(PurePosixPath(str(entry.get("to"))).parent)))
+    fence: tuple[str, int] | None = None
+    for index, line in enumerate(lines):
+        fence, in_code = _fence_step(fence, line)
+        if in_code:
+            continue
+        new_dir = next((d for first, end, d in sections if first <= index < end), default_dir)
+        if held is not None and _reference_label_spells(line, doc, base, path_map):
+            held.append(f"{rel}:{index + 1} (reference-style link)")
+        changed = _respell_labels(line, base, new_dir, path_map, split_targets)
+        if changed == line:
+            continue
+        if index in heading_lines:
+            if held is not None:
+                held.append(f"{rel}:{index + 1} (heading: the label sets its anchor)")
+            continue
+        lines[index] = changed
+    return "\n".join(lines)
+
+
 def preflight(context: PlanContext) -> tuple[list[dict[str, Any]], list[tuple[str, str]]]:
     """Compute every write as exact before/after bytes. Returns (operations, redirects added)."""
     repo, site, plan, corpus = context.repo, context.site, context.plan, context.corpus
@@ -6611,11 +6738,18 @@ def preflight(context: PlanContext) -> tuple[list[dict[str, Any]], list[tuple[st
         anchor_map[(str(entry["file"]), str(entry["from"]).lower())] = (path_map.get(str(entry["file"]), str(entry["file"])), str(entry["to"]))
     # line edits first: their line numbers are the original file's, which a move, an archive's
     # status line or a split would shift or take away
-    for entry in plan.entries("reference"):
-        rel = str(entry["file"])
-        lines = tree.text(rel).split("\n")
-        lines[int(entry["line"]) - 1] = lines[int(entry["line"]) - 1].replace(str(entry["old"]), str(entry["new"]), 1)
-        tree.write(rel, "\n".join(lines).encode())
+    held: list[str] = []
+    line_edited = {str(e["file"]) for e in plan.entries("reference")} | {
+        r for r in repo.files if r.endswith(MARKDOWN_EXTENSIONS) and _link_rewritable(context, r)
+    }
+    split_targets = _split_anchor_targets(context, lambda r: tree.text(r) if tree.read(r) is not None else None)
+    for rel in sorted(line_edited):
+        before = tree.text(rel)
+        after = _planned_lines(context, rel, before, path_map, held, split_targets)
+        if after != before:
+            tree.write(rel, after.encode())
+    if held:
+        context.report.data["held_labels"] = held
     # structural edits, with every Markdown file's links re-pointed
     markdown = sorted(r for r in repo.files if r.endswith(MARKDOWN_EXTENSIONS))
     split_sources = {s[0]: s for s in splits}
@@ -7246,14 +7380,14 @@ def _verify(context: PlanContext, args: argparse.Namespace) -> list[str]:
         if entry["kind"] == "rewritten":
             for digest in entry.get("blocks", []):
                 relocated[digest] = str(entry.get("to", ""))
-    expected = _reference_digests(context.plan, baseline)
+    expected = _expected_digests(context, baseline)
     used: set[int] = set()
     matched: list[int | None] = []
     for position, block in enumerate(baseline):
         digest = block["hash"]
         free = [i for i in occurrences.get(digest, []) if i not in used]
         if not free and position in expected:
-            # the block as the plan's own [[reference]] edits left it
+            # the block as the plan's own line edits left it
             digest = expected[position]
             free = [i for i in occurrences.get(digest, []) if i not in used]
         if len(free) > 1:
@@ -7343,29 +7477,46 @@ def _verify(context: PlanContext, args: argparse.Namespace) -> list[str]:
     return required
 
 
-def _reference_digests(plan: Plan, baseline: list[dict[str, Any]]) -> dict[int, str]:
-    """Baseline position -> the digest of that block after the [[reference]] edits on its lines."""
-    edits: dict[str, list[tuple[int, str, str]]] = defaultdict(list)
-    for entry in plan.entries("reference"):
-        if isinstance(entry.get("line"), int) and isinstance(entry.get("old"), str) and isinstance(entry.get("new"), str):
-            edits[str(entry.get("file"))].append((entry["line"], entry["old"], entry["new"]))
-    starts: dict[str, list[int]] = defaultdict(list)
-    for block in baseline:
-        starts[str(block["file"])].append(int(block["line"]))
-    out: dict[int, str] = {}
+def _expected_digests(context: PlanContext, baseline: list[dict[str, Any]]) -> dict[int, str]:
+    """Baseline position -> the digest of that block after the plan's own line edits.
+
+    Each file is read at the base commit, edited by the function apply uses, and parsed again. A
+    digest exists only when the edit kept every block boundary: a block split in two has no single
+    successor, so it needs a reviewed mapping.
+    """
+    plan = context.plan
+    commit = plan.meta.get("base_commit")
+    if not isinstance(commit, str) or not commit or commit.startswith("-"):
+        return {}
+    path_map = _plan_moves(plan)
+    split_targets = _split_anchor_targets(context, lambda r: git(context.repo.root, "cat-file", "blob", f"{commit}:{r}"))
+    referenced = {str(e.get("file")) for e in plan.entries("reference")}
+    by_file: dict[str, list[int]] = defaultdict(list)
     for position, block in enumerate(baseline):
-        file, first = str(block["file"]), int(block["line"])
-        if file not in edits:
+        by_file[str(block["file"])].append(position)
+    out: dict[int, str] = {}
+
+    def shape(block: Block) -> tuple[Any, ...]:
+        return (block.type, block.line, block.depth, block.position, block.info, tuple(block.heading_path))
+
+    for rel, positions in by_file.items():
+        if rel not in referenced and not ((path_map or split_targets) and _link_rewritable(context, rel)):
             continue
-        after = [s for s in starts[file] if s > first]
-        end = min(after) if after else first + 10**9  # the file's last block runs to its end
-        text = str(block["text"])
-        touched = False
-        for line, old, new in sorted(edits[file]):
-            if first <= line < end and old in text:
-                text, touched = text.replace(old, new, 1), True
-        if touched:
-            out[position] = _block_hash(Block(type=str(block["type"]), text=text, line=first, heading_path=[], info=str(block.get("info", ""))))
+        original = git(context.repo.root, "cat-file", "blob", f"{commit}:{rel}")
+        if original is None:
+            continue
+        edited = _planned_lines(context, rel, original, path_map, None, split_targets)
+        if edited == original:
+            continue
+        before, after = _parse_like_corpus(context, rel, original).blocks, _parse_like_corpus(context, rel, edited).blocks
+        if len(before) != len(positions) or [shape(b) for b in before] != [shape(b) for b in after]:
+            continue
+        if any(baseline[p]["hash"] != _block_hash(b) for p, b in zip(positions, before, strict=True)):
+            continue
+        for position, old, new in zip(positions, before, after, strict=True):
+            digest = _block_hash(new)
+            if digest != _block_hash(old):
+                out[position] = digest
     return out
 
 
@@ -7515,6 +7666,9 @@ def render_plan_text(report: Report) -> str:
     redirects = report.data.get("redirects") or []
     if redirects:
         out += [f"Redirects added ({len(redirects)}):"] + [f"  {r}" for r in redirects]
+    held = report.data.get("held_labels") or []
+    if held:
+        out += [f"Link labels that spell an old path, left for you ({len(held)}):"] + [f"  {h}" for h in held]
     return "\n".join(out) + "\n\n"
 
 
