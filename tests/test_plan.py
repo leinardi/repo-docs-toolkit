@@ -724,9 +724,7 @@ def test_rewrites_and_promotion_respect_fence_length_and_character() -> None:
 
 def test_text_dry_run_lists_operations_and_verify_names_the_unchecked_urls(tmp_path: Path) -> None:
     repo = messy(tmp_path)
-    result = subprocess.run(
-        ["python3", "-I", str(DOCSTOOL), "plan", "apply", "--root", str(repo)], capture_output=True, text=True, check=False, env=GIT_ENV
-    )
+    result = run_script(DOCSTOOL, "plan", "apply", "--root", str(repo))
     assert result.returncode == 0, result.stderr
     assert "Operations (" in result.stdout
     assert "docs/guide/release.md" in result.stdout
