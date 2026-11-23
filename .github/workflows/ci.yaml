@@ -1,6 +1,6 @@
 name: CI
 
-# The authoritative checks (pre-commit-all, test, zensical, a11y, docs-build, plugin-validate) run on every pull request, every
+# The authoritative checks (pre-commit-all, test, test-macos, zensical, a11y, docs-build, plugin-validate) run on every pull request, every
 # push to main, every dispatch and every weekly scheduled run. The reviewdog jobs only annotate pull
 # requests. ci-result is the one job that stands for all of them.
 on:
@@ -96,6 +96,30 @@ jobs:
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: ${{ matrix.python-version }}
+
+      - name: Install test dependencies
+        run: python -m pip install --disable-pip-version-check -r requirements-dev.txt
+
+      # PYTHON= on the command line makes .mk/test.mk use this interpreter instead of uv.
+      - name: Run the unit tests
+        run: make test PYTHON=python
+
+  # docstool ships to macOS users too, whose default filesystem is case-insensitive, which matters
+  # to its link and path checks. On the supported floor only.
+  test-macos:
+    runs-on: macos-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.11"
 
       - name: Install test dependencies
         run: python -m pip install --disable-pip-version-check -r requirements-dev.txt
@@ -438,6 +462,7 @@ jobs:
     needs:
       - pre-commit-all
       - test
+      - test-macos
       - zensical
       - a11y
       - docs-build

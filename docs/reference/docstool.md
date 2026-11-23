@@ -85,6 +85,7 @@ Find broken links, anchors, images, nav entries and publication problems.
 | `--built` | `DIR` |  | a docstool site-build output directory (refused when stale or not built by docstool) |
 | `--save-baseline` | `PATH` |  | write the URL and anchor baseline of --built (or, without it, a source-derived one) to this file |
 | `--baseline` | `PATH` |  | check --built against a saved URL baseline: routes, redirects, anchors |
+| `--site-planned` | flag |  | with no site config: also report links that would break once docs/ is published (changes no baseline) |
 
 Common options: `--root`, `--format`, `--out`, `--max`, `--fail-on`.
 
@@ -92,6 +93,9 @@ Common options: `--root`, `--format`, `--out`, `--max`, `--fail-on`.
 `site-build` produced. `--baseline` with `--built` then checks a new build against it: every old
 route must still be a page, or a redirect whose chain ends at one, and every old anchor must still
 exist on its destination.
+
+`--site-planned` is for a repository with no site yet. It reports links from pages that would be
+published to files outside `docs/` or under `docs/internal/`, and it never changes a saved baseline.
 
 ## site-build
 
@@ -115,13 +119,13 @@ Validate, approve, apply, resume, roll back or verify a restructure plan.
 
 | Option | Values | Default | What it does |
 | --- | --- | --- | --- |
-| `action` | `validate`, `approve`, `apply`, `resume`, `rollback`, `verify` |  | what to do with the plan (see below) |
+| `action` | `validate`, `approve`, `apply`, `resume`, `rollback`, `verify`, `mappings` |  | what to do with the plan (see below) |
 | `--plan` | `PATH` | `docs/internal/restructure/plan.toml` | the plan file |
 | `--write` | flag |  | apply: write the changes (the default is a dry run) |
 | `--by` | `NAME` |  | approve: who approves (gate G9) |
 | `--mappings` | flag |  | approve: write review receipts for mappings.toml instead of the plan approval |
-| `--urls` | `PATH` |  | verify: also check a saved URL baseline against --built |
-| `--built` | `DIR` |  | verify --urls: the new site-build output |
+| `--urls` | `PATH` |  | verify, mappings: also check a saved URL baseline (a site's needs --built) |
+| `--built` | `DIR` |  | verify or mappings with --urls: the new site-build output |
 
 Common options: `--root`, `--format`, `--out`, `--max`, `--fail-on`.
 
@@ -134,7 +138,8 @@ The actions, in the order a restructure uses them:
 | `apply` | Prints what would change; with `--write`, applies it as one journalled transaction that rolls back on failure |
 | `resume` | Finishes an interrupted apply |
 | `rollback` | Undoes an interrupted apply |
-| `verify` | Checks that every block of the baseline is accounted for, that every mapping has a valid receipt and, with `--urls` and `--built`, that old URLs still resolve |
+| `mappings` | Prints a `mappings.toml` skeleton to stdout for what is still unaccounted for; it writes no file and refuses `--out` |
+| `verify` | Checks that every block of the baseline is accounted for, that every mapping has a valid receipt and, with `--urls`, that old URLs still resolve: site routes with `--built`, GitHub paths and anchors for a baseline with no site routes |
 
 The file format is in [The plan format](plan-format.md).
 
@@ -148,9 +153,15 @@ Find commands, flags, env vars and paths the docs name that the code no longer h
 | `--base` | `REF` |  | also report tokens removed or added since this commit (read-only git diff) |
 | `--paths` | flag |  | also check repository paths quoted in inline code |
 | `--leads` | flag |  | also report status claims, hand-maintained counts and stale docs as leads |
+| `--include-records` | flag |  | also read docs/internal/restructure/ and docs/internal/history/ |
 | `--allow-partial` | flag |  | exit 0/1 even when coverage is incomplete (the summary says PARTIAL) |
 
 Common options: `--root`, `--format`, `--out`, `--max`, `--fail-on`.
+
+`drift` skips `docs/internal/restructure/` and `docs/internal/history/` unless `--include-records`
+is set, because those pages describe the past on purpose; the `records` coverage row gives the count.
+An environment variable nothing reads stays a P2 and says that dependencies were not scanned. One
+read through a traced Rust callback or forwarding function is a P3.
 
 ## site-audit
 

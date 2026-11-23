@@ -29,12 +29,15 @@ from __future__ import annotations
 import hashlib
 import json
 import subprocess
+import tomllib
 from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from conftest import DOCSTOOL, GIT_ENV, docstool_code, docstool_json, git, load_module, make_repo
+from conftest import DOCSTOOL, GIT_ENV, docstool_code, docstool_json, git, load_module, make_repo, run_script
+from test_site_build import build, prebuilt
 
 ART = "docs/internal/restructure"
 
@@ -721,9 +724,7 @@ def test_rewrites_and_promotion_respect_fence_length_and_character() -> None:
 
 def test_text_dry_run_lists_operations_and_verify_names_the_unchecked_urls(tmp_path: Path) -> None:
     repo = messy(tmp_path)
-    result = subprocess.run(
-        ["python3", "-I", str(DOCSTOOL), "plan", "apply", "--root", str(repo)], capture_output=True, text=True, check=False, env=GIT_ENV
-    )
+    result = run_script(DOCSTOOL, "plan", "apply", "--root", str(repo))
     assert result.returncode == 0, result.stderr
     assert "Operations (" in result.stdout
     assert "docs/guide/release.md" in result.stdout
@@ -757,3 +758,641 @@ def test_links_outside_the_docs_are_rewritten_only_when_declared(tmp_path: Path)
     releasing.write_text(releasing.read_text(encoding="utf-8") + "\nmore\n", encoding="utf-8")
     code, report = docstool_json(repo, "plan", "validate")
     assert ("plan-stale", "RELEASING.md") in {(f["check"], f["file"]) for f in report["findings"]}
+
+
+def reference_repo(tmp_path: Path) -> tuple[Path, str]:
+    """A plan with a [[reference]] edit outside the docs, applied; returns the repo and the block's hash."""
+    repo = make_repo("clean", tmp_path)
+    (repo / "NOTES.md").write_text("# Notes\n\nRead old/path before you start.\n", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "notes")
+    write_plan(
+        repo,
+        {"keep": [{"paths": ["docs/"]}], "reference": [{"file": "NOTES.md", "line": 3, "old": "old/path", "new": "new/path"}]},
+        ["NOTES.md"],
+    )
+    approve(repo)
+    assert docstool_json(repo, "plan", "apply", "--write")[0] == 0
+    blocks = json.loads((repo / ART / "blocks.json").read_text(encoding="utf-8"))["blocks"]
+    return repo, next(b["hash"] for b in blocks if b["file"] == "NOTES.md" and "old/path" in b["text"])
+
+
+def test_a_reviewed_mapping_covers_a_block_with_a_reference_edit(tmp_path: Path) -> None:
+    repo, digest = reference_repo(tmp_path)
+    (repo / "NOTES.md").write_text("# Notes\n\nStart by reading new/path.\n", encoding="utf-8")
+    (repo / ART / "mappings.toml").write_text(
+        f'[[rewritten]]\nid = "m1"\nblocks = ["{digest}"]\nto = "NOTES.md"\nheading = "Notes"\n', encoding="utf-8"
+    )
+    assert docstool_json(repo, "plan", "approve", "--mappings", "--by", "Owner")[0] == 0
+    code, report = docstool_json(repo, "plan", "verify")
+    assert code == 0, report["findings"]
+    (repo / ART / "review-receipts.json").write_text('{"receipts": []}', encoding="utf-8")
+    code, report = docstool_json(repo, "plan", "verify")
+    assert code == 1
+    assert {"block-unaccounted", "mapping-unreviewed"} <= {f["check"] for f in report["findings"]}
+
+
+def split_repo(tmp_path: Path, **extra: Any) -> Path:
+    repo = make_repo("clean", tmp_path)
+    (repo / "docs" / "mixed.md").write_text("# Mixed\n\nIntro.\n\n## Old notes\n\nHistory text.\n", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "mixed")
+    split = {"from": "docs/mixed.md", "heading": "Old notes", "to": "docs/internal/history/old-notes.md", **extra}
+    write_plan(repo, {"keep": [{"paths": ["docs/"]}], "split": [split]}, ["docs/mixed.md"])
+    return repo
+
+
+def test_a_split_can_write_a_status_line(tmp_path: Path) -> None:
+    repo = split_repo(tmp_path, status="Historical notes, superseded by the guide.")
+    approve(repo)
+    code, report = docstool_json(repo, "plan", "apply", "--write")
+    assert code == 0, report["findings"]
+    moved = (repo / "docs/internal/history/old-notes.md").read_text(encoding="utf-8")
+    assert moved == "# Old notes\n\n> **Status:** Historical notes, superseded by the guide.\n\nHistory text.\n"
+    assert "Status" not in (repo / "docs/mixed.md").read_text(encoding="utf-8")
+    code, report = docstool_json(repo, "plan", "verify")
+    assert not {"block-unaccounted"} & {f["check"] for f in report["findings"]}
+
+
+def test_a_split_without_status_writes_none(tmp_path: Path) -> None:
+    repo = split_repo(tmp_path)
+    approve(repo)
+    assert docstool_json(repo, "plan", "apply", "--write")[0] == 0
+    assert "Status" not in (repo / "docs/internal/history/old-notes.md").read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("status", ["", "   ", 3])
+def test_a_split_refuses_a_blank_or_non_string_status(tmp_path: Path, status: Any) -> None:
+    repo = split_repo(tmp_path, status=status)
+    code, report = docstool_json(repo, "plan", "validate")
+    assert code == 1
+    assert any(f["check"] == "plan-entry" and "status" in f["message"] for f in report["findings"])
+
+
+@pytest.mark.parametrize(
+    ("section", "expected"),
+    [
+        ("## Old notes\nHistory text.\n", "# Old notes\n\n> **Status:** Old.\n\nHistory text.\n"),
+        ("Old notes\n---\n\n```sh\n# install deps\n```\n", "Old notes\n---\n\n> **Status:** Old.\n\n```sh\n# install deps\n```\n"),
+        ("Old notes\n---\n\nHistory text.\n", "Old notes\n---\n\n> **Status:** Old.\n\nHistory text.\n"),
+        (" ## Old notes\nHistory text.\n", " ## Old notes\n\n> **Status:** Old.\n\nHistory text.\n"),
+    ],
+)
+def test_a_split_status_sits_under_the_real_title(tmp_path: Path, section: str, expected: str) -> None:
+    repo = make_repo("clean", tmp_path)
+    (repo / "docs" / "mixed.md").write_text(f"# Mixed\n\nIntro.\n\n{section}", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "mixed")
+    split = {"from": "docs/mixed.md", "heading": "Old notes", "to": "docs/internal/history/old-notes.md", "status": "Old."}
+    write_plan(repo, {"keep": [{"paths": ["docs/"]}], "split": [split]}, ["docs/mixed.md"])
+    approve(repo)
+    code, report = docstool_json(repo, "plan", "apply", "--write")
+    assert code == 0, report["findings"]
+    assert (repo / "docs/internal/history/old-notes.md").read_text(encoding="utf-8") == expected
+
+
+def test_an_archive_status_skips_a_fenced_comment_and_front_matter() -> None:
+    module = load_module("docstool_status", DOCSTOOL)
+    text = "---\ntitle: x\n# yaml comment\n---\n\nIntro.\n\n```sh\n# not a title\n```\n"
+    assert module._status_line(text, "Old.") == "---\ntitle: x\n# yaml comment\n---\n> **Status:** Old.\n\n\nIntro.\n\n```sh\n# not a title\n```\n"
+    assert module._status_line("Title\n===\nBody.\n", "Old.") == "Title\n===\n\n> **Status:** Old.\n\nBody.\n"
+
+
+def no_site_repo(tmp_path: Path) -> Path:
+    """A repository with no site config, a block baseline and a source URL baseline."""
+    repo = make_repo("clean", tmp_path)
+    (repo / "zensical.toml").unlink()
+    (repo / "docs" / "old.md").write_text("# Old\n\nIntro text.\n\n## Details\n\nBody text.\n", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "no site")
+    write_plan(repo, {"keep": [{"paths": ["docs/"]}]})
+    docstool_json(repo, "check", "--save-baseline", f"{ART}/urls.json")
+    assert json.loads((repo / ART / "urls.json").read_text(encoding="utf-8"))["routes"] == {}
+    return repo
+
+
+def verify_urls(repo: Path) -> tuple[int, dict[str, Any]]:
+    return docstool_json(repo, "plan", "verify", "--urls", f"{ART}/urls.json")
+
+
+def rows(report: dict[str, Any]) -> dict[str, str]:
+    return {r["input"]: r["state"] for r in report["coverage"]}
+
+
+def test_no_site_verify_checks_github_urls_not_site_routes(tmp_path: Path) -> None:
+    repo = no_site_repo(tmp_path)
+    code, report = verify_urls(repo)
+    assert code == 0, report["findings"]
+    assert rows(report)["url_baseline"] == "not_applicable"
+    assert rows(report)["github_urls"] == "complete"
+
+
+def test_no_site_verify_without_urls_says_github_is_unchecked(tmp_path: Path) -> None:
+    repo = no_site_repo(tmp_path)
+    code, report = docstool_json(repo, "plan", "verify")
+    assert code == 3
+    assert rows(report)["github_urls"] == "partial"
+
+
+@pytest.mark.parametrize(
+    "change",
+    [{"routes": None}, {"routes": []}, {"routes": {"a/": {"type": "page", "ids": []}}}, {"kind": "built"}],
+)
+def test_no_site_verify_refuses_any_other_baseline(tmp_path: Path, change: dict[str, Any]) -> None:
+    repo = no_site_repo(tmp_path)
+    path = repo / ART / "urls.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data.update(change)
+    path.write_text(json.dumps(data), encoding="utf-8")
+    assert docstool_code(repo, "plan", "verify", "--urls", f"{ART}/urls.json") == 2
+
+
+def test_no_site_verify_refuses_a_baseline_with_no_routes_key(tmp_path: Path) -> None:
+    repo = no_site_repo(tmp_path)
+    path = repo / ART / "urls.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    del data["routes"]
+    path.write_text(json.dumps(data), encoding="utf-8")
+    assert docstool_code(repo, "plan", "verify", "--urls", f"{ART}/urls.json") == 2
+
+
+@pytest.mark.parametrize("built", [False, True])
+@pytest.mark.parametrize("github", [None, [], {"docs/old.md": "details"}, {"docs/old.md": [1]}])
+def test_a_malformed_github_table_is_refused_with_or_without_built(tmp_path: Path, built: bool, github: Any) -> None:
+    repo = no_site_repo(tmp_path)
+    path = repo / ART / "urls.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["github"] = github
+    path.write_text(json.dumps(data), encoding="utf-8")
+    extra = ["--built", str(tmp_path / "unused")] if built else []
+    result = run_script(DOCSTOOL, "plan", "verify", "--urls", f"{ART}/urls.json", *extra, "--root", str(repo), "--format", "json")
+    assert result.returncode == 2
+    assert "github table" in result.stderr
+
+
+def test_a_site_added_later_still_compares_the_github_urls(tmp_path: Path) -> None:
+    repo = no_site_repo(tmp_path)
+    git(repo, "checkout", "-q", "HEAD~1", "--", "zensical.toml")
+    page = repo / "docs" / "old.md"
+    page.write_text(page.read_text(encoding="utf-8").replace("## Details", "## More"), encoding="utf-8")
+    prebuilt(repo, {"index.html": "<h1 id='home'>Home</h1>"})
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "site")
+    out = tmp_path / "site"
+    code, built_report = build(repo, out)
+    assert code == 0, built_report
+    code, report = docstool_json(repo, "plan", "verify", "--urls", f"{ART}/urls.json", "--built", str(out))
+    assert code == 3  # a source baseline leaves url_baseline partial
+    assert rows(report)["url_baseline"] == "partial"
+    assert rows(report)["github_urls"] == "complete"
+    assert "github-url-lost" in {f["check"] for f in report["findings"]}
+
+
+def test_a_page_loss_entry_does_not_excuse_anchors_of_a_surviving_page(tmp_path: Path) -> None:
+    repo = no_site_repo(tmp_path)
+    page = repo / "docs" / "old.md"
+    page.write_text(page.read_text(encoding="utf-8").replace("## Details", "## More"), encoding="utf-8")
+    entry = '[[github_loss]]\nid = "g1"\npath = "docs/old.md"\npage = true\nreason = "owner decision"\n'
+    (repo / ART / "mappings.toml").write_text(entry, encoding="utf-8")
+    assert docstool_json(repo, "plan", "approve", "--mappings", "--by", "Owner")[0] == 0
+    code, report = verify_urls(repo)
+    assert code == 1
+    assert "github-url-lost" in {f["check"] for f in report["findings"]}
+
+
+def test_a_page_loss_entry_accepts_a_missing_page(tmp_path: Path) -> None:
+    repo = no_site_repo(tmp_path)
+    old = repo / "docs" / "old.md"
+    (repo / "docs" / "new.md").write_text(old.read_text(encoding="utf-8"), encoding="utf-8")
+    old.unlink()
+    entry = '[[github_loss]]\nid = "g1"\npath = "docs/old.md"\npage = true\nreason = "owner moved it"\n'
+    (repo / ART / "mappings.toml").write_text(entry, encoding="utf-8")
+    assert docstool_json(repo, "plan", "approve", "--mappings", "--by", "Owner")[0] == 0
+    code, report = verify_urls(repo)
+    assert code == 0, report["findings"]
+
+
+def test_a_renamed_github_anchor_needs_a_reviewed_loss(tmp_path: Path) -> None:
+    repo = no_site_repo(tmp_path)
+    page = repo / "docs" / "old.md"
+    page.write_text(page.read_text(encoding="utf-8").replace("## Details", "## More"), encoding="utf-8")
+    code, report = verify_urls(repo)
+    assert code == 1
+    assert [f["check"] for f in report["findings"]] == ["github-url-lost"]
+    mappings = repo / ART / "mappings.toml"
+    entry = '[[github_loss]]\nid = "g1"\npath = "docs/old.md"\nanchors = ["details"]\nreason = "owner renamed it"\n'
+    mappings.write_text(entry, encoding="utf-8")
+    assert verify_urls(repo)[0] == 1  # not reviewed yet
+    assert docstool_json(repo, "plan", "approve", "--mappings", "--by", "Owner")[0] == 0
+    code, report = verify_urls(repo)
+    assert code == 0, report["findings"]
+    mappings.write_text(entry.replace("owner renamed it", "changed"), encoding="utf-8")
+    assert "receipt-invalid" in {f["check"] for f in verify_urls(repo)[1]["findings"]}
+
+
+@pytest.mark.parametrize("stub", [False, True])
+def test_a_moved_page_loses_its_github_url_even_with_a_stub(tmp_path: Path, stub: bool) -> None:
+    repo = no_site_repo(tmp_path)
+    old = repo / "docs" / "old.md"
+    (repo / "docs" / "new.md").write_text(old.read_text(encoding="utf-8"), encoding="utf-8")
+    if stub:
+        old.write_text("# Old\n\nThis page moved to [New](new.md).\n", encoding="utf-8")
+    else:
+        old.unlink()
+    code, report = verify_urls(repo)
+    assert code == 1
+    lost = [f for f in report["findings"] if f["check"] == "github-url-lost"]
+    assert len(lost) == 1
+    assert ("#details" in lost[0]["message"]) is stub
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        'path = "docs/old.md"\nanchors = ["details"]\nreason = "  "\n',
+        'path = "docs/old.md"\nreason = "x"\n',
+        'anchors = ["details"]\nreason = "x"\n',
+        'path = "docs/old.md"\npage = "yes"\nreason = "x"\n',
+    ],
+)
+def test_a_malformed_github_loss_cannot_be_approved(tmp_path: Path, entry: str) -> None:
+    repo = no_site_repo(tmp_path)
+    (repo / ART / "mappings.toml").write_text(f'[[github_loss]]\nid = "g1"\n{entry}', encoding="utf-8")
+    code, report = docstool_json(repo, "plan", "approve", "--mappings", "--by", "Owner")
+    assert code == 1
+    assert "mapping-invalid" in {f["check"] for f in report["findings"]}
+
+
+def test_a_github_loss_cannot_excuse_content(tmp_path: Path) -> None:
+    repo = no_site_repo(tmp_path)
+    blocks = json.loads((repo / ART / "blocks.json").read_text(encoding="utf-8"))["blocks"]
+    digest = next(b["hash"] for b in blocks if b["text"] == "Body text.")
+    entry = f'[[github_loss]]\nid = "g1"\nblocks = ["{digest}"]\npath = "docs/old.md"\npage = true\nreason = "x"\n'
+    (repo / ART / "mappings.toml").write_text(entry, encoding="utf-8")
+    code, report = docstool_json(repo, "plan", "approve", "--mappings", "--by", "Owner")
+    assert code == 1
+    assert "mapping-invalid" in {f["check"] for f in report["findings"]}
+
+
+def label_repo(tmp_path: Path, page: str, extra: dict[str, list[dict[str, Any]]] | None = None) -> Path:
+    repo = make_repo("clean", tmp_path)
+    (repo / "docs" / "old.md").write_text("# Old\n\nOld body.\n", encoding="utf-8")
+    (repo / "docs" / "page.md").write_text(page, encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "labels")
+    entries: dict[str, list[dict[str, Any]]] = {
+        "keep": [{"paths": ["docs/"]}],
+        "move": [{"from": "docs/old.md", "to": "docs/guide/new.md"}],
+        **(extra or {}),
+    }
+    write_plan(repo, entries, ["docs/old.md", "docs/page.md"])
+    approve(repo)
+    code, report = docstool_json(repo, "plan", "apply", "--write")
+    assert code == 0, report["findings"]
+    return repo
+
+
+def test_a_label_that_spells_the_old_path_moves_with_the_link(tmp_path: Path) -> None:
+    page = "# Page\n\nSee [`docs/old.md`](old.md), [old.md](old.md) and [the guide](old.md).\n"
+    repo = label_repo(tmp_path, page)
+    text = (repo / "docs" / "page.md").read_text(encoding="utf-8")
+    assert "[`docs/guide/new.md`](guide/new.md), [guide/new.md](guide/new.md) and [the guide](guide/new.md)" in text
+    code, report = docstool_json(repo, "plan", "verify")
+    assert code == 0, report["findings"]
+
+
+@pytest.mark.parametrize(
+    "line",
+    ["![old.md](old.md)", "[docs/old.md and more](old.md)"],
+)
+def test_other_labels_stay(tmp_path: Path, line: str) -> None:
+    repo = label_repo(tmp_path, f"# Page\n\n{line}\n")
+    text = (repo / "docs" / "page.md").read_text(encoding="utf-8")
+    assert "guide/new.md" not in text.split("](")[0]
+
+
+def test_labels_in_code_stay(monkeypatch: pytest.MonkeyPatch) -> None:
+    # validate refuses a real plan whose docs quote a moved path in code, so this calls the rewrite itself
+    module = load_module("docstool_labels", DOCSTOOL)
+    monkeypatch.setattr(module, "_link_rewritable", lambda _context, _rel: True)
+    context = SimpleNamespace(plan=module.Plan("plan.toml", "", {}, "."), site=module.Site())
+    moves = {"docs/old.md": "docs/guide/new.md"}
+    for text in ("`[old.md](old.md)` in code\n", "```md\n[old.md](old.md)\n```\n"):
+        assert module._planned_lines(context, "docs/page.md", text, moves) == text
+    assert module._planned_lines(context, "docs/page.md", "[old.md](old.md)\n", moves) == "[guide/new.md](old.md)\n"
+
+
+def test_a_heading_label_keeps_its_anchor_and_context(tmp_path: Path) -> None:
+    page = "# Page\n\n## [old.md](old.md)\n\nNever do this here.\n\nSee [page](page.md#oldmd).\n"
+    repo = label_repo(tmp_path, page)
+    text = (repo / "docs" / "page.md").read_text(encoding="utf-8")
+    assert "## [old.md](guide/new.md)" in text
+    assert "page.md#oldmd" in text or "#oldmd" in text
+    code, report = docstool_json(repo, "plan", "verify")
+    assert code == 0, report["findings"]
+
+
+def test_the_dry_run_names_heading_labels_it_leaves(tmp_path: Path) -> None:
+    repo = make_repo("clean", tmp_path)
+    (repo / "docs" / "old.md").write_text("# Old\n\nOld body.\n", encoding="utf-8")
+    (repo / "docs" / "page.md").write_text("# Page\n\n## [old.md](old.md)\n\nText.\n", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "labels")
+    write_plan(repo, {"keep": [{"paths": ["docs/"]}], "move": [{"from": "docs/old.md", "to": "docs/guide/new.md"}]}, ["docs/old.md", "docs/page.md"])
+    result = run_script(DOCSTOOL, "plan", "apply", "--root", str(repo))
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Link labels that spell an old path, left for you (1):" in result.stdout
+    assert "docs/page.md:3 (heading" in result.stdout
+
+
+def test_a_reference_edit_in_a_multiline_block_replaces_its_own_line(tmp_path: Path) -> None:
+    repo = make_repo("clean", tmp_path)
+    (repo / "NOTES.md").write_text("# Notes\n\nThe old/path stays here,\nand the old/path moves.\n", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "notes")
+    write_plan(
+        repo, {"keep": [{"paths": ["docs/"]}], "reference": [{"file": "NOTES.md", "line": 4, "old": "old/path", "new": "new/path"}]}, ["NOTES.md"]
+    )
+    approve(repo)
+    assert docstool_json(repo, "plan", "apply", "--write")[0] == 0
+    assert (repo / "NOTES.md").read_text(encoding="utf-8") == "# Notes\n\nThe old/path stays here,\nand the new/path moves.\n"
+    code, report = docstool_json(repo, "plan", "verify")
+    assert code == 0, report["findings"]
+
+
+@pytest.mark.parametrize("delete_second", [False, True])
+def test_an_edit_that_splits_a_block_has_no_expected_hash(tmp_path: Path, delete_second: bool) -> None:
+    repo = make_repo("clean", tmp_path)
+    (repo / "NOTES.md").write_text("# Notes\n\nFirst half. SPLIT Second half.\n", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "notes")
+    write_plan(repo, {"keep": [{"paths": ["docs/"]}], "reference": [{"file": "NOTES.md", "line": 3, "old": " SPLIT ", "new": "\n\n"}]}, ["NOTES.md"])
+    approve(repo)
+    assert docstool_json(repo, "plan", "apply", "--write")[0] == 0
+    if delete_second:
+        (repo / "NOTES.md").write_text("# Notes\n\nFirst half.\n", encoding="utf-8")
+    code, report = docstool_json(repo, "plan", "verify")
+    assert code == 1
+    assert "block-unaccounted" in {f["check"] for f in report["findings"]}
+
+
+def test_a_label_follows_a_fragment_into_a_split_section(tmp_path: Path) -> None:
+    repo = make_repo("clean", tmp_path)
+    (repo / "docs" / "old.md").write_text("# Old\n\nOld body.\n\n## Part\n\nPart body.\n", encoding="utf-8")
+    (repo / "docs" / "page.md").write_text("# Page\n\n[docs/old.md](old.md#part), [old.md](old.md#part), [old.md](old.md)\n", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "labels")
+    entries: dict[str, list[dict[str, Any]]] = {
+        "keep": [{"paths": ["docs/"]}],
+        "move": [{"from": "docs/old.md", "to": "docs/guide/new.md"}],
+        "split": [{"from": "docs/old.md", "heading": "Part", "to": "docs/part.md"}],
+    }
+    write_plan(repo, entries, ["docs/old.md", "docs/page.md"])
+    approve(repo)
+    code, report = docstool_json(repo, "plan", "apply", "--write")
+    assert code == 0, report["findings"]
+    text = (repo / "docs" / "page.md").read_text(encoding="utf-8")
+    assert "[docs/part.md](part.md#part), [part.md](part.md#part), [guide/new.md](guide/new.md)" in text
+    code, report = docstool_json(repo, "plan", "verify")
+    assert code == 0, report["findings"]
+
+
+def test_a_heading_label_after_a_multiline_reference_edit_stays(tmp_path: Path) -> None:
+    repo = make_repo("clean", tmp_path)
+    (repo / "docs" / "old.md").write_text("# Old\n\nOld body.\n", encoding="utf-8")
+    (repo / "NOTES.md").write_text("# Notes\n\nFirst. SPLIT Second.\n\n## [docs/old.md](docs/old.md)\n\nBody.\n", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "notes")
+    entries: dict[str, list[dict[str, Any]]] = {
+        "keep": [{"paths": ["docs/"]}],
+        "move": [{"from": "docs/old.md", "to": "docs/guide/new.md"}],
+        "reference": [{"file": "NOTES.md", "line": 3, "old": " SPLIT ", "new": "\n\n"}],
+    }
+    write_plan(repo, entries, ["docs/old.md", "NOTES.md"])
+    result = run_script(DOCSTOOL, "plan", "apply", "--root", str(repo))
+    assert "NOTES.md:7 (heading" in result.stdout, result.stdout
+    approve(repo)
+    assert docstool_json(repo, "plan", "apply", "--write")[0] == 0
+    assert "## [docs/old.md](docs/guide/new.md)" in (repo / "NOTES.md").read_text(encoding="utf-8")
+
+
+def test_multiline_setext_and_reference_style_labels_are_held(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = load_module("docstool_held", DOCSTOOL)
+    monkeypatch.setattr(module, "_link_rewritable", lambda _context, _rel: True)
+    context = SimpleNamespace(plan=module.Plan("plan.toml", "", {}, "."), site=module.Site())
+    moves = {"docs/old.md": "docs/guide/new.md"}
+    held: list[str] = []
+    setext = "Intro\n[old.md](old.md)\nmore\n---\n"
+    assert module._planned_lines(context, "docs/page.md", setext, moves, held) == setext
+    assert held == ["docs/page.md:2 (heading: the label sets its anchor)"]
+    held.clear()
+    reference = "See [old.md][ref].\n\n[ref]: old.md\n"
+    assert module._planned_lines(context, "docs/page.md", reference, moves, held) == reference
+    assert held == ["docs/page.md:1 (reference-style link)"]
+
+
+def test_a_moved_page_with_a_label_in_a_split_section_uses_the_new_directory(tmp_path: Path) -> None:
+    page = "# Page\n\nIntro.\n\n## Part\n\nSee [old.md](old.md).\n"
+    repo = label_repo(tmp_path, page, {"split": [{"from": "docs/page.md", "heading": "Part", "to": "docs/archive/part.md"}]})
+    assert "[../guide/new.md](../guide/new.md)" in (repo / "docs" / "archive" / "part.md").read_text(encoding="utf-8")
+    code, report = docstool_json(repo, "plan", "verify")
+    assert code == 0, report["findings"]
+
+
+def scaffold(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    return run_script(DOCSTOOL, "plan", "mappings", "--root", str(repo), *args)
+
+
+def repeated_repo(tmp_path: Path) -> Path:
+    repo = make_repo("clean", tmp_path)
+    (repo / "docs" / "same.md").write_text("# Same\n\nSame text.\n\nMiddle.\n\nSame text.\n", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "same")
+    write_plan(repo, {"keep": [{"paths": ["docs/"]}]})
+    return repo
+
+
+def test_block_unaccounted_names_the_hash(tmp_path: Path) -> None:
+    repo = repeated_repo(tmp_path)
+    blocks = json.loads((repo / ART / "blocks.json").read_text(encoding="utf-8"))["blocks"]
+    digest = next(b["hash"] for b in blocks if b["text"] == "Middle.")
+    (repo / "docs" / "same.md").write_text("# Same\n\nSame text.\n\nSame text.\n", encoding="utf-8")
+    _, report = docstool_json(repo, "plan", "verify")
+    finding = next(f for f in report["findings"] if f["check"] == "block-unaccounted")
+    assert f"block hash: {digest}" in finding["evidence"]
+
+
+def test_the_default_scaffold_output_is_toml_and_cannot_be_approved_unfilled(tmp_path: Path) -> None:
+    repo = repeated_repo(tmp_path)
+    (repo / "docs" / "same.md").write_text("# Same\n\nSame text.\n\nSame text.\n", encoding="utf-8")
+    result = scaffold(repo)
+    assert result.returncode == 0, result.stderr
+    data = tomllib.loads(result.stdout)
+    assert [e["to"] for e in data["rewritten"]] == [""]
+    assert not result.stdout.startswith("docstool")
+    (repo / ART / "mappings.toml").write_text(result.stdout, encoding="utf-8")
+    code, report = docstool_json(repo, "plan", "approve", "--mappings", "--by", "Owner")
+    assert code == 1
+    assert "mapping-invalid" in {f["check"] for f in report["findings"]}
+    assert not (repo / ART / "review-receipts.json").exists()
+
+
+def test_the_scaffold_keeps_a_second_missing_copy_of_a_mapped_hash(tmp_path: Path) -> None:
+    repo = repeated_repo(tmp_path)
+    blocks = json.loads((repo / ART / "blocks.json").read_text(encoding="utf-8"))["blocks"]
+    digest = next(b["hash"] for b in blocks if b["text"] == "Same text.")
+    (repo / "docs" / "same.md").write_text("# Same\n\nMiddle.\n", encoding="utf-8")
+    assert [e["blocks"] for e in tomllib.loads(scaffold(repo).stdout)["rewritten"]] == [[digest], [digest]]
+    (repo / ART / "mappings.toml").write_text(f'[[rewritten]]\nid = "m1"\nblocks = ["{digest}"]\nto = "docs/same.md"\n', encoding="utf-8")
+    entries = tomllib.loads(scaffold(repo).stdout)["rewritten"]
+    assert [e["blocks"] for e in entries] == [[digest]]
+    assert entries[0]["id"] != "m1"
+
+
+@pytest.mark.parametrize("damage", [lambda b: b.append(3), lambda b: b[0].pop("hash"), lambda b: b[0].update(line="x")])
+def test_a_damaged_baseline_gives_no_scaffold(tmp_path: Path, damage: Callable[[list[Any]], None]) -> None:
+    repo = repeated_repo(tmp_path)
+    path = repo / ART / "blocks.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    damage(data["blocks"])
+    path.write_text(json.dumps(data), encoding="utf-8")
+    result = scaffold(repo)
+    assert result.returncode == 3
+    assert result.stdout == ""
+    assert "conservation_baseline" in result.stderr
+    assert docstool_code(repo, "plan", "verify") == 3
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        b"rewritten = [1]\n",
+        b'[[rewritten]]\nid = "m1"\nblocks = 1\n',
+        b'[[rewritten]]\nid = "m1"\nblocks = "abc"\n',
+        b'[[rewritten]]\nid = "m1"\nblocks = [["a"]]\n',
+        b"# \xff not utf-8\n",
+    ],
+)
+def test_malformed_mappings_are_refused(tmp_path: Path, content: bytes) -> None:
+    repo = repeated_repo(tmp_path)
+    (repo / ART / "mappings.toml").write_bytes(content)
+    assert scaffold(repo).returncode == 2
+    assert docstool_code(repo, "plan", "verify") == 2
+
+
+@pytest.mark.parametrize("name", ["plan.toml", "blocks.json", "mappings.toml", "review-receipts.json", "new.toml"])
+def test_the_scaffold_never_writes_a_file(tmp_path: Path, name: str) -> None:
+    repo = repeated_repo(tmp_path)
+    (repo / ART / "mappings.toml").write_text("", encoding="utf-8")
+    (repo / ART / "review-receipts.json").write_text('{"receipts": []}', encoding="utf-8")
+    before = {p.name: p.read_bytes() for p in (repo / ART).iterdir()}
+    result = scaffold(repo, "--out", str(repo / ART / name))
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert {p.name: p.read_bytes() for p in (repo / ART).iterdir()} == before
+
+
+def test_the_scaffold_as_json(tmp_path: Path) -> None:
+    repo = repeated_repo(tmp_path)
+    (repo / "docs" / "same.md").write_text("# Same\n\nSame text.\n\nSame text.\n", encoding="utf-8")
+    code, report = docstool_json(repo, "plan", "mappings")
+    assert code == 0
+    assert report["findings"] == []
+    assert len(tomllib.loads(report["data"]["mappings_toml"])["rewritten"]) == 1
+
+
+def test_the_scaffold_lists_github_losses_with_urls(tmp_path: Path) -> None:
+    repo = no_site_repo(tmp_path)
+    page = repo / "docs" / "old.md"
+    page.write_text(page.read_text(encoding="utf-8").replace("## Details", "## More"), encoding="utf-8")
+    assert "GitHub URLs were not compared" in scaffold(repo).stdout
+    result = scaffold(repo, "--urls", f"{ART}/urls.json")
+    assert result.returncode == 0, result.stderr
+    losses = tomllib.loads(result.stdout)["github_loss"]
+    assert [(e["path"], e["anchors"], e["reason"]) for e in losses] == [("docs/old.md", ["details"], "")]
+    (repo / ART / "mappings.toml").write_text(result.stdout, encoding="utf-8")
+    assert docstool_json(repo, "plan", "approve", "--mappings", "--by", "Owner")[0] == 1
+    assert "github_loss" not in tomllib.loads(scaffold(repo, "--urls", f"{ART}/urls.json").stdout)
+
+
+def test_a_scaffold_comment_stays_on_one_line(tmp_path: Path) -> None:
+    repo = make_repo("clean", tmp_path)
+    (repo / "docs" / "code.md").write_text('# Code\n\n```sh\nfirst\n[[rewritten]]\nid = "x"\n```\n', encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "code")
+    write_plan(repo, {"keep": [{"paths": ["docs/"]}]})
+    (repo / "docs" / "code.md").write_text("# Code\n", encoding="utf-8")
+    entries = tomllib.loads(scaffold(repo).stdout)["rewritten"]
+    assert len(entries) == 1
+    assert entries[0]["id"] == "m1"
+
+
+def wrap_repo(tmp_path: Path, limit: int = 50, page: bytes | None = None) -> Path:
+    repo = make_repo("clean", tmp_path)
+    (repo / ".markdownlint.yaml").write_text(f"MD013:\n  line_length: {limit}\n", encoding="utf-8")
+    (repo / "docs" / "old.md").write_text("# Old\n\nBody.\n", encoding="utf-8")
+    long_before = "An old line that was already much longer than the limit, before this plan."
+    (repo / "docs" / "page.md").write_text(
+        f"# Page\n\nSee the [old page](old.md) for it all.\n\n[old page](old.md) is here and also more.\n\n{long_before}\n\n[a](old.md)\n",
+        encoding="utf-8",
+    )
+    if page is not None:
+        (repo / "docs" / "page.md").write_bytes(page)
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "wrap")
+    target = "docs/guide/some/deeply/nested/place/new.md"
+    write_plan(repo, {"keep": [{"paths": ["docs/"]}], "move": [{"from": "docs/old.md", "to": target}]}, ["docs/old.md", "docs/page.md"])
+    return repo
+
+
+def test_the_default_dry_run_shows_wrap_warnings(tmp_path: Path) -> None:
+    repo = wrap_repo(tmp_path)
+    result = run_script(DOCSTOOL, "plan", "apply", "--root", str(repo))
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Wrap warnings: apply pushes 2 lines past the markdownlint line_length (MD013 defaults" in result.stdout
+    assert "docs/page.md:3 (" in result.stdout
+    assert "docs/page.md:5 (" in result.stdout
+    assert "docs/page.md:7 (" not in result.stdout
+    assert "docs/page.md:9 (" not in result.stdout
+    capped = run_script(DOCSTOOL, "plan", "apply", "--root", str(repo), "--max", "1")
+    assert "... 1 more (raise --max or use --format json)" in capped.stdout
+    code, report = docstool_json(repo, "plan", "apply")
+    assert code == 0
+    assert len(report["data"]["wrap_warnings"]) == 2
+
+
+def wrap_lines(repo: Path) -> list[int]:
+    code, report = docstool_json(repo, "plan", "apply")
+    assert code == 0, report["findings"]
+    return [w["line"] for w in report["data"].get("wrap_warnings", [])]
+
+
+def test_wrap_warnings_follow_md013(tmp_path: Path) -> None:
+    page = (
+        "# Page\n\n"
+        "A line already well past the limit before [old page](old.md) and more.\n\n"
+        "See the [old page](old.md) for it all.\n\n"
+        "Short words then the last token [x](old.md)\n\n"
+        "[old page](old.md) [old page](old.md)\n\n"
+        "[ref]: old.md\n"
+    )
+    assert wrap_lines(wrap_repo(tmp_path, page=page.encode())) == [5]
+
+
+def test_wrap_warnings_read_crlf_files(tmp_path: Path) -> None:
+    module = load_module("docstool_wrap", DOCSTOOL)
+    (tmp_path / "page.md").write_bytes(b"```sh\r\ncode\r\n```\r\n\r\nSee the [old page](old.md) for it all.\r\n")
+    tree = module.VirtualTree(tmp_path)
+    tree.write("page.md", b"```sh\r\ncode\r\n```\r\n\r\nSee the [old page](guide/some/deeply/nested/new.md) for it all.\r\n")
+    assert [w["line"] for w in module._wrap_warnings(tree, 50, {})] == [5]
+
+
+def test_no_wrap_warnings_without_a_lint_limit(tmp_path: Path) -> None:
+    repo = wrap_repo(tmp_path)
+    (repo / ".markdownlint.yaml").unlink()
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "no lint")
+    target = "docs/guide/some/deeply/nested/place/new.md"
+    (repo / ART / "blocks.json").unlink()
+    write_plan(repo, {"keep": [{"paths": ["docs/"]}], "move": [{"from": "docs/old.md", "to": target}]}, ["docs/old.md", "docs/page.md"])
+    assert "Wrap warnings" not in run_script(DOCSTOOL, "plan", "apply", "--root", str(repo)).stdout

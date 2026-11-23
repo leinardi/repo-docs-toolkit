@@ -15,6 +15,7 @@ make test             # the unit tests
 make check            # pre-commit on every file
 make check-stage      # pre-commit on the staged files only
 make sync-vendored    # after editing skills/repo-docs/scripts/docstool.py
+make sync-pins        # after changing a pin in requirements-dev.txt
 make docs-serve       # preview the documentation site with live reload (through uv)
 make docs-verify      # the documentation site, built strict and checked with docstool (through uv)
 make validate-plugin  # needs the claude CLI

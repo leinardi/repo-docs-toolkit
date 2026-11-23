@@ -22,7 +22,8 @@ Findings:
   F2 [P1][verified] make-target-missing docs/usage.md:7: make release: no such target in Makefile or the files it includes
       fix: targets: build, lint
   F3 [P2][likely] env-unknown docs/usage.md:13: SVC_TIMEOUT is documented but nothing in the repository reads it
-      fix: remove it from the docs, or point at the code that reads it
+      evidence: dependencies were not scanned
+      fix: remove it from the docs, point at the code that reads it, or confirm that a dependency reads it
   ... 2 more (raise --max or use --format json)
 ```
 

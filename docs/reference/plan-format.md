@@ -22,7 +22,7 @@ Entries are arrays of tables. Paths are relative to the repository root.
 | --- | --- | --- |
 | `[[move]]` | `from`, `to`, optional `redirect_to` | Moves the file, rewrites links, adds a redirect when the source was published |
 | `[[archive]]` | `from`, `to`, `status`, optional `redirect_to` | A move plus the status line `> **Status:** <status>` under the title |
-| `[[split]]` | `from`, `heading`, `to` | Moves the section under a heading (which must occur once) to a new file |
+| `[[split]]` | `from`, `heading`, `to`, optional `status` | Moves the section under a heading (which must occur once) to a new file; `status` writes the status line under its title |
 | `[[merge]]` | `from` (list), `into` | Declares a merge the agent does by hand after apply |
 | `[[anchor]]` | `file`, `from`, `to` | Re-points links to `file#from` at `#to` |
 | `[[stub]]` | `path`, `target`, optional `title` | Writes a one-line "This page moved" page |
@@ -57,11 +57,25 @@ heading = "Install"
 id = "m2"
 blocks = ["<hash>"]
 proof = "exact duplicate of docs/guide/release.md:5"
+
+[[github_loss]]
+id = "m3"
+path = "docs/old.md"
+anchors = ["details"]
+reason = "the owner renamed this section"
 ```
+
+`docstool plan mappings` prints a skeleton of this file to stdout, one entry per block occurrence
+still unaccounted for. It writes no file, and an entry left with an empty `to` or `reason` cannot be
+approved.
 
 `docstool plan approve --mappings` prints each mapping's text for you to review and writes a
 receipt for it to `review-receipts.json`. Changing the mapping, its baseline blocks or its
 destination afterwards invalidates the receipt.
+
+A `[[github_loss]]` entry accepts a GitHub URL that a restructure of a repository with no site loses
+on purpose. `page = true` accepts a path that no longer exists; for a page that still exists,
+`anchors` names each lost fragment.
 
 ## An example
 

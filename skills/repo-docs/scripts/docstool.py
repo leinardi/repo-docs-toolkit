@@ -41,6 +41,7 @@ run incomplete (exit 3) instead of clean.
 from __future__ import annotations
 
 import argparse
+import difflib
 import hashlib
 import html
 import io
@@ -200,6 +201,7 @@ class Report:
     coverage: list[CoverageRow] = field(default_factory=list)
     findings: list[Finding] = field(default_factory=list)
     data: dict[str, Any] = field(default_factory=dict)
+    text_max: int = 50  # entries a text renderer lists before it says how many more there are
 
     def add(self, finding: Finding) -> None:
         self.findings.append(finding)
@@ -2465,7 +2467,16 @@ def _blob_suggestion(site: Site, repo: Repo, target: str) -> str:
     return f"link to {base.rstrip('/')}/blob/main/{target} (outside docs_dir the site cannot serve it)"
 
 
-def check_links(corpus: Corpus, report: Report, scope: set[str]) -> dict[str, int]:
+def _would_publish(site: Site, rel: str, is_dir: bool = False) -> bool:
+    """Whether a file or directory would be on a site planned for a repository that has none yet."""
+    if not site.in_docs(rel):
+        return False
+    # normalize_path strips a directory link's slash; the exclude patterns need it back
+    inner = site.docs_rel(rel) + ("/" if is_dir else "")
+    return not (inner.startswith("internal/") or DEFAULT_EXCLUDES.match(inner))
+
+
+def check_links(corpus: Corpus, report: Report, scope: set[str], planned: bool = False) -> dict[str, int]:
     repo, site = corpus.repo, corpus.site
     stats: Counter[str] = Counter()
     for rel in sorted(scope):
@@ -2535,6 +2546,31 @@ def check_links(corpus: Corpus, report: Report, scope: set[str]) -> dict[str, in
                     )
                     continue
             if not published:
+                if planned and _would_publish(site, rel):
+                    if not site.in_docs(resolved):
+                        report.add(
+                            Finding(
+                                "planned-leaves-docs",
+                                "P2",
+                                "likely",
+                                rel,
+                                link.line,
+                                f"{target} points outside {site.docs_dir}/: it works on GitHub but would break once {site.docs_dir}/ is published",
+                                suggestion=_blob_suggestion(site, repo, resolved),
+                            )
+                        )
+                    elif not _would_publish(site, resolved, resolved in repo.all_dirs):
+                        report.add(
+                            Finding(
+                                "planned-links-internal",
+                                "P2",
+                                "likely",
+                                rel,
+                                link.line,
+                                f"{target} points at {resolved}, which would not be published with the planned site",
+                                suggestion="move the fact to a page that will be published, or link to the file on GitHub",
+                            )
+                        )
                 continue
             if not site.in_docs(resolved):
                 report.add(
@@ -2787,7 +2823,9 @@ def cmd_check(args: argparse.Namespace, report: Report) -> list[str]:
     )
     scope = select_scope(corpus, args.scope)
     report.data["files_checked"] = len(scope)
-    report.data["links"] = check_links(corpus, report, scope)
+    if args.site_planned and site.config:
+        raise UsageError(f"--site-planned is for a repository with no site, and {site.config} exists")
+    report.data["links"] = check_links(corpus, report, scope, planned=args.site_planned)
     check_structure(corpus, report, scope)
     if args.scope != "repo":
         check_site(corpus, report)
@@ -3963,6 +4001,9 @@ DOCKER_ENV_RE = re.compile(r"^[ \t]*(?:ENV|ARG)[ \t]+([A-Z][A-Z0-9_]*)", re.MULT
 DOTENV_RE = re.compile(r"^[ \t]*(?:export[ \t]+)?([A-Z][A-Z0-9_]*)=", re.MULTILINE)
 # VAR=value before a command, or export VAR=value, anywhere on a shell or recipe line
 SHELL_ASSIGN_RE = re.compile(r"(?:^|[\s;&|(])(?:export[ \t]+)?([A-Z][A-Z0-9_]*)=(?!=)", re.MULTILINE)
+# Make's own variables: NAME := value (also =, ?=, += and !=) and $(NAME)
+MAKE_ASSIGN_RE = re.compile(r"^[ \t]*(?:(?:export|override)[ \t]+)*([A-Z][A-Z0-9_]*)[ \t]*(?::{1,3}=|[?+!]?=)", re.MULTILINE)
+MAKE_REF_RE = re.compile(r"(?<!\$)\$\(([A-Z][A-Z0-9_]*)\)")
 # Config loaders that map every variable under a prefix onto config keys (RUNHOLD_AUTH__MODE ->
 # auth.mode): the code never names the full variable, so it cannot be matched by name.
 # (pattern, separator): the loader joins prefix and key with the separator (viper, envconfig,
@@ -4348,9 +4389,17 @@ def env_mentions(rel: str, text: str) -> set[str]:
     """Variables a script, compose file, Dockerfile, workflow or .env sample uses or defines."""
     name = re.sub(r"\.(?:j2|jinja2?|tmpl|tpl|template|example|sample|dist)$", "", PurePosixPath(rel).name)
     found: set[str] = set()
-    if name.endswith((".sh", ".bash", ".zsh", ".mk")) or name in ("Makefile", "GNUmakefile", "justfile", "Justfile") or rel.startswith(".github/"):
+    if (
+        name.endswith((".sh", ".bash", ".zsh", ".mk"))
+        or name in ("Makefile", "GNUmakefile", "makefile", "justfile", "Justfile")
+        or rel.startswith(".github/")
+    ):
         found.update(SHELL_ENV_RE.findall(text))
         found.update(SHELL_ASSIGN_RE.findall(re.sub(r"(?m)^[ \t]*#.*$", "", text)))
+        if name.endswith(".mk") or name in ("Makefile", "GNUmakefile", "makefile"):
+            uncommented = re.sub(r"(?m)^[ \t]*#.*$", "", text)
+            found.update(MAKE_ASSIGN_RE.findall(uncommented))
+            found.update(MAKE_REF_RE.findall(uncommented))
     if re.match(r"(docker-)?compose.*\.ya?ml$", name) or name.startswith("Dockerfile") or name.endswith(".env") or ".env." in name or name == ".env":
         found.update(SHELL_ENV_RE.findall(text))
         found.update(COMPOSE_ENV_RE.findall(text))
@@ -4376,6 +4425,308 @@ def env_prefixes(rel: str, text: str) -> set[str]:
             if literal is not None:
                 found.add(literal.group(1).upper())
     return {p for p in found if len(p) > 1}
+
+
+RUST_FN_RE = re.compile(r"\bfn\s+([A-Za-z_]\w*)\s*")
+RUST_CALL_RE = re.compile(r"(?<![\w.:])((?:[A-Za-z_]\w*::)*)([A-Za-z_]\w*)(?:::<[^<>()]*>)?\s*\(")
+RUST_TEST_ITEM_RE = re.compile(r"#\[\s*(?:cfg\(\s*(?:all\(\s*)?test\b|(?:\w+::)?test\b)")
+RUST_RAW_STRING_RE = re.compile(r"b?r(#*)\"")
+RUST_CHAR_RE = re.compile(r"'(?:\\.[^']{0,8}|[^\\'\n])'")
+RUST_LOOKUP_TYPE_RE = re.compile(r"^(?:impl\s+|&\s*(?:dyn\s+)?|Box<\s*dyn\s+)*Fn(?:Mut)?\(\s*&(?:'\w+\s+)?str\s*\)\s*->\s*Option<\s*String\s*>")
+RUST_STR_TYPE_RE = re.compile(r"&(?:'\w+\s+)?str")
+RUST_CLOSURE_RE = re.compile(r"^\s*(?:move\s+)?\|\s*([A-Za-z_]\w*)\s*(?::[^|]*)?\|\s*\{?\s*(.*)$", re.DOTALL)
+
+
+@dataclass
+class _RustFn:
+    rel: str
+    name: str
+    params: list[tuple[str, str]]
+    start: int
+    end: int
+
+
+@dataclass
+class _RustCall:
+    rel: str
+    offset: int
+    args: list[str]  # the argument text, string literals kept
+    masked: list[str]  # the same arguments with string contents blanked
+    caller: _RustFn | None
+
+
+def _rust_skip(text: str, index: int) -> int:
+    """The index after the comment, string or char literal at index, or index when there is none."""
+    if text.startswith("//", index):
+        end = text.find("\n", index)
+        return len(text) if end < 0 else end
+    if text.startswith("/*", index):
+        end = text.find("*/", index + 2)
+        return len(text) if end < 0 else end + 2
+    if text[index] in "br" and (index == 0 or not (text[index - 1].isalnum() or text[index - 1] == "_")):
+        raw = RUST_RAW_STRING_RE.match(text, index)
+        if raw:
+            end = text.find('"' + raw.group(1), raw.end())
+            return len(text) if end < 0 else end + 1 + len(raw.group(1))
+    if text[index] == '"':
+        cursor = index + 1
+        while cursor < len(text) and text[cursor] != '"':
+            cursor += 2 if text[cursor] == "\\" else 1
+        return min(cursor + 1, len(text))
+    if text[index] == "'":
+        char = RUST_CHAR_RE.match(text, index)
+        return char.end() if char else index
+    return index
+
+
+def _rust_views(text: str) -> tuple[str, str]:
+    """Production code of the same length: (comments and test items blanked, string contents blanked too)."""
+    code, mask = list(text), list(text)
+    index = 0
+    while index < len(text):
+        after = _rust_skip(text, index)
+        if after == index:
+            index += 1
+            continue
+        comment = text.startswith(("//", "/*"), index)
+        for cursor in range(index, after):
+            if text[cursor] != "\n":
+                # a literal keeps one mark, so an argument that is only a string is not an empty one
+                mask[cursor] = '"' if cursor == index and not comment else " "
+                if comment:
+                    code[cursor] = " "
+        index = after
+    masked = "".join(mask)
+    if re.search(r"#!\[\s*cfg\(\s*test\b", masked):
+        return re.sub(r"[^\n]", " ", text), re.sub(r"[^\n]", " ", text)
+    position = 0
+    while (match := RUST_TEST_ITEM_RE.search(masked, position)) is not None:
+        stop = next((i for i in range(match.end(), len(masked)) if masked[i] in "{;"), len(masked) - 1)
+        end = stop
+        if masked[stop] == "{":
+            depth = 0
+            for end in range(stop, len(masked)):
+                depth += {"{": 1, "}": -1}.get(masked[end], 0)
+                if depth == 0:
+                    break
+        for cursor in range(match.start(), end + 1):
+            if text[cursor] != "\n":
+                mask[cursor] = code[cursor] = " "
+        masked = "".join(mask)
+        position = end + 1
+    return "".join(code), masked
+
+
+def _rust_split(mask: str, start: int, angles: bool = False) -> tuple[list[tuple[int, int]], int]:
+    """The spans of the comma-separated items of a list whose opener ends just before start, and its closer."""
+    items: list[tuple[int, int]] = []
+    depth, angle, begin, index = 0, 0, start, start
+    while index < len(mask):
+        char = mask[index]
+        if char in "([{":
+            depth += 1
+        elif char in ")]}":
+            if depth == 0:
+                if mask[begin:index].strip():
+                    items.append((begin, index))
+                return items, index
+            depth -= 1
+        elif angles and char == "<":
+            angle += 1
+        elif angles and char == ">" and mask[index - 1] != "-" and angle:
+            angle -= 1
+        elif not angles and char == "|" and depth == 0 and mask[begin:index].strip() in ("", "move"):
+            # a closure's parameter list: its commas do not separate call arguments
+            close = mask.find("|", index + 1)
+            index = close if close >= 0 else index
+        elif char == "," and depth == 0 and angle == 0:
+            items.append((begin, index))
+            begin = index + 1
+        index += 1
+    return items, len(mask)
+
+
+def _rust_bounds(text: str) -> dict[str, str]:
+    """Type parameter -> its bound, from a generics list or a where clause."""
+    sentinel = text + ")"
+    found = {}
+    for begin, end in _rust_split(sentinel, 0, angles=True)[0]:
+        name, _, bound = sentinel[begin:end].partition(":")
+        if bound.strip():
+            found[name.strip()] = " ".join(bound.split())
+    return found
+
+
+def _rust_functions(rel: str, mask: str) -> list[_RustFn]:
+    out = []
+    for match in RUST_FN_RE.finditer(mask):
+        index, generics = match.end(), ""
+        if mask[index : index + 1] == "<":
+            depth, cursor = 0, index
+            while cursor < len(mask):
+                if mask[cursor] == "<":
+                    depth += 1
+                elif mask[cursor] == ">" and mask[cursor - 1] != "-":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                cursor += 1
+            generics = mask[index + 1 : cursor]
+            index = cursor + 1
+            while index < len(mask) and mask[index].isspace():
+                index += 1
+        if mask[index : index + 1] != "(":
+            continue
+        raw, close = _rust_split(mask, index + 1, angles=True)
+        tail = close + 1
+        while tail < len(mask) and mask[tail] not in ";{":
+            tail += 1
+        bounds = {**_rust_bounds(generics), **_rust_bounds(mask[close + 1 : tail].partition("where")[2])}
+        params = []
+        for begin, end in raw:
+            name, _, kind = mask[begin:end].partition(":")
+            kind = " ".join(kind.split())
+            params.append((re.sub(r"^\s*(?:mut\s+)?", "", name).strip(), bounds.get(kind.lstrip("& "), kind)))
+        if tail < len(mask) and mask[tail] == "{":
+            _, end = _rust_split(mask, tail + 1)
+            out.append(_RustFn(rel, match.group(1), params, tail + 1, end))
+    return out
+
+
+def _forwards_to_env(body: str, name: str) -> bool:
+    return re.search(rf"\benv::var(?:_os)?\(\s*&?{re.escape(name)}\s*\)", body) is not None
+
+
+def _rebinds(body: str, name: str) -> bool:
+    return re.search(rf"\blet\s+(?:mut\s+)?{re.escape(name)}\b", body) is not None
+
+
+def _rust_path_is(segments: list[str], function: _RustFn) -> bool:
+    """Whether a call's path can name this function: no path, a local root, or the function's module."""
+    if not segments or segments[-1] in ("crate", "self", "super"):
+        return True
+    path = PurePosixPath(function.rel)
+    return segments[-1] == (path.parent.name if path.stem == "mod" else path.stem)
+
+
+def _imports_other(mask: str, name: str, function: _RustFn) -> bool:
+    """Whether a use statement brings in a different item under this name."""
+    for statement in re.findall(r"\buse\s+([^;]+);", mask):
+        found = re.search(rf"\b{re.escape(name)}\b", statement)
+        if found:
+            before = statement[: found.start()]
+            before = before.rpartition("{")[0] if "{" in before else before
+            if not _rust_path_is(re.findall(r"[A-Za-z_]\w*", before), function):
+                return True
+    return False
+
+
+def rust_env_lookups(repo: Repo) -> dict[str, str]:
+    """Variables production Rust reads through a traced env callback or forwarding function -> where."""
+    codes: dict[str, str] = {}
+    masks: dict[str, str] = {}
+    for rel in repo.files:
+        if rel.endswith(".rs") and not _is_test_path(rel):
+            codes[rel], masks[rel] = _rust_views(repo.text(rel)[0] or "")
+    by_name: dict[str, list[_RustFn]] = defaultdict(list)
+    in_file: dict[str, list[_RustFn]] = defaultdict(list)
+    for rel, mask in masks.items():
+        for function in _rust_functions(rel, mask):
+            by_name[function.name].append(function)
+            in_file[rel].append(function)
+    # an ambiguous name or a method cannot be tied to its call sites
+    targets = {
+        name: found[0]
+        for name, found in by_name.items()
+        if len(found) == 1 and not any(p[0].lstrip("&").split()[-1:] == ["self"] for p in found[0].params)
+    }
+
+    def body(function: _RustFn) -> str:
+        return masks[function.rel][function.start : function.end]
+
+    calls: dict[str, list[_RustCall]] = defaultdict(list)
+    for rel, mask in masks.items():
+        for match in RUST_CALL_RE.finditer(mask):
+            name = match.group(2)
+            if name not in targets or re.search(r"\bfn\s+$", mask[max(0, match.start() - 8) : match.start()]):
+                continue
+            segments = [s for s in match.group(1).split("::") if s]
+            if not _rust_path_is(segments, targets[name]) or (not segments and _imports_other(mask, name, targets[name])):
+                continue
+            around = [f for f in in_file[rel] if f.start <= match.start() < f.end]
+            caller = max(around, key=lambda f: f.start) if around else None
+            if caller is not None and (_rebinds(body(caller), name) or name in [p[0] for p in caller.params]):
+                continue  # a local of the same name
+            spans = _rust_split(mask, match.end())[0]
+            calls[name].append(_RustCall(rel, match.start(), [codes[rel][a:b] for a, b in spans], [mask[a:b] for a, b in spans], caller))
+    candidates = {
+        (name, index)
+        for name, function in targets.items()
+        for index, (param, kind) in enumerate(function.params)
+        if RUST_LOOKUP_TYPE_RE.match(kind) and not _rebinds(body(function), param)
+    }
+    backed: set[tuple[str, int]] = set()
+
+    def is_backed(call: _RustCall, param: str) -> bool:
+        if call.caller is None or targets.get(call.caller.name) is not call.caller:
+            return False
+        names = [p[0] for p in call.caller.params]
+        return param in names and (call.caller.name, names.index(param)) in backed
+
+    def site_is_env(call: _RustCall, index: int) -> bool:
+        if index >= len(call.masked):
+            return False
+        closure = RUST_CLOSURE_RE.match(call.masked[index])
+        if closure:
+            key, rest = closure.group(1), closure.group(2)
+            if re.match(rf"(?:std::)?env::var(?:_os)?\(\s*&?{re.escape(key)}\s*\)", rest):
+                return True
+            forwarded = re.match(rf"([A-Za-z_]\w*)\(\s*&?{re.escape(key)}\s*\)", rest)
+            return forwarded is not None and is_backed(call, forwarded.group(1))
+        ident = re.fullmatch(r"\s*&?\s*([A-Za-z_]\w*)\s*", call.masked[index])
+        return ident is not None and is_backed(call, ident.group(1))
+
+    changed = True
+    while changed:
+        changed = False
+        for key in sorted(candidates - backed):
+            sites = calls.get(key[0], [])
+            if sites and all(site_is_env(call, key[1]) for call in sites):
+                backed.add(key)
+                changed = True
+    declared: dict[str, dict[str, str]] = {}
+
+    def value_of(rel: str, argument: str) -> str | None:
+        literal = re.fullmatch(r'\s*"([A-Z][A-Z0-9_]*)"\s*', argument)
+        return literal.group(1) if literal else resolve_env_argument(repo, rel, argument, declared)
+
+    found: dict[str, str] = {}
+    for name, index in sorted(backed):
+        function = targets[name]
+        param = function.params[index][0]
+        mask = masks[function.rel]
+        for match in re.finditer(rf"(?<![\w.:]){re.escape(param)}\s*\(", body(function)):
+            spans = _rust_split(mask, function.start + match.end())[0]
+            value = value_of(function.rel, codes[function.rel][spans[0][0] : spans[0][1]]) if spans else None
+            if value:
+                line = mask.count("\n", 0, function.start + match.start()) + 1
+                found.setdefault(value, f"{function.rel}:{line} through the env lookup {param}")
+    for name, function in sorted(targets.items()):
+        for index, (param, kind) in enumerate(function.params):
+            if not RUST_STR_TYPE_RE.fullmatch(kind) or not _forwards_to_env(body(function), param) or _rebinds(body(function), param):
+                continue
+            for call in calls.get(name, []):
+                value = value_of(call.rel, call.args[index]) if index < len(call.args) else None
+                if value:
+                    line = masks[call.rel].count("\n", 0, call.offset) + 1
+                    found.setdefault(value, f"{call.rel}:{line} through {name}, which reads the environment")
+    return found
+
+
+def _is_record(site: Site, rel: str) -> bool:
+    """A restructure record or an archived page: it describes the past on purpose."""
+    prefix = "" if site.docs_dir == "." else site.docs_dir + "/"
+    return rel.startswith((f"{prefix}internal/restructure/", f"{prefix}internal/history/"))
 
 
 def _implicit_env(name: str) -> bool:
@@ -4440,7 +4791,12 @@ def cmd_drift(args: argparse.Namespace, report: Report) -> list[str]:
     report.coverage.append(
         CoverageRow("markdown", "partial" if corpus.unreadable else "complete", ", ".join(corpus.unreadable) or f"{len(corpus.docs)} files")
     )
-    scope = select_scope(corpus, args.scope)
+    records = set() if args.include_records else {r for r in corpus.docs if _is_record(site, r)}
+    scope = select_scope(corpus, args.scope) - records
+    if records:
+        report.coverage.append(
+            CoverageRow("records", "complete", f"{len(records)} restructure and history records not read; --include-records reads them")
+        )
     binaries = project_binaries(repo)
     # Definitions in the code
     makefiles = {r: None for r in repo.files if PurePosixPath(r).name in ("Makefile", "GNUmakefile", "makefile") and not _is_test_path(r)}
@@ -4572,6 +4928,7 @@ def cmd_drift(args: argparse.Namespace, report: Report) -> list[str]:
                     make_confidence,
                     add,
                 )
+    lookups: dict[str, str] | None = None
     for name, (rel, number) in sorted(documented_env.items()):
         if name in readers or name in mentioned or _implicit_env(name):
             continue
@@ -4588,6 +4945,21 @@ def cmd_drift(args: argparse.Namespace, report: Report) -> list[str]:
                     suggestion="check the key it maps to against the config type the loader fills",
                 )
             )
+            continue
+        if lookups is None:
+            lookups = rust_env_lookups(repo)
+        if name in lookups:
+            add(
+                Finding(
+                    "env-unknown",
+                    "P3",
+                    "unverified",
+                    rel,
+                    number,
+                    f"{name} is read indirectly, at {lookups[name]}",
+                    suggestion="check that the docs match that read",
+                )
+            )
         else:
             add(
                 Finding(
@@ -4597,10 +4969,11 @@ def cmd_drift(args: argparse.Namespace, report: Report) -> list[str]:
                     rel,
                     number,
                     f"{name} is documented but nothing in the repository reads it",
-                    suggestion="remove it from the docs, or point at the code that reads it",
+                    ["dependencies were not scanned"],
+                    "remove it from the docs, point at the code that reads it, or confirm that a dependency reads it",
                 )
             )
-    all_text = "\n".join("\n".join(d.lines) for d in corpus.docs.values())
+    all_text = "\n".join("\n".join(d.lines) for r, d in corpus.docs.items() if r not in records)
     for name, files in sorted(readers.items()):
         if not _implicit_env(name) and not re.search(rf"(?<![\w]){re.escape(name)}(?![\w])", all_text):
             add(
@@ -4632,7 +5005,7 @@ def cmd_drift(args: argparse.Namespace, report: Report) -> list[str]:
                 )
             )
     if args.base:
-        _base_drift(args.base, repo, corpus, models, flags, readers, add)
+        _base_drift(args.base, repo, corpus, models, flags, readers, add, records)
         # a removed flag still documented is one problem, not also an unknown flag on the same line
         removed = {(f.file, f.line, f.message.split(" ")[0]) for f in report.findings if f.check == "removed-still-documented"}
         report.findings = [f for f in report.findings if not (f.check == "flag-unknown" and (f.file, f.line, _first_flag(f.message)) in removed)]
@@ -4829,6 +5202,7 @@ NOT_A_PATH_RE = re.compile(
 def _check_paths(corpus: Corpus, scope: set[str], repo: Repo, add: Callable[[Finding], None]) -> None:
     basenames = {PurePosixPath(f).name for f in repo.files}
     top_level = {f.split("/", 1)[0] for f in repo.files}
+    known = set(repo.files) | set(repo.all_dirs)
     for rel in sorted(scope):
         doc = corpus.docs[rel]
         base_dir = str(PurePosixPath(rel).parent)
@@ -4844,6 +5218,22 @@ def _check_paths(corpus: Corpus, scope: set[str], repo: Repo, add: Callable[[Fin
                 # a bare file name: a path only when no file of that name exists anywhere
                 if target not in basenames:
                     add(Finding("path-missing", "P3", "unverified", rel, number, f"{span}: no file of that name in the repository"))
+                continue
+            # a span that starts at an existing directory is anchored there: a deeper twin is not what it meant
+            anchored = target.split("/", 1)[0] in top_level or repo.exists(normalize_path(base_dir, target.split("/", 1)[0]) or "")
+            ends = [] if anchored else [p for p in known if p.endswith("/" + target)]
+            if len(ends) == 1:
+                add(
+                    Finding(
+                        "path-missing",
+                        "P3",
+                        "unverified",
+                        rel,
+                        number,
+                        f"{span}: a partial path; the only match is {ends[0]}",
+                        suggestion=f"use {ends[0]}",
+                    )
+                )
                 continue
             first = target.split("/", 1)[0]
             # a renamed top-level directory is drift too: a span that ends in a file name or a / names a path
@@ -4986,6 +5376,7 @@ def _base_drift(
     flags: dict[str, set[str]],
     readers: dict[str, list[str]],
     add: Callable[[Finding], None],
+    records: set[str],
 ) -> None:
     removed: dict[tuple[str, str], str] = {}
     added: dict[tuple[str, str], str] = {}
@@ -5004,6 +5395,8 @@ def _base_drift(
             added.pop(token, None)
     for (kind, value), source in sorted(removed.items()):
         for rel, doc in sorted(corpus.docs.items()):
+            if rel in records:
+                continue
             for number, line in enumerate(doc.lines, 1):
                 pattern = rf"\bmake\b[^\n`]*\s{re.escape(value)}\b" if kind == "make" else rf"(?<![\w-]){re.escape(value)}(?![\w-])"
                 if re.search(pattern, line):
@@ -5018,7 +5411,7 @@ def _base_drift(
                             [f"{source}: removed"],
                         )
                     )
-    all_text = "\n".join("\n".join(d.lines) for d in corpus.docs.values())
+    all_text = "\n".join("\n".join(d.lines) for r, d in corpus.docs.items() if r not in records)
     for (kind, value), source in sorted(added.items()):
         if not re.search(rf"(?<![\w-]){re.escape(value)}(?![\w-])", all_text):
             add(
@@ -5498,7 +5891,7 @@ def compare_url_baseline(baseline: dict[str, Any], new: dict[str, Any], report: 
 
 PLAN_SCHEMA = 1
 PLAN_TYPES = ("move", "archive", "split", "merge", "anchor", "reference", "freeze", "keep", "stub", "delete", "decision")
-MAPPING_TYPES = ("rewritten", "dropped")
+MAPPING_TYPES = ("rewritten", "dropped", "github_loss")
 JOURNAL_NAME = ".apply-journal.json"
 LOG_NAME = "apply-log.json"
 STAGING_NAME = ".staging"
@@ -5507,6 +5900,8 @@ RECEIPTS_NAME = "review-receipts.json"
 MAPPINGS_NAME = "mappings.toml"
 APPROVAL_RE = re.compile(r"(?m)^\[approval\][ \t]*$")
 SENSITIVE_RE = re.compile(r"\b(?:warning|caution|never|must not|do not|don't|before you|requires?)\b", re.IGNORECASE)
+REF_LABEL_RE = re.compile(r"(?<!!)\[(`?)([^\]`\n]+)\1\]\[([^\]\n]*)\]")
+LABEL_LINK_RE = re.compile(r"(?<!!)\[(`?)([^\]`\n]+)\1\]\(\s*<?([^)\s>]+)")
 LINK_DEST_RE = re.compile(
     r"(\]\(\s*<?)([^)\s>]+)|(^[ \t]{0,3}\[[^\]]+\]:[ \t]*<?)(\S+?)(?=>|\s|$)|(\b(?:href|src)\s*=\s*[\"'])([^\"']+)", re.MULTILINE
 )
@@ -5612,6 +6007,10 @@ class PlanContext:
             )
         )
         self.plan = load_plan(self.repo, _plan_rel(self.repo, str(args.plan)))
+        # what verify found, for the mappings scaffold
+        self.baseline: list[dict[str, Any]] | None = None
+        self.unmatched: list[int] = []  # baseline positions with no block left, one per occurrence
+        self.github_lost: list[tuple[str, bool, list[str]]] = []  # (path, whole page, anchors)
 
     def couplings(self) -> list[dict[str, Any]]:
         if not hasattr(self, "_couplings"):
@@ -5817,6 +6216,8 @@ def _validate_entries(context: PlanContext, couplings: list[dict[str, Any]]) -> 
             matches = [h for h in corpus.docs[source].headings if h.text == heading] if source in corpus.docs else []
             if len(matches) != 1:
                 error("plan-entry", f"split {source}: heading {heading!r} occurs {len(matches)} times; it must occur once")
+        if "status" in entry and not (isinstance(entry["status"], str) and entry["status"].strip()):
+            error("plan-entry", f"split {source}: status must be a non-empty string when present")
         claim(target, "split target")
     for entry in plan.entries("merge"):
         sources, into = _paths_of(entry, "from"), str(entry.get("into", ""))
@@ -6111,7 +6512,19 @@ def _rewrite_one(
     return prefix + rebuilt + ("#" + new_fragment if new_fragment else hash_mark)
 
 
-def _status_line(text: str, status: str, width: int = 100) -> str:
+def _title_end(lines: list[str], start: int) -> int | None:
+    """The index of the last line of a title that opens at start (an ATX line or a setext underline)."""
+    if ATX_RE.match(lines[start]):
+        return start
+    for index in range(start + 1, len(lines)):
+        if not lines[index].strip():
+            return None
+        if re.fullmatch(r" {0,3}(?:=+|-+)[ \t]*", lines[index]):
+            return index
+    return None
+
+
+def _status_line(text: str, status: str, width: int = 100, title_at: int | None = None) -> str:
     """The text with a status quote under its title, wrapped to the repository's line width."""
     lines = text.split("\n")
     # a wrapped line must not start like a list item, a heading or a quote: that would be structure
@@ -6124,11 +6537,27 @@ def _status_line(text: str, status: str, width: int = 100) -> str:
     else:
         wrapped = [f"**Status:** {status}"]
     note = "\n".join(f"> {part}" for part in wrapped)
-    for index, line in enumerate(lines):
-        heading = ATX_RE.match(line)
-        if heading and len(heading.group(1)) == 1:
-            return "\n".join([*lines[: index + 1], "", note, *lines[index + 1 :]])
-    return "\n".join([note, "", *lines])
+    body = 0
+    if lines[0].strip() == "---":
+        body = next((i + 1 for i in range(1, len(lines)) if lines[i].strip() in ("---", "...")), 0)
+    end = _title_end(lines, title_at) if title_at is not None else None
+    if end is None:
+        fence: tuple[str, int] | None = None
+        for index in range(body, len(lines)):
+            fence, in_code = _fence_step(fence, lines[index])
+            if in_code or not lines[index].strip():
+                continue
+            heading = ATX_RE.match(lines[index])
+            underline = index + 1 < len(lines) and re.fullmatch(r" {0,3}=+[ \t]*", lines[index + 1])
+            if (heading and len(heading.group(1)) == 1) or (not heading and underline):
+                end = index + 1 if underline and not heading else index
+                break
+    if end is None:
+        return "\n".join([*lines[:body], note, "", *lines[body:]])
+    rest = lines[end + 1 :]
+    # a line directly under the quote would be its lazy continuation in CommonMark
+    gap = [""] if rest and rest[0].strip() else []
+    return "\n".join([*lines[: end + 1], "", note, *gap, *rest])
 
 
 def _section_bounds(doc: MarkdownDoc, heading: str) -> tuple[int, int, int]:
@@ -6152,6 +6581,131 @@ def _promote(lines: list[str], by: int) -> list[str]:
     return out
 
 
+def _plan_moves(plan: Plan) -> dict[str, str]:
+    return {str(e["from"]): str(e["to"]) for kind in ("move", "archive") for e in plan.entries(kind) if "from" in e and "to" in e}
+
+
+def _respell_labels(line: str, old_dir: str, new_dir: str, path_map: dict[str, str], split_targets: dict[tuple[str, str], str]) -> str:
+    """The line with each link label that is exactly its own target's old path spelled with the final one."""
+    masked = mask_code_spans(line)
+
+    def swap(match: re.Match[str]) -> str:
+        whole, label, dest = match.group(0), match.group(2), match.group(3)
+        if masked[match.start()] != "[" or SCHEME_RE.match(dest):
+            return whole
+        path_part, _, fragment = dest.partition("#")
+        path = unquote(path_part)
+        resolved = normalize_path(old_dir, path) if path else None
+        if resolved is None:
+            return whole
+        # a fragment in a split section opens the split's file, wherever the rest of the page went
+        target = split_targets.get((resolved, unquote(fragment).lower())) or path_map.get(resolved)
+        if target is None or target == resolved:
+            return whole
+        if label == resolved:
+            spelled = target
+        elif label == path:
+            spelled = _relative(new_dir, target)
+        else:
+            return whole
+        begin, end = match.start(2) - match.start(), match.end(2) - match.start()
+        return whole[:begin] + spelled + whole[end:]
+
+    return LABEL_LINK_RE.sub(swap, line)
+
+
+def _reference_label_spells(line: str, doc: MarkdownDoc, old_dir: str, path_map: dict[str, str]) -> bool:
+    """Whether a reference-style link on this line has a label spelling its definition's moved path."""
+    masked = mask_code_spans(line)
+    for match in REF_LABEL_RE.finditer(line):
+        definition = doc.ref_defs.get(normalize_label(match.group(3) or match.group(2)))
+        if masked[match.start()] != "[" or definition is None or SCHEME_RE.match(definition[0]):
+            continue
+        path = unquote(definition[0].partition("#")[0])
+        resolved = normalize_path(old_dir, path) if path else None
+        if resolved in path_map and match.group(2) in (resolved, path):
+            return True
+    return False
+
+
+def _split_anchor_targets(context: PlanContext, read: Callable[[str], str | None]) -> dict[tuple[str, str], str]:
+    """(source, lowercase anchor) -> the file a [[split]] sends that heading to."""
+    out: dict[tuple[str, str], str] = {}
+    for entry in context.plan.entries("split"):
+        source, heading = str(entry.get("from")), str(entry.get("heading"))
+        text = read(source)
+        if text is None:
+            continue
+        doc = _parse_like_corpus(context, source, text)
+        if sum(h.text == heading for h in doc.headings) != 1:
+            continue
+        first, end, _ = _section_bounds(doc, heading)
+        for h in doc.headings:
+            if first < h.line <= end:
+                out[(source, h.gh_slug.lower())] = str(entry.get("to"))
+    return out
+
+
+def _parse_like_corpus(context: PlanContext, rel: str, text: str) -> MarkdownDoc:
+    site = context.site
+    return parse_markdown(rel, text, site.slug_style if site.config else None, site.config is None or "attr_list" in site.extensions)
+
+
+def _planned_lines(
+    context: PlanContext,
+    rel: str,
+    text: str,
+    path_map: dict[str, str],
+    held: list[str] | None = None,
+    split_targets: dict[tuple[str, str], str] | None = None,
+) -> str:
+    """The file after the plan's line edits: its [[reference]] entries, then the link labels that spell an old path.
+
+    A label in a heading stays: changing it would change the anchor and the heading path below it.
+    """
+    plan = context.plan
+    lines = text.split("\n")
+    for entry in plan.entries("reference"):
+        number, old, new = entry.get("line"), entry.get("old"), entry.get("new")
+        if str(entry.get("file")) == rel and isinstance(number, int) and 1 <= number <= len(lines) and isinstance(old, str) and isinstance(new, str):
+            lines[number - 1] = lines[number - 1].replace(old, new, 1)
+    split_targets = split_targets or {}
+    # a replacement may hold newlines: number the lines as the parser will
+    lines = "\n".join(lines).split("\n")
+    if not (path_map or split_targets) or not rel.endswith(MARKDOWN_EXTENSIONS) or not _link_rewritable(context, rel):
+        return "\n".join(lines)
+    doc = _parse_like_corpus(context, rel, "\n".join(lines))
+    # every physical line of a heading: a setext title may span several, up to its underline
+    heading_lines: set[int] = set()
+    for h in doc.headings:
+        last = _title_end(lines, h.line - 1)
+        heading_lines.update(range(h.line - 1, (h.line - 1 if last is None else last) + 1))
+    base = str(PurePosixPath(rel).parent)
+    default_dir = str(PurePosixPath(path_map.get(rel, rel)).parent)
+    sections = []
+    for entry in plan.entries("split"):
+        if str(entry.get("from")) == rel and sum(h.text == str(entry.get("heading")) for h in doc.headings) == 1:
+            first, end, _ = _section_bounds(doc, str(entry["heading"]))
+            sections.append((first, end, str(PurePosixPath(str(entry.get("to"))).parent)))
+    fence: tuple[str, int] | None = None
+    for index, line in enumerate(lines):
+        fence, in_code = _fence_step(fence, line)
+        if in_code:
+            continue
+        new_dir = next((d for first, end, d in sections if first <= index < end), default_dir)
+        if held is not None and _reference_label_spells(line, doc, base, path_map):
+            held.append(f"{rel}:{index + 1} (reference-style link)")
+        changed = _respell_labels(line, base, new_dir, path_map, split_targets)
+        if changed == line:
+            continue
+        if index in heading_lines:
+            if held is not None:
+                held.append(f"{rel}:{index + 1} (heading: the label sets its anchor)")
+            continue
+        lines[index] = changed
+    return "\n".join(lines)
+
+
 def preflight(context: PlanContext) -> tuple[list[dict[str, Any]], list[tuple[str, str]]]:
     """Compute every write as exact before/after bytes. Returns (operations, redirects added)."""
     repo, site, plan, corpus = context.repo, context.site, context.plan, context.corpus
@@ -6161,7 +6715,8 @@ def preflight(context: PlanContext) -> tuple[list[dict[str, Any]], list[tuple[st
     redirects: list[tuple[str, str]] = []
     status_of: dict[str, str] = {}
     # a status line wraps where the repository's Markdown lint does, else at its usual width
-    wrap_width = tooling_census(repo).get("markdown_wrap") or house_style(corpus)["wrap_p95"] or 100
+    lint_wrap = tooling_census(repo).get("markdown_wrap")
+    wrap_width = lint_wrap or house_style(corpus)["wrap_p95"] or 100
     for kind in ("move", "archive"):
         for entry in plan.entries(kind):
             source, target = str(entry["from"]), str(entry["to"])
@@ -6172,6 +6727,7 @@ def preflight(context: PlanContext) -> tuple[list[dict[str, Any]], list[tuple[st
             if site.config and site.published(source) and site.published(landing):
                 redirects.append((site.docs_rel(source), site.docs_rel(landing)))
     splits = []
+    split_status: dict[str, str] = {}
     for entry in plan.entries("split"):
         source, heading, target = str(entry["from"]), str(entry["heading"]), str(entry["to"])
         doc = corpus.docs[source]
@@ -6180,6 +6736,8 @@ def preflight(context: PlanContext) -> tuple[list[dict[str, Any]], list[tuple[st
         for h in section_headings:
             anchor_map[(source, h.gh_slug.lower())] = (target, h.gh_slug)
         splits.append((source, heading, target, first, end, level, {h.gh_slug.lower() for h in section_headings}))
+        if "status" in entry:
+            split_status[target] = str(entry["status"])
         if site.config and site.published(source) and site.kind == "zensical":
             for h in section_headings:
                 redirects.append((f"{site.docs_rel(source)}#{h.site_slug}", f"{site.docs_rel(target)}#{h.site_slug}"))
@@ -6187,11 +6745,18 @@ def preflight(context: PlanContext) -> tuple[list[dict[str, Any]], list[tuple[st
         anchor_map[(str(entry["file"]), str(entry["from"]).lower())] = (path_map.get(str(entry["file"]), str(entry["file"])), str(entry["to"]))
     # line edits first: their line numbers are the original file's, which a move, an archive's
     # status line or a split would shift or take away
-    for entry in plan.entries("reference"):
-        rel = str(entry["file"])
-        lines = tree.text(rel).split("\n")
-        lines[int(entry["line"]) - 1] = lines[int(entry["line"]) - 1].replace(str(entry["old"]), str(entry["new"]), 1)
-        tree.write(rel, "\n".join(lines).encode())
+    held: list[str] = []
+    line_edited = {str(e["file"]) for e in plan.entries("reference")} | {
+        r for r in repo.files if r.endswith(MARKDOWN_EXTENSIONS) and _link_rewritable(context, r)
+    }
+    split_targets = _split_anchor_targets(context, lambda r: tree.text(r) if tree.read(r) is not None else None)
+    for rel in sorted(line_edited):
+        before = tree.text(rel)
+        after = _planned_lines(context, rel, before, path_map, held, split_targets)
+        if after != before:
+            tree.write(rel, after.encode())
+    if held:
+        context.report.data["held_labels"] = held
     # structural edits, with every Markdown file's links re-pointed
     markdown = sorted(r for r in repo.files if r.endswith(MARKDOWN_EXTENSIONS))
     split_sources = {s[0]: s for s in splits}
@@ -6210,6 +6775,8 @@ def preflight(context: PlanContext) -> tuple[list[dict[str, Any]], list[tuple[st
             moved_text = _rewrite_links(
                 moved_text, str(PurePosixPath(rel).parent), str(PurePosixPath(target).parent), rel, target, path_map, {}, inner
             )
+            if target in split_status:
+                moved_text = _status_line(moved_text, split_status[target], wrap_width, title_at=0)
             tree.write(target, moved_text.encode())
             text = remaining
         rewritten = _rewrite_links(text, str(PurePosixPath(rel).parent), str(PurePosixPath(new_rel).parent), rel, new_rel, path_map, anchor_map)
@@ -6228,7 +6795,44 @@ def preflight(context: PlanContext) -> tuple[list[dict[str, Any]], list[tuple[st
         tree.write(str(entry["path"]), None)
     if redirects and site.config:
         tree.write(site.config, _append_redirects(tree.text(site.config), site, redirects).encode())
+    if lint_wrap:
+        origin = {**{target: source for source, target in path_map.items()}, **{s[2]: s[0] for s in splits}}
+        warnings = _wrap_warnings(tree, lint_wrap, origin)
+        if warnings:
+            context.report.data["wrap_warnings"] = warnings
     return tree.operations(), redirects
+
+
+def _md013_long(line: str, limit: int) -> bool:
+    """markdownlint 0.40.0 MD013 with its defaults: the last word may cross the limit if it starts within it."""
+    if re.match(r" {0,3}\[[^\]]+\]:", line):
+        return False  # a link reference definition
+    if re.fullmatch(r"[\s>*+-]*(?:\d+[.)]\s*)?", re.sub(r"!?\[[^\]]*\]\([^)]*\)|<[^>\s]+>", "", line)):
+        return False  # nothing but links
+    return len(re.sub(r"\S*$", "#", line, count=1)) > limit
+
+
+def _wrap_warnings(tree: VirtualTree, limit: int, origin: dict[str, str]) -> list[dict[str, Any]]:
+    """Lines the plan pushes past the markdownlint limit that were within it before; code is exempt."""
+    out = []
+    for op in tree.operations():
+        rel = op["path"]
+        if op["data"] is None or not rel.endswith(MARKDOWN_EXTENSIONS):
+            continue
+        before = [line.rstrip("\r") for line in (tree._disk(origin.get(rel, rel)) or b"").decode("utf-8", "replace").split("\n")]
+        after = [line.rstrip("\r") for line in op["data"].decode("utf-8").split("\n")]
+        previous: dict[int, str] = {}
+        for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, before, after, autojunk=False).get_opcodes():
+            if tag in ("equal", "replace"):
+                for offset in range(min(i2 - i1, j2 - j1)):
+                    previous[j1 + offset] = before[i1 + offset]
+        fence: tuple[str, int] | None = None
+        for index, line in enumerate(after):
+            fence, in_code = _fence_step(fence, line)
+            if in_code or not _md013_long(line, limit) or (index in previous and _md013_long(previous[index], limit)):
+                continue
+            out.append({"path": rel, "line": index + 1, "length": len(line), "limit": limit})
+    return out
 
 
 def _append_redirects(text: str, site: Site, redirects: list[tuple[str, str]]) -> str:
@@ -6446,6 +7050,9 @@ class _Refused(Exception):
 
 def cmd_plan(args: argparse.Namespace, report: Report) -> list[str]:
     action = args.action
+    if action == "mappings" and args.out:
+        raise UsageError("plan mappings prints to stdout only, so it can never overwrite a plan artifact")
+    report.text_max = args.max
     context = PlanContext(args, report)
     required = ["config", "nav", "exclude_docs", "redirects", "markdown"]
     art = _plan_art(context)
@@ -6455,6 +7062,12 @@ def cmd_plan(args: argparse.Namespace, report: Report) -> list[str]:
             return []
         if action == "verify":
             return _verify(context, args)
+        if action == "mappings":
+            needed = [r for r in _verify(context, args) if r != "github_urls" or args.urls]
+            report.findings = []  # a skeleton is not a verdict: plan verify is
+            if context.baseline is not None:
+                report.data["mappings_toml"] = _mappings_scaffold(context, args)
+            return needed
         if action == "approve" and args.mappings:
             _approve_mappings(context, args)
             return ["conservation_baseline"]
@@ -6610,12 +7223,20 @@ def _load_mappings(context: PlanContext) -> list[dict[str, Any]]:
     path = context.repo.root / context.plan.artifact(MAPPINGS_NAME)
     if not path.is_file():
         return []
-    data = tomllib.loads(path.read_text(encoding="utf-8"))
+    try:
+        data = tomllib.loads(path.read_text(encoding="utf-8"))
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as error:
+        raise UsageError(f"{context.plan.artifact(MAPPINGS_NAME)}: {error}") from error
     out = []
     for kind in MAPPING_TYPES:
-        for entry in data.get(kind, []) or []:
-            if isinstance(entry, dict):
-                out.append({"kind": kind, **entry})
+        entries = data.get(kind, [])
+        if not isinstance(entries, list) or not all(isinstance(entry, dict) for entry in entries):
+            raise UsageError(f"{context.plan.artifact(MAPPINGS_NAME)}: {kind} must be an array of tables")
+        for entry in entries:
+            blocks = entry.get("blocks", [])
+            if not isinstance(blocks, list) or not all(isinstance(h, str) for h in blocks):
+                raise UsageError(f"{context.plan.artifact(MAPPINGS_NAME)}: mapping {entry.get('id', '?')}: blocks must be a list of hashes")
+        out += [{"kind": kind, **entry} for entry in entries]
     return out
 
 
@@ -6650,6 +7271,10 @@ def _approve_mappings(context: PlanContext, args: argparse.Namespace) -> None:
                 f"mapping {entry.get('id', '?')}: needs an id and baseline block hashes ({', '.join(missing[:3])} not in the baseline)",
             )
             continue
+        problem = _github_loss_problem(entry) if entry["kind"] == "github_loss" else None
+        if problem:
+            context.error("mapping-invalid", f"mapping {entry['id']}: {problem}")
+            continue
         destination = _destination_hashes(context.corpus, entry)
         if entry["kind"] == "dropped" and not str(entry.get("proof") or "").strip():
             context.error(
@@ -6676,6 +7301,7 @@ def _approve_mappings(context: PlanContext, args: argparse.Namespace) -> None:
                 "before": [by_hash[h]["text"] for h in entry.get("blocks", [])],
                 "to": entry.get("to"),
                 "proof": entry.get("proof"),
+                **({k: entry.get(k) for k in ("path", "page", "anchors", "reason")} if entry["kind"] == "github_loss" else {}),
             }
         )
     context.report.data["review"] = review
@@ -6687,14 +7313,171 @@ def _approve_mappings(context: PlanContext, args: argparse.Namespace) -> None:
     context.report.data["state"] = f"{len(receipts)} review receipts written"
 
 
+def _github_loss_problem(entry: dict[str, Any]) -> str | None:
+    """Why a [[github_loss]] entry cannot be reviewed, or None."""
+    if entry.get("blocks"):
+        return "a github_loss entry accepts a lost URL and cannot excuse content blocks"
+    path, page, anchors = entry.get("path"), entry.get("page", False), entry.get("anchors", [])
+    if not isinstance(path, str) or not path.strip():
+        return "a github_loss entry needs a path"
+    if not isinstance(page, bool) or not isinstance(anchors, list) or not all(isinstance(a, str) and a for a in anchors):
+        return "page must be a boolean and anchors a list of fragments"
+    if not page and not anchors:
+        return "a github_loss entry must name the page or at least one anchor"
+    if not str(entry.get("reason") or "").strip():
+        return "a github_loss entry needs a reason (the owner's decision)"
+    return None
+
+
+def _github_loss_keys(entry: dict[str, Any]) -> set[tuple[str, str]]:
+    """(path, fragment) pairs an entry accepts; the empty fragment is the whole page."""
+    if _github_loss_problem(entry):
+        return set()
+    path = str(entry["path"])
+    return {(path, str(a)) for a in entry.get("anchors", [])} | ({(path, "")} if entry.get("page") else set())
+
+
+def _github_loss_named(entry: dict[str, Any]) -> set[tuple[str, str]]:
+    """The (path, fragment) pairs an entry names, reviewed or not: a saved skeleton is not listed twice."""
+    path, anchors = entry.get("path"), entry.get("anchors", [])
+    if not isinstance(path, str):
+        return set()
+    named = {(path, a) for a in anchors if isinstance(a, str)} if isinstance(anchors, list) else set()
+    return named | ({(path, "")} if entry.get("page") is True else set())
+
+
+def _compare_github(context: PlanContext, table: dict[str, Any], accepted: set[tuple[str, str]]) -> CoverageRow:
+    """Every old GitHub path and fragment must exist at its original path, or be an accepted loss."""
+    kept = 0
+    for rel, anchors in sorted(table.items()):
+        doc = context.corpus.docs.get(rel)
+        if doc is None:
+            if (rel, "") not in accepted:
+                context.github_lost.append((rel, True, list(anchors)))
+                context.report.add(
+                    Finding(
+                        "github-url-lost",
+                        "P1",
+                        "verified",
+                        rel,
+                        0,
+                        f"{rel} no longer exists at this path, so its GitHub URL breaks",
+                        suggestion="keep a page there with the same anchors, or record a reviewed [[github_loss]] entry in mappings.toml",
+                    )
+                )
+            continue
+        have = {a.lower() for a in doc.anchors()}
+        # a surviving page needs each lost anchor named: the whole-page key applies only to a missing page
+        gone = [a for a in anchors if a.lower() not in have and (rel, a) not in accepted]
+        kept += len(anchors) - len(gone)
+        if gone:
+            context.github_lost.append((rel, False, gone))
+            context.report.add(
+                Finding(
+                    "github-url-lost",
+                    "P1",
+                    "verified",
+                    rel,
+                    0,
+                    f"{len(gone)} GitHub anchors of {rel} are gone: {', '.join('#' + a for a in gone[:8])}",
+                    suggestion="keep the headings, or record a reviewed [[github_loss]] entry in mappings.toml",
+                )
+            )
+    return CoverageRow("github_urls", "complete", f"{len(table)} paths compared at their original location, {kept} anchors kept or accepted")
+
+
+def _toml_string(value: str) -> str:
+    # JSON escapes are valid TOML; DEL is the one control character JSON leaves raw
+    return json.dumps(value, ensure_ascii=False).replace(chr(0x7F), "\\" + "u007F")
+
+
+def _toml_comment(value: str) -> str:
+    return "".join(c if c.isprintable() else " " for c in value)[:80]
+
+
+def _mappings_scaffold(context: PlanContext, args: argparse.Namespace) -> str:
+    """A mappings.toml skeleton: one entry per unmatched occurrence no existing entry covers yet."""
+    baseline = context.baseline or []
+    existing = _load_mappings(context)
+    taken = Counter(h for entry in existing if entry["kind"] != "github_loss" for h in entry.get("blocks", []))
+    ids = {str(entry.get("id")) for entry in existing}
+    named = {key for entry in existing if entry["kind"] == "github_loss" for key in _github_loss_named(entry)}
+    number = 0
+
+    def next_id() -> str:
+        nonlocal number
+        number += 1
+        while f"m{number}" in ids:
+            number += 1
+        return f"m{number}"
+
+    out = [
+        "# plan mappings: a skeleton for mappings.toml. It is not a verification.",
+        "# Fill in every to and reason, then have the owner review it.",
+    ]
+    if not args.urls:
+        out.append("# GitHub URLs were not compared: pass --urls to include them.")
+    entries = 0
+    for position in context.unmatched:
+        block = baseline[position]
+        if taken[block["hash"]] > 0:
+            taken[block["hash"]] -= 1
+            continue
+        entries += 1
+        out += [
+            "",
+            f"# {_toml_comment(str(block['file']))}:{block['line']} {_toml_comment(str(block['type']))}: {_toml_comment(str(block['text']))}",
+            "# Or make this a [[dropped]] entry with a proof.",
+            "[[rewritten]]",
+            f"id = {_toml_string(next_id())}",
+            f"blocks = [{_toml_string(block['hash'])}]",
+            'to = ""',
+        ]
+    for rel, page, anchors in context.github_lost:
+        remaining = [a for a in anchors if (rel, a) not in named]
+        if (page and (rel, "") in named) or (not page and not remaining):
+            continue
+        entries += 1
+        out += [
+            "",
+            f"# the GitHub URL of {_toml_comment(rel)} is lost",
+            "[[github_loss]]",
+            f"id = {_toml_string(next_id())}",
+            f"path = {_toml_string(rel)}",
+        ]
+        out.append("page = true" if page else "anchors = [" + ", ".join(_toml_string(a) for a in remaining) + "]")
+        out.append('reason = ""')
+    if not entries:
+        out += ["", "# Nothing to map."]
+    return "\n".join(out) + "\n"
+
+
+def _baseline_entry_problem(entry: Any) -> str | None:
+    """Why a blocks.json entry cannot be trusted, or None: a damaged baseline must not look complete."""
+    if not isinstance(entry, dict):
+        return "not an object"
+    for key, kind in (("file", str), ("line", int), ("type", str), ("depth", int), ("heading_path", list), ("hash", str), ("text", str)):
+        value = entry.get(key)
+        if not isinstance(value, kind) or isinstance(value, bool):
+            return f"{key} is missing or malformed"
+    if not entry["hash"] or not all(isinstance(h, str) for h in entry["heading_path"]):
+        return "hash or heading_path is malformed"
+    return None
+
+
 def _load_baseline(context: PlanContext) -> list[dict[str, Any]] | None:
     rel = context.plan.meta.get("blocks")
     data = _read_json(context.repo.root / str(rel)) if isinstance(rel, str) else None
     if not isinstance(data, dict) or not isinstance(data.get("blocks"), list):
         context.report.coverage.append(CoverageRow("conservation_baseline", "failed", f"{rel}: missing or unreadable"))
         return None
+    for index, entry in enumerate(data["blocks"]):
+        problem = _baseline_entry_problem(entry)
+        if problem:
+            context.report.coverage.append(CoverageRow("conservation_baseline", "failed", f"{rel}: block {index}: {problem}"))
+            return None
     context.report.coverage.append(CoverageRow("conservation_baseline", "complete", f"{rel}: {len(data['blocks'])} blocks"))
-    return [b for b in data["blocks"] if isinstance(b, dict)]
+    return list(data["blocks"])
 
 
 def _verify(context: PlanContext, args: argparse.Namespace) -> list[str]:
@@ -6703,12 +7486,14 @@ def _verify(context: PlanContext, args: argparse.Namespace) -> list[str]:
     baseline = _load_baseline(context)
     if baseline is None:
         return required
+    context.baseline = baseline
     current = [(rel, b, _block_hash(b)) for rel in sorted(corpus.docs) for b in corpus.docs[rel].blocks]
     occurrences: dict[str, list[int]] = defaultdict(list)
     for index, (_rel, _block, digest) in enumerate(current):
         occurrences[digest].append(index)
     receipts = {r["id"]: r for r in (_read_json(context.repo.root / context.plan.artifact(RECEIPTS_NAME)) or {}).get("receipts", [])}
     excused: Counter[str] = Counter()
+    accepted: set[tuple[str, str]] = set()
     # a block a reviewed rewritten mapping sends to another page sits where the owner agreed
     relocated: dict[str, str] = {}
     for entry in _load_mappings(context):
@@ -6745,29 +7530,35 @@ def _verify(context: PlanContext, args: argparse.Namespace) -> list[str]:
                 )
             )
             continue
+        if entry["kind"] == "github_loss":
+            accepted.update(_github_loss_keys(entry))
+            continue
         excused.update(entry.get("blocks", []))
         if entry["kind"] == "rewritten":
             for digest in entry.get("blocks", []):
                 relocated[digest] = str(entry.get("to", ""))
-    expected = _reference_digests(context.plan, baseline)
+    expected = _expected_digests(context, baseline)
     used: set[int] = set()
     matched: list[int | None] = []
     for position, block in enumerate(baseline):
         digest = block["hash"]
         free = [i for i in occurrences.get(digest, []) if i not in used]
         if not free and position in expected:
-            # the block as the plan's own [[reference]] edits left it
+            # the block as the plan's own line edits left it
             digest = expected[position]
             free = [i for i in occurrences.get(digest, []) if i not in used]
         if len(free) > 1:
             # of identical copies (a table copied into a spike, a repeated warning), the one still
             # in its section is the one this block became
             free.sort(key=lambda i: not _place_kept(context.plan, block, current[i][0], current[i][1].heading_path))
+        if not free:
+            context.unmatched.append(position)
         if free:
             used.add(free[0])
             matched.append(free[0])
-        elif excused[digest] > 0:
-            excused[digest] -= 1
+        elif excused[block["hash"]] > 0:
+            # mappings and their receipts name baseline hashes, never the post-edit digest
+            excused[block["hash"]] -= 1
             matched.append(None)
         else:
             matched.append(None)
@@ -6779,7 +7570,8 @@ def _verify(context: PlanContext, args: argparse.Namespace) -> list[str]:
                     block["file"],
                     block["line"],
                     f"{block['type']} not found after the restructure: {block['text'][:100]!r}",
-                    suggestion="restore it, or record a rewritten/dropped mapping and have it reviewed",
+                    [f"block hash: {block['hash']}"],
+                    "restore it, or record a rewritten/dropped mapping and have it reviewed (plan mappings prints a skeleton)",
                 )
             )
     unaccounted = sum(1 for f in report.findings if f.check == "block-unaccounted")
@@ -6813,47 +7605,78 @@ def _verify(context: PlanContext, args: argparse.Namespace) -> list[str]:
         "excused_by_mappings": sum(1 for i in matched if i is None) - unaccounted,
     }
     if args.urls:
-        if not args.built:
-            raise UsageError("plan verify --urls needs --built NEW_SITE")
         urls = _read_json(_root_path(args, args.urls))
         if not isinstance(urls, dict):
             raise UsageError(f"{args.urls}: not a URL baseline")
-        built = load_built(args.built, context.repo, context.site)
         if "routes" not in urls:
             raise UsageError(f"{args.urls}: not a URL baseline written by check --save-baseline")
-        compare_url_baseline(urls, built["site"], report, args.urls)
-        report.coverage.append(_url_baseline_row(urls, built))
-        required.append("url_baseline")
+        # an empty object, from a tree with no site: its GitHub paths and anchors still need checking
+        no_site = urls.get("kind") == "source" and urls["routes"] == {}
+        github = urls.get("github")
+        table: dict[str, Any] = github if isinstance(github, dict) else {}
+        if no_site and (table is not github or not all(isinstance(a, list) and all(isinstance(x, str) for x in a) for a in table.values())):
+            raise UsageError(f"{args.urls}: the github table of a no-site baseline is missing or malformed")
+        if args.built:
+            built = load_built(args.built, context.repo, context.site)
+            compare_url_baseline(urls, built["site"], report, args.urls)
+            report.coverage.append(_url_baseline_row(urls, built))
+            required.append("url_baseline")
+        elif no_site:
+            report.coverage.append(CoverageRow("url_baseline", "not_applicable", "the baseline has no built-site routes"))
+        else:
+            raise UsageError("plan verify --urls needs --built NEW_SITE unless the baseline is a source baseline with no site routes")
+        if no_site:
+            report.coverage.append(_compare_github(context, table, accepted))
+            required.append("github_urls")
     elif context.site.config:
         report.coverage.append(CoverageRow("url_baseline", "partial", "not checked: pass --urls and --built to verify URL preservation"))
     else:
-        report.coverage.append(CoverageRow("url_baseline", "not_applicable", "no site config: no URLs to preserve"))
+        report.coverage.append(CoverageRow("url_baseline", "not_applicable", "no site config: no built-site routes"))
+        report.coverage.append(CoverageRow("github_urls", "partial", "not compared: pass --urls with the baseline from check --save-baseline"))
+        required.append("github_urls")
     return required
 
 
-def _reference_digests(plan: Plan, baseline: list[dict[str, Any]]) -> dict[int, str]:
-    """Baseline position -> the digest of that block after the [[reference]] edits on its lines."""
-    edits: dict[str, list[tuple[int, str, str]]] = defaultdict(list)
-    for entry in plan.entries("reference"):
-        if isinstance(entry.get("line"), int) and isinstance(entry.get("old"), str) and isinstance(entry.get("new"), str):
-            edits[str(entry.get("file"))].append((entry["line"], entry["old"], entry["new"]))
-    starts: dict[str, list[int]] = defaultdict(list)
-    for block in baseline:
-        starts[str(block["file"])].append(int(block["line"]))
-    out: dict[int, str] = {}
+def _expected_digests(context: PlanContext, baseline: list[dict[str, Any]]) -> dict[int, str]:
+    """Baseline position -> the digest of that block after the plan's own line edits.
+
+    Each file is read at the base commit, edited by the function apply uses, and parsed again. A
+    digest exists only when the edit kept every block boundary: a block split in two has no single
+    successor, so it needs a reviewed mapping.
+    """
+    plan = context.plan
+    commit = plan.meta.get("base_commit")
+    if not isinstance(commit, str) or not commit or commit.startswith("-"):
+        return {}
+    path_map = _plan_moves(plan)
+    split_targets = _split_anchor_targets(context, lambda r: git(context.repo.root, "cat-file", "blob", f"{commit}:{r}"))
+    referenced = {str(e.get("file")) for e in plan.entries("reference")}
+    by_file: dict[str, list[int]] = defaultdict(list)
     for position, block in enumerate(baseline):
-        file, first = str(block["file"]), int(block["line"])
-        if file not in edits:
+        by_file[str(block["file"])].append(position)
+    out: dict[int, str] = {}
+
+    def shape(block: Block) -> tuple[Any, ...]:
+        return (block.type, block.line, block.depth, block.position, block.info, tuple(block.heading_path))
+
+    for rel, positions in by_file.items():
+        if rel not in referenced and not ((path_map or split_targets) and _link_rewritable(context, rel)):
             continue
-        after = [s for s in starts[file] if s > first]
-        end = min(after) if after else first + 10**9  # the file's last block runs to its end
-        text = str(block["text"])
-        touched = False
-        for line, old, new in sorted(edits[file]):
-            if first <= line < end and old in text:
-                text, touched = text.replace(old, new, 1), True
-        if touched:
-            out[position] = _block_hash(Block(type=str(block["type"]), text=text, line=first, heading_path=[], info=str(block.get("info", ""))))
+        original = git(context.repo.root, "cat-file", "blob", f"{commit}:{rel}")
+        if original is None:
+            continue
+        edited = _planned_lines(context, rel, original, path_map, None, split_targets)
+        if edited == original:
+            continue
+        before, after = _parse_like_corpus(context, rel, original).blocks, _parse_like_corpus(context, rel, edited).blocks
+        if len(before) != len(positions) or [shape(b) for b in before] != [shape(b) for b in after]:
+            continue
+        if any(baseline[p]["hash"] != _block_hash(b) for p, b in zip(positions, before, strict=True)):
+            continue
+        for position, old, new in zip(positions, before, after, strict=True):
+            digest = _block_hash(new)
+            if digest != _block_hash(old):
+                out[position] = digest
     return out
 
 
@@ -6930,6 +7753,11 @@ def build_parser() -> argparse.ArgumentParser:
     check.add_argument("--built", help="a docstool site-build output directory (refused when stale or not built by docstool)")
     check.add_argument("--save-baseline", help="write the URL and anchor baseline of --built (or, without it, a source-derived one) to this file")
     check.add_argument("--baseline", help="check --built against a saved URL baseline: routes, redirects, anchors")
+    check.add_argument(
+        "--site-planned",
+        action="store_true",
+        help="with no site config: also report links that would break once docs/ is published (changes no baseline)",
+    )
     build = sub.add_parser("site-build", help="build the site with its generator into a fresh directory, with a stamp of its inputs")
     _common(build, out=False)
     build.add_argument("--out", dest="out_dir", required=True, help="fresh output directory (must not exist or be empty)")
@@ -6938,19 +7766,20 @@ def build_parser() -> argparse.ArgumentParser:
     build.add_argument("--generator-cmd", help=argparse.SUPPRESS)
     plan = sub.add_parser("plan", help="validate, approve, apply, resume, roll back or verify a restructure plan")
     _common(plan)
-    plan.add_argument("action", choices=("validate", "approve", "apply", "resume", "rollback", "verify"))
+    plan.add_argument("action", choices=("validate", "approve", "apply", "resume", "rollback", "verify", "mappings"))
     plan.add_argument("--plan", default="docs/internal/restructure/plan.toml", help="the plan file (default docs/internal/restructure/plan.toml)")
     plan.add_argument("--write", action="store_true", help="apply: write the changes (the default is a dry run)")
     plan.add_argument("--by", help="approve: who approves (gate G9)")
     plan.add_argument("--mappings", action="store_true", help="approve: write review receipts for mappings.toml instead of the plan approval")
-    plan.add_argument("--urls", help="verify: also check a saved URL baseline against --built")
-    plan.add_argument("--built", help="verify --urls: the new site-build output")
+    plan.add_argument("--urls", help="verify, mappings: also check a saved URL baseline (a site's needs --built)")
+    plan.add_argument("--built", help="verify or mappings with --urls: the new site-build output")
     drift = sub.add_parser("drift", help="find commands, flags, env vars and paths the docs name that the code no longer has")
     _common(drift)
     drift.add_argument("--scope", choices=("all", "docs", "repo"), default="all", help="which Markdown files to read")
     drift.add_argument("--base", help="also report tokens removed or added since this commit (read-only git diff)")
     drift.add_argument("--paths", action="store_true", help="also check repository paths quoted in inline code")
     drift.add_argument("--leads", action="store_true", help="also report status claims, hand-maintained counts and stale docs as leads")
+    drift.add_argument("--include-records", action="store_true", help="also read docs/internal/restructure/ and docs/internal/history/")
     drift.add_argument("--allow-partial", action="store_true", help="exit 0/1 even when coverage is incomplete (the summary says PARTIAL)")
     audit = sub.add_parser("site-audit", help="audit zensical.toml or mkdocs.yml for what Zensical ignores, misses or does differently")
     _common(audit)
@@ -6997,6 +7826,18 @@ def render_plan_text(report: Report) -> str:
     redirects = report.data.get("redirects") or []
     if redirects:
         out += [f"Redirects added ({len(redirects)}):"] + [f"  {r}" for r in redirects]
+    held = report.data.get("held_labels") or []
+    if held:
+        out += [f"Link labels that spell an old path, left for you ({len(held)}):"] + [f"  {h}" for h in held]
+    warnings = report.data.get("wrap_warnings") or []
+    if warnings:
+        out.append(
+            f"Wrap warnings: apply pushes {len(warnings)} lines past the markdownlint line_length"
+            " (MD013 defaults; its strict, stern, tables and headings options are not read):"
+        )
+        out += [f"  {w['path']}:{w['line']} ({w['length']} > {w['limit']})" for w in warnings[: report.text_max]]
+        if len(warnings) > report.text_max:
+            out.append(f"  ... {len(warnings) - report.text_max} more (raise --max or use --format json)")
     return "\n".join(out) + "\n\n"
 
 
@@ -7014,6 +7855,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         required = COMMANDS[args.command](args, report)
         code, incomplete = finalize(report, required, args.fail_on, getattr(args, "allow_partial", False))
+        scaffold = args.command == "plan" and args.action == "mappings"
+        if scaffold and incomplete:
+            report.data.pop("mappings_toml", None)
         if args.format == "json":
             output = render_json(report, incomplete)
         elif args.command == "slug":
@@ -7023,9 +7867,14 @@ def main(argv: list[str] | None = None) -> int:
                 + "\n"
                 for r in report.data["slugs"]
             )
+        elif scaffold and "mappings_toml" in report.data:
+            output = report.data["mappings_toml"]  # stdout is the TOML itself, with no report around it
         else:
             extra = TEXT_RENDERERS[args.command](report) if args.command in TEXT_RENDERERS else ""
             output = extra + render_text(report, incomplete, args.max)
+        if scaffold and args.format == "text" and "mappings_toml" not in report.data:
+            sys.stderr.write(output)  # stdout stays empty, so a redirect cannot capture a report as TOML
+            return code
         if getattr(args, "out", None):
             _write_output(Path(args.out), output)
         else:

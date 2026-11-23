@@ -6,3 +6,6 @@
 #
 # Install with: make dev-deps
 pytest==9.2.0
+# Parallel test execution. Most tests run docstool as a real process, so the suite is bound by process
+# startup and runs several times faster on many cores. `make test-unit` runs serially without it.
+pytest-xdist==3.8.0

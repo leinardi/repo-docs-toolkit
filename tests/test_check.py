@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from conftest import DOCSTOOL, docstool_json, make_repo, run_script
+from conftest import DOCSTOOL, docstool_code, docstool_json, git, load_module, make_repo, run_script
 
 
 def findings(report: dict[str, Any]) -> set[tuple[str, str, int]]:
@@ -248,3 +248,62 @@ def test_out_refuses_to_write_through_a_symlink(tmp_path: Path) -> None:
     refused = run_script(DOCSTOOL, "check", "--root", str(repo), "--out", str(tmp_path / "link.json"))
     assert refused.returncode == 2
     assert victim.read_text(encoding="utf-8") == "keep\n"
+
+
+def planned_repo(tmp_path: Path) -> Path:
+    repo = make_repo("clean", tmp_path)
+    (repo / "zensical.toml").unlink()
+    (repo / "deployments").mkdir()
+    (repo / "deployments" / "stack.yml").write_text("services: {}\n", encoding="utf-8")
+    (repo / "docs" / "internal").mkdir(exist_ok=True)
+    (repo / "docs" / "internal" / "notes.md").write_text("# Notes\n\n[Stack](../../deployments/stack.yml)\n", encoding="utf-8")
+    (repo / "docs" / "page.md").write_text(
+        "# Page\n\n[Stack](../deployments/stack.yml), [readme](../README.md), [notes](internal/notes.md), [self](#page)\n", encoding="utf-8"
+    )
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "planned")
+    return repo
+
+
+def test_site_planned_reports_links_that_would_break(tmp_path: Path) -> None:
+    repo = planned_repo(tmp_path)
+    _, plain = docstool_json(repo, "check")
+    assert not {f["check"] for f in plain["findings"]} & {"planned-leaves-docs", "planned-links-internal", "leaves-docs-dir", "links-unpublished"}
+    _, report = docstool_json(repo, "check", "--site-planned")
+    found = sorted((f["check"], f["file"]) for f in report["findings"] if f["check"].startswith("planned-"))
+    assert found == [("planned-leaves-docs", "docs/page.md"), ("planned-leaves-docs", "docs/page.md"), ("planned-links-internal", "docs/page.md")]
+    planned = [f for f in report["findings"] if f["check"].startswith("planned-")]
+    assert all(f["severity"] == "P2" and f["confidence"] == "likely" for f in planned)
+    assert not any("strict" in f["message"] for f in planned)
+    assert not {f["check"] for f in report["findings"]} & {"leaves-docs-dir", "links-unpublished"}
+
+
+@pytest.mark.parametrize("target", ["internal/", "templates/"])
+def test_site_planned_reports_a_link_to_an_excluded_directory(tmp_path: Path, target: str) -> None:
+    repo = planned_repo(tmp_path)
+    (repo / "docs" / "templates").mkdir()
+    (repo / "docs" / "templates" / "base.html").write_text("<html></html>\n", encoding="utf-8")
+    (repo / "docs" / "page.md").write_text(f"# Page\n\n[x]({target})\n", encoding="utf-8")
+    _, report = docstool_json(repo, "check", "--site-planned")
+    assert [f["check"] for f in report["findings"] if f["check"].startswith("planned-")] == ["planned-links-internal"]
+
+
+@pytest.mark.parametrize("name", ["internal", "templates"])
+def test_site_planned_keeps_a_regular_file_named_like_an_excluded_directory(tmp_path: Path, name: str) -> None:
+    module = load_module("docstool_planned", DOCSTOOL)
+    site = module.Site()
+    assert module._would_publish(site, f"docs/{name}") is True
+    assert module._would_publish(site, f"docs/{name}", is_dir=True) is False
+
+
+def test_site_planned_does_not_change_the_saved_baseline(tmp_path: Path) -> None:
+    repo = planned_repo(tmp_path)
+    docstool_json(repo, "check", "--save-baseline", "plain.json")
+    docstool_json(repo, "check", "--site-planned", "--save-baseline", "planned.json")
+    assert (repo / "planned.json").read_bytes() == (repo / "plain.json").read_bytes()
+    assert json.loads((repo / "planned.json").read_text(encoding="utf-8"))["routes"] == {}
+
+
+def test_site_planned_is_refused_when_a_site_exists(tmp_path: Path) -> None:
+    repo = make_repo("clean", tmp_path)
+    assert docstool_code(repo, "check", "--site-planned") == 2

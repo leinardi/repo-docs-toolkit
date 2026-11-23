@@ -28,6 +28,10 @@ MK_LOCAL_TEST_INCLUDED := 1
 PYTHON ?= python3
 CLAUDE ?= claude
 
+# Worker count for the unit tests. `auto` is one per core; set PYTEST_WORKERS=1 to debug a failure
+# without workers reordering the output.
+PYTEST_WORKERS ?= auto
+
 # uv runs the tests when it is installed: it resolves requirements-dev.txt into a cached
 # environment with no virtualenv to manage, and it works where pip refuses to touch the system
 # interpreter (PEP 668). An explicit PYTHON= on the command line wins.
@@ -39,13 +43,18 @@ endif
 UV_RUN = $(UV) run --no-project --with-requirements $(REPO_ROOT)/requirements-dev.txt python
 
 .PHONY: dev-deps
-dev-deps: ## Install the pinned Python development dependencies (pytest)
+dev-deps: ## Install the pinned Python development dependencies (pytest, pytest-xdist)
 ifneq ($(strip $(UV)),)
-	@$(UV_RUN) -c 'import pytest'
+	@$(UV_RUN) -c 'import pytest, xdist'
 	@printf 'dev dependencies ready in uv'"'"'s cache; make test uses them automatically.\n'
 else
 	@$(PYTHON) -m pip install -r $(REPO_ROOT)/requirements-dev.txt
 endif
+
+# Plain $(PYTHON), never uv: the script needs only the standard library and edits the repository.
+.PHONY: sync-pins
+sync-pins: ## Rewrite the .pre-commit-config.yaml pins to match requirements-dev.txt
+	@$(PYTHON) -I $(REPO_ROOT)/scripts/sync_pins.py
 
 .PHONY: test
 test: test-unit ## Run the test suite
@@ -53,9 +62,20 @@ test: test-unit ## Run the test suite
 .PHONY: test-unit
 test-unit: ## Run the Python unit tests (docstool, sync-vendored, skill lint, release bump)
 ifneq ($(strip $(UV)),)
-	@$(UV_RUN) -m pytest
+	@$(UV_RUN) -m pytest -n $(PYTEST_WORKERS)
 else
-	@$(PYTHON) -m pytest
+	@$(PYTHON) -c 'import pytest' 2>/dev/null || { \
+	  printf '%s cannot import pytest, so the package or the interpreter is missing.\n' '$(PYTHON)' >&2; \
+	  printf 'install the pinned dev dependencies with: make dev-deps\n' >&2; \
+	  exit 1; \
+	}
+	@if $(PYTHON) -c 'import xdist' 2>/dev/null; then \
+	  $(PYTHON) -m pytest -n $(PYTEST_WORKERS); \
+	else \
+	  printf 'pytest-xdist is not installed, so the unit tests run serially (several times slower).\n' >&2; \
+	  printf 'install it with: make dev-deps\n' >&2; \
+	  $(PYTHON) -m pytest; \
+	fi
 endif
 
 # The tests that need Zensical run in the docs uv environment (tools/docs/uv.lock, zensical.mk's
