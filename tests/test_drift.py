@@ -353,3 +353,210 @@ def test_a_commented_assignment_does_not_make_a_variable_known(tmp_path: Path) -
     git(repo, "commit", "-q", "-m", "comment")
     _, report = docstool_json(repo, "drift")
     assert any(f["check"] == "env-unknown" and f["message"].startswith("OLD_VAR ") and f["severity"] == "P2" for f in report["findings"])
+
+
+def env_repo(tmp_path: Path, sources: dict[str, str], doc: str = "Set `FOO_MODE=1` and `FOO_PIN=2`.\n") -> Path:
+    repo = make_repo("clean", tmp_path)
+    for rel, text in {"docs/env.md": f"# Env\n\n{doc}", **sources}.items():
+        path = repo / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "env")
+    return repo
+
+
+def env_severity(report: dict[str, Any], name: str) -> str | None:
+    return next((f["severity"] for f in report["findings"] if f["check"] == "env-unknown" and f["message"].startswith(name + " ")), None)
+
+
+LOOKUP = "impl Fn(&str) -> Option<String>"
+ENV_CLOSURE = "|key| std::env::var(key).ok()"
+
+
+def test_env_read_through_a_traced_callback_is_a_lead(tmp_path: Path) -> None:
+    repo = env_repo(
+        tmp_path,
+        {
+            "src/main.rs": f"fn main() {{ run_with(vec![], {ENV_CLOSURE}, 1); }}\n",
+            "src/run.rs": f"pub fn run_with(args: Vec<String>, getenv: {LOOKUP}, stop: u8) {{ docker::settings(&getenv); }}\n",
+            "src/docker.rs": f'const PIN: &str = "FOO_PIN";\npub fn settings(getenv: {LOOKUP}) {{ getenv("FOO_MODE"); getenv(PIN); }}\n',
+        },
+    )
+    _, report = docstool_json(repo, "drift")
+    assert env_severity(report, "FOO_MODE") == "P3"
+    assert env_severity(report, "FOO_PIN") == "P3"
+
+
+def test_env_read_through_a_forwarding_function_is_a_lead(tmp_path: Path) -> None:
+    repo = env_repo(
+        tmp_path,
+        {
+            "src/main.rs": 'const PIN: &str = "FOO_PIN";\nfn read(key: &str) -> Option<String> { std::env::var(key).ok() }\nfn main() { read("FOO_MODE"); read(PIN); }\n'
+        },
+    )
+    _, report = docstool_json(repo, "drift")
+    assert env_severity(report, "FOO_MODE") == "P3"
+    assert env_severity(report, "FOO_PIN") == "P3"
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        # an unrelated callback of the same type, beside a real env closure
+        f'fn main() {{ other({ENV_CLOSURE}); label(|k| names(k)); }}\nfn other(get: {LOOKUP}) {{}}\nfn label(get: {LOOKUP}) {{ get("FOO_MODE"); }}\n',
+        # one call site passes something else
+        f'fn main() {{ label({ENV_CLOSURE}); label(|k| names(k)); }}\nfn label(get: {LOOKUP}) {{ get("FOO_MODE"); }}\n',
+        # the parameter is shadowed
+        f'fn main() {{ label({ENV_CLOSURE}); }}\nfn label(get: {LOOKUP}) {{ let get = names; get("FOO_MODE"); }}\n',
+        # the exact string as a metric label and a log field
+        'fn main() { let v = labels.get("FOO_MODE"); counter("FOO_MODE"); log(field = "FOO_MODE"); let k = std::env::var(name); }\n',
+        # a method of the same name as a forwarding function
+        'fn read(key: &str) -> Option<String> { std::env::var(key).ok() }\nfn main() { labels.read("FOO_MODE"); }\n',
+    ],
+)
+def test_env_lookalikes_stay_likely(tmp_path: Path, source: str) -> None:
+    repo = env_repo(tmp_path, {"src/main.rs": source})
+    _, report = docstool_json(repo, "drift")
+    assert env_severity(report, "FOO_MODE") == "P2"
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        f'fn main() {{ label({ENV_CLOSURE}); }}\nfn label(get: {LOOKUP}) {{ // get("FOO_MODE") was removed\n}}\n',
+        f'fn main() {{ label({ENV_CLOSURE}); }}\nfn label(get: {LOOKUP}) {{ log("get(\\"FOO_MODE\\")"); }}\n',
+        'fn read(key: &str) -> Option<String> { std::env::var(key).ok() }\n/// read("FOO_MODE")\nfn main() {}\n',
+        'fn read(key: &str) -> Option<String> { std::env::var(key).ok() }\nfn main() {}\n#[cfg(test)]\nmod t { fn x() { read("FOO_MODE"); } }\n',
+        'fn get(key: &str) -> Option<String> { std::env::var(key).ok() }\nfn main() { labels::get("FOO_MODE"); }\n',
+        'use labels::get;\nfn main() { get("FOO_MODE"); }\nmod other { fn get(key: &str) -> Option<String> { std::env::var(key).ok() } }\n',
+        f'fn main() {{ outer({ENV_CLOSURE}, |k| names(k)); }}\nfn outer(a: {LOOKUP}, b: {LOOKUP}) {{ inner(|k| b(k)); }}\nfn inner(get: {LOOKUP}) {{ get("FOO_MODE"); }}\n',
+    ],
+)
+def test_comments_tests_and_foreign_calls_are_not_env_evidence(tmp_path: Path, source: str) -> None:
+    repo = env_repo(tmp_path, {"src/main.rs": source})
+    _, report = docstool_json(repo, "drift")
+    assert env_severity(report, "FOO_MODE") == "P2"
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        # a fake injected by an inline test does not break the production chain
+        f'fn main() {{ label({ENV_CLOSURE}); }}\nfn label(get: {LOOKUP}) {{ get("FOO_MODE"); }}\n#[cfg(test)]\nmod tests {{ fn t() {{ label(|_| None); }} }}\n',
+        # a closure forwarding to an env-backed parameter
+        f'fn main() {{ outer({ENV_CLOSURE}); }}\nfn outer(a: {LOOKUP}) {{ inner(|k| a(k)); }}\nfn inner(get: {LOOKUP}) {{ get("FOO_MODE"); }}\n',
+        # generic and where-bound callbacks
+        f'fn main() {{ label({ENV_CLOSURE}); }}\nfn label<F: Fn(&str) -> Option<String>>(get: F) {{ get("FOO_MODE"); }}\n',
+        f'fn main() {{ label({ENV_CLOSURE}); }}\nfn label<F>(get: F) where F: Fn(&str) -> Option<String> {{ get("FOO_MODE"); }}\n',
+        # a path that names the function's module
+        'mod cfgs;\nfn main() { main_helper::read("FOO_MODE"); }\n',
+    ],
+)
+def test_real_env_chains_are_traced(tmp_path: Path, source: str) -> None:
+    extra = {"src/main_helper.rs": "pub fn read(key: &str) -> Option<String> { std::env::var(key).ok() }\n"} if "main_helper" in source else {}
+    repo = env_repo(tmp_path, {"src/main.rs": source, **extra})
+    _, report = docstool_json(repo, "drift")
+    assert env_severity(report, "FOO_MODE") == "P3"
+
+
+def test_a_generic_function_counts_for_name_uniqueness(tmp_path: Path) -> None:
+    source = (
+        "fn read(key: &str) -> Option<String> { std::env::var(key).ok() }\n"
+        "mod other { fn read<F: Fn(&str) -> Option<String>>(get: F) {} }\n"
+        'fn main() { read("FOO_MODE"); }\n'
+    )
+    repo = env_repo(tmp_path, {"src/main.rs": source})
+    _, report = docstool_json(repo, "drift")
+    assert env_severity(report, "FOO_MODE") == "P2"
+
+
+def test_an_unread_env_var_says_dependencies_were_not_scanned(tmp_path: Path) -> None:
+    repo = env_repo(tmp_path, {})
+    _, report = docstool_json(repo, "drift")
+    finding = next(f for f in report["findings"] if f["message"].startswith("FOO_MODE "))
+    assert finding["severity"] == "P2"
+    assert "dependencies were not scanned" in finding["evidence"]
+
+
+@pytest.mark.parametrize("line", ["FOO_MODE := app", "FOO_MODE ?= app", "FOO_MODE += app", "all:\n\t@echo $(FOO_MODE)"])
+def test_make_variables_are_known(tmp_path: Path, line: str) -> None:
+    repo = env_repo(tmp_path, {"Makefile": "include .mk/x.mk\n", ".mk/x.mk": f"{line}\n"})
+    _, report = docstool_json(repo, "drift")
+    assert env_severity(report, "FOO_MODE") is None
+
+
+def test_a_lowercase_makefile_is_read(tmp_path: Path) -> None:
+    repo = env_repo(tmp_path, {"makefile": "FOO_MODE := app\nall:\n\t@echo $(FOO_PIN)\n"})
+    _, report = docstool_json(repo, "drift")
+    assert env_severity(report, "FOO_MODE") is None
+    assert env_severity(report, "FOO_PIN") is None
+
+
+def test_a_commented_make_variable_is_not_known(tmp_path: Path) -> None:
+    repo = env_repo(tmp_path, {"Makefile": "# FOO_MODE := app\n# $(FOO_MODE)\nall:\n\t@true\n"})
+    _, report = docstool_json(repo, "drift")
+    assert env_severity(report, "FOO_MODE") == "P2"
+
+
+def test_partial_paths(tmp_path: Path) -> None:
+    repo = env_repo(
+        tmp_path,
+        {"src/a/core/one.rs": "\n", "src/a/core/two.rs": "\n", "src/b/core/two.rs": "\n"},
+        doc="See `core/one.rs` and `core/two.rs` and `core/three.rs`.\n",
+    )
+    _, report = docstool_json(repo, "drift", "--paths")
+    by_span = {f["message"].split(":")[0]: f for f in report["findings"] if f["check"] == "path-missing"}
+    assert by_span["core/one.rs"]["severity"] == "P3"
+    assert by_span["core/one.rs"]["suggestion"] == "use src/a/core/one.rs"
+    assert by_span["core/two.rs"]["severity"] == "P2"
+    assert by_span["core/three.rs"]["severity"] == "P2"
+
+
+def test_a_removed_root_path_is_not_redirected_to_a_deeper_twin(tmp_path: Path) -> None:
+    repo = env_repo(tmp_path, {"src/keep.py": "\n", "tests/fixtures/src/config.py": "\n"}, doc="See `src/config.py`.\n")
+    _, report = docstool_json(repo, "drift", "--paths")
+    finding = next(f for f in report["findings"] if f["check"] == "path-missing")
+    assert finding["severity"] == "P2"
+    assert "tests/fixtures" not in finding["message"]
+
+
+def test_records_are_skipped_and_can_be_included(tmp_path: Path) -> None:
+    repo = env_repo(
+        tmp_path,
+        {
+            "Makefile": "all:\n\t@true\n",
+            "docs/internal/history/old.md": "# Old\n\nRun `make go-vet`.\n",
+            "docs/internal/restructure/report.md": "# Report\n\nRun `make go-vet`.\n",
+        },
+        doc="Nothing.\n",
+    )
+    code, report = docstool_json(repo, "drift")
+    assert "make-target-missing" not in {f["check"] for f in report["findings"]}
+    assert next(r for r in report["coverage"] if r["input"] == "records")["state"] == "complete"
+    assert code == 0
+    _, included = docstool_json(repo, "drift", "--include-records")
+    assert {f["file"] for f in included["findings"] if f["check"] == "make-target-missing"} == {
+        "docs/internal/history/old.md",
+        "docs/internal/restructure/report.md",
+    }
+
+
+def test_a_record_does_not_document_a_variable_or_hide_a_removal(tmp_path: Path) -> None:
+    repo = env_repo(
+        tmp_path,
+        {
+            "src/main.rs": 'fn main() { std::env::var("BAR_OLD"); std::env::var("BAR_NEW"); }\n',
+            "docs/internal/history/old.md": "# Old\n\nBAR_OLD and BAR_NEW.\n",
+        },
+        doc="Nothing.\n",
+    )
+    _, report = docstool_json(repo, "drift")
+    assert {"BAR_OLD", "BAR_NEW"} <= {f["message"].split(" ")[0] for f in report["findings"] if f["check"] == "env-undocumented"}
+    (repo / "src/main.rs").write_text('fn main() { std::env::var("BAR_NEW"); }\n', encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "drop")
+    _, report = docstool_json(repo, "drift", "--base", "HEAD~1")
+    assert "removed-still-documented" not in {f["check"] for f in report["findings"]}
+    _, included = docstool_json(repo, "drift", "--base", "HEAD~1", "--include-records")
+    assert "removed-still-documented" in {f["check"] for f in included["findings"]}

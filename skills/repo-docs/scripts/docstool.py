@@ -3999,6 +3999,9 @@ DOCKER_ENV_RE = re.compile(r"^[ \t]*(?:ENV|ARG)[ \t]+([A-Z][A-Z0-9_]*)", re.MULT
 DOTENV_RE = re.compile(r"^[ \t]*(?:export[ \t]+)?([A-Z][A-Z0-9_]*)=", re.MULTILINE)
 # VAR=value before a command, or export VAR=value, anywhere on a shell or recipe line
 SHELL_ASSIGN_RE = re.compile(r"(?:^|[\s;&|(])(?:export[ \t]+)?([A-Z][A-Z0-9_]*)=(?!=)", re.MULTILINE)
+# Make's own variables: NAME := value (also =, ?=, += and !=) and $(NAME)
+MAKE_ASSIGN_RE = re.compile(r"^[ \t]*(?:(?:export|override)[ \t]+)*([A-Z][A-Z0-9_]*)[ \t]*(?::{1,3}=|[?+!]?=)", re.MULTILINE)
+MAKE_REF_RE = re.compile(r"(?<!\$)\$\(([A-Z][A-Z0-9_]*)\)")
 # Config loaders that map every variable under a prefix onto config keys (RUNHOLD_AUTH__MODE ->
 # auth.mode): the code never names the full variable, so it cannot be matched by name.
 # (pattern, separator): the loader joins prefix and key with the separator (viper, envconfig,
@@ -4384,9 +4387,17 @@ def env_mentions(rel: str, text: str) -> set[str]:
     """Variables a script, compose file, Dockerfile, workflow or .env sample uses or defines."""
     name = re.sub(r"\.(?:j2|jinja2?|tmpl|tpl|template|example|sample|dist)$", "", PurePosixPath(rel).name)
     found: set[str] = set()
-    if name.endswith((".sh", ".bash", ".zsh", ".mk")) or name in ("Makefile", "GNUmakefile", "justfile", "Justfile") or rel.startswith(".github/"):
+    if (
+        name.endswith((".sh", ".bash", ".zsh", ".mk"))
+        or name in ("Makefile", "GNUmakefile", "makefile", "justfile", "Justfile")
+        or rel.startswith(".github/")
+    ):
         found.update(SHELL_ENV_RE.findall(text))
         found.update(SHELL_ASSIGN_RE.findall(re.sub(r"(?m)^[ \t]*#.*$", "", text)))
+        if name.endswith(".mk") or name in ("Makefile", "GNUmakefile", "makefile"):
+            uncommented = re.sub(r"(?m)^[ \t]*#.*$", "", text)
+            found.update(MAKE_ASSIGN_RE.findall(uncommented))
+            found.update(MAKE_REF_RE.findall(uncommented))
     if re.match(r"(docker-)?compose.*\.ya?ml$", name) or name.startswith("Dockerfile") or name.endswith(".env") or ".env." in name or name == ".env":
         found.update(SHELL_ENV_RE.findall(text))
         found.update(COMPOSE_ENV_RE.findall(text))
@@ -4412,6 +4423,308 @@ def env_prefixes(rel: str, text: str) -> set[str]:
             if literal is not None:
                 found.add(literal.group(1).upper())
     return {p for p in found if len(p) > 1}
+
+
+RUST_FN_RE = re.compile(r"\bfn\s+([A-Za-z_]\w*)\s*")
+RUST_CALL_RE = re.compile(r"(?<![\w.:])((?:[A-Za-z_]\w*::)*)([A-Za-z_]\w*)(?:::<[^<>()]*>)?\s*\(")
+RUST_TEST_ITEM_RE = re.compile(r"#\[\s*(?:cfg\(\s*(?:all\(\s*)?test\b|(?:\w+::)?test\b)")
+RUST_RAW_STRING_RE = re.compile(r"b?r(#*)\"")
+RUST_CHAR_RE = re.compile(r"'(?:\\.[^']{0,8}|[^\\'\n])'")
+RUST_LOOKUP_TYPE_RE = re.compile(r"^(?:impl\s+|&\s*(?:dyn\s+)?|Box<\s*dyn\s+)*Fn(?:Mut)?\(\s*&(?:'\w+\s+)?str\s*\)\s*->\s*Option<\s*String\s*>")
+RUST_STR_TYPE_RE = re.compile(r"&(?:'\w+\s+)?str")
+RUST_CLOSURE_RE = re.compile(r"^\s*(?:move\s+)?\|\s*([A-Za-z_]\w*)\s*(?::[^|]*)?\|\s*\{?\s*(.*)$", re.DOTALL)
+
+
+@dataclass
+class _RustFn:
+    rel: str
+    name: str
+    params: list[tuple[str, str]]
+    start: int
+    end: int
+
+
+@dataclass
+class _RustCall:
+    rel: str
+    offset: int
+    args: list[str]  # the argument text, string literals kept
+    masked: list[str]  # the same arguments with string contents blanked
+    caller: _RustFn | None
+
+
+def _rust_skip(text: str, index: int) -> int:
+    """The index after the comment, string or char literal at index, or index when there is none."""
+    if text.startswith("//", index):
+        end = text.find("\n", index)
+        return len(text) if end < 0 else end
+    if text.startswith("/*", index):
+        end = text.find("*/", index + 2)
+        return len(text) if end < 0 else end + 2
+    if text[index] in "br" and (index == 0 or not (text[index - 1].isalnum() or text[index - 1] == "_")):
+        raw = RUST_RAW_STRING_RE.match(text, index)
+        if raw:
+            end = text.find('"' + raw.group(1), raw.end())
+            return len(text) if end < 0 else end + 1 + len(raw.group(1))
+    if text[index] == '"':
+        cursor = index + 1
+        while cursor < len(text) and text[cursor] != '"':
+            cursor += 2 if text[cursor] == "\\" else 1
+        return min(cursor + 1, len(text))
+    if text[index] == "'":
+        char = RUST_CHAR_RE.match(text, index)
+        return char.end() if char else index
+    return index
+
+
+def _rust_views(text: str) -> tuple[str, str]:
+    """Production code of the same length: (comments and test items blanked, string contents blanked too)."""
+    code, mask = list(text), list(text)
+    index = 0
+    while index < len(text):
+        after = _rust_skip(text, index)
+        if after == index:
+            index += 1
+            continue
+        comment = text.startswith(("//", "/*"), index)
+        for cursor in range(index, after):
+            if text[cursor] != "\n":
+                # a literal keeps one mark, so an argument that is only a string is not an empty one
+                mask[cursor] = '"' if cursor == index and not comment else " "
+                if comment:
+                    code[cursor] = " "
+        index = after
+    masked = "".join(mask)
+    if re.search(r"#!\[\s*cfg\(\s*test\b", masked):
+        return re.sub(r"[^\n]", " ", text), re.sub(r"[^\n]", " ", text)
+    position = 0
+    while (match := RUST_TEST_ITEM_RE.search(masked, position)) is not None:
+        stop = next((i for i in range(match.end(), len(masked)) if masked[i] in "{;"), len(masked) - 1)
+        end = stop
+        if masked[stop] == "{":
+            depth = 0
+            for end in range(stop, len(masked)):
+                depth += {"{": 1, "}": -1}.get(masked[end], 0)
+                if depth == 0:
+                    break
+        for cursor in range(match.start(), end + 1):
+            if text[cursor] != "\n":
+                mask[cursor] = code[cursor] = " "
+        masked = "".join(mask)
+        position = end + 1
+    return "".join(code), masked
+
+
+def _rust_split(mask: str, start: int, angles: bool = False) -> tuple[list[tuple[int, int]], int]:
+    """The spans of the comma-separated items of a list whose opener ends just before start, and its closer."""
+    items: list[tuple[int, int]] = []
+    depth, angle, begin, index = 0, 0, start, start
+    while index < len(mask):
+        char = mask[index]
+        if char in "([{":
+            depth += 1
+        elif char in ")]}":
+            if depth == 0:
+                if mask[begin:index].strip():
+                    items.append((begin, index))
+                return items, index
+            depth -= 1
+        elif angles and char == "<":
+            angle += 1
+        elif angles and char == ">" and mask[index - 1] != "-" and angle:
+            angle -= 1
+        elif not angles and char == "|" and depth == 0 and mask[begin:index].strip() in ("", "move"):
+            # a closure's parameter list: its commas do not separate call arguments
+            close = mask.find("|", index + 1)
+            index = close if close >= 0 else index
+        elif char == "," and depth == 0 and angle == 0:
+            items.append((begin, index))
+            begin = index + 1
+        index += 1
+    return items, len(mask)
+
+
+def _rust_bounds(text: str) -> dict[str, str]:
+    """Type parameter -> its bound, from a generics list or a where clause."""
+    sentinel = text + ")"
+    found = {}
+    for begin, end in _rust_split(sentinel, 0, angles=True)[0]:
+        name, _, bound = sentinel[begin:end].partition(":")
+        if bound.strip():
+            found[name.strip()] = " ".join(bound.split())
+    return found
+
+
+def _rust_functions(rel: str, mask: str) -> list[_RustFn]:
+    out = []
+    for match in RUST_FN_RE.finditer(mask):
+        index, generics = match.end(), ""
+        if mask[index : index + 1] == "<":
+            depth, cursor = 0, index
+            while cursor < len(mask):
+                if mask[cursor] == "<":
+                    depth += 1
+                elif mask[cursor] == ">" and mask[cursor - 1] != "-":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                cursor += 1
+            generics = mask[index + 1 : cursor]
+            index = cursor + 1
+            while index < len(mask) and mask[index].isspace():
+                index += 1
+        if mask[index : index + 1] != "(":
+            continue
+        raw, close = _rust_split(mask, index + 1, angles=True)
+        tail = close + 1
+        while tail < len(mask) and mask[tail] not in ";{":
+            tail += 1
+        bounds = {**_rust_bounds(generics), **_rust_bounds(mask[close + 1 : tail].partition("where")[2])}
+        params = []
+        for begin, end in raw:
+            name, _, kind = mask[begin:end].partition(":")
+            kind = " ".join(kind.split())
+            params.append((re.sub(r"^\s*(?:mut\s+)?", "", name).strip(), bounds.get(kind.lstrip("& "), kind)))
+        if tail < len(mask) and mask[tail] == "{":
+            _, end = _rust_split(mask, tail + 1)
+            out.append(_RustFn(rel, match.group(1), params, tail + 1, end))
+    return out
+
+
+def _forwards_to_env(body: str, name: str) -> bool:
+    return re.search(rf"\benv::var(?:_os)?\(\s*&?{re.escape(name)}\s*\)", body) is not None
+
+
+def _rebinds(body: str, name: str) -> bool:
+    return re.search(rf"\blet\s+(?:mut\s+)?{re.escape(name)}\b", body) is not None
+
+
+def _rust_path_is(segments: list[str], function: _RustFn) -> bool:
+    """Whether a call's path can name this function: no path, a local root, or the function's module."""
+    if not segments or segments[-1] in ("crate", "self", "super"):
+        return True
+    path = PurePosixPath(function.rel)
+    return segments[-1] == (path.parent.name if path.stem == "mod" else path.stem)
+
+
+def _imports_other(mask: str, name: str, function: _RustFn) -> bool:
+    """Whether a use statement brings in a different item under this name."""
+    for statement in re.findall(r"\buse\s+([^;]+);", mask):
+        found = re.search(rf"\b{re.escape(name)}\b", statement)
+        if found:
+            before = statement[: found.start()]
+            before = before.rpartition("{")[0] if "{" in before else before
+            if not _rust_path_is(re.findall(r"[A-Za-z_]\w*", before), function):
+                return True
+    return False
+
+
+def rust_env_lookups(repo: Repo) -> dict[str, str]:
+    """Variables production Rust reads through a traced env callback or forwarding function -> where."""
+    codes: dict[str, str] = {}
+    masks: dict[str, str] = {}
+    for rel in repo.files:
+        if rel.endswith(".rs") and not _is_test_path(rel):
+            codes[rel], masks[rel] = _rust_views(repo.text(rel)[0] or "")
+    by_name: dict[str, list[_RustFn]] = defaultdict(list)
+    in_file: dict[str, list[_RustFn]] = defaultdict(list)
+    for rel, mask in masks.items():
+        for function in _rust_functions(rel, mask):
+            by_name[function.name].append(function)
+            in_file[rel].append(function)
+    # an ambiguous name or a method cannot be tied to its call sites
+    targets = {
+        name: found[0]
+        for name, found in by_name.items()
+        if len(found) == 1 and not any(p[0].lstrip("&").split()[-1:] == ["self"] for p in found[0].params)
+    }
+
+    def body(function: _RustFn) -> str:
+        return masks[function.rel][function.start : function.end]
+
+    calls: dict[str, list[_RustCall]] = defaultdict(list)
+    for rel, mask in masks.items():
+        for match in RUST_CALL_RE.finditer(mask):
+            name = match.group(2)
+            if name not in targets or re.search(r"\bfn\s+$", mask[max(0, match.start() - 8) : match.start()]):
+                continue
+            segments = [s for s in match.group(1).split("::") if s]
+            if not _rust_path_is(segments, targets[name]) or (not segments and _imports_other(mask, name, targets[name])):
+                continue
+            around = [f for f in in_file[rel] if f.start <= match.start() < f.end]
+            caller = max(around, key=lambda f: f.start) if around else None
+            if caller is not None and (_rebinds(body(caller), name) or name in [p[0] for p in caller.params]):
+                continue  # a local of the same name
+            spans = _rust_split(mask, match.end())[0]
+            calls[name].append(_RustCall(rel, match.start(), [codes[rel][a:b] for a, b in spans], [mask[a:b] for a, b in spans], caller))
+    candidates = {
+        (name, index)
+        for name, function in targets.items()
+        for index, (param, kind) in enumerate(function.params)
+        if RUST_LOOKUP_TYPE_RE.match(kind) and not _rebinds(body(function), param)
+    }
+    backed: set[tuple[str, int]] = set()
+
+    def is_backed(call: _RustCall, param: str) -> bool:
+        if call.caller is None or targets.get(call.caller.name) is not call.caller:
+            return False
+        names = [p[0] for p in call.caller.params]
+        return param in names and (call.caller.name, names.index(param)) in backed
+
+    def site_is_env(call: _RustCall, index: int) -> bool:
+        if index >= len(call.masked):
+            return False
+        closure = RUST_CLOSURE_RE.match(call.masked[index])
+        if closure:
+            key, rest = closure.group(1), closure.group(2)
+            if re.match(rf"(?:std::)?env::var(?:_os)?\(\s*&?{re.escape(key)}\s*\)", rest):
+                return True
+            forwarded = re.match(rf"([A-Za-z_]\w*)\(\s*&?{re.escape(key)}\s*\)", rest)
+            return forwarded is not None and is_backed(call, forwarded.group(1))
+        ident = re.fullmatch(r"\s*&?\s*([A-Za-z_]\w*)\s*", call.masked[index])
+        return ident is not None and is_backed(call, ident.group(1))
+
+    changed = True
+    while changed:
+        changed = False
+        for key in sorted(candidates - backed):
+            sites = calls.get(key[0], [])
+            if sites and all(site_is_env(call, key[1]) for call in sites):
+                backed.add(key)
+                changed = True
+    declared: dict[str, dict[str, str]] = {}
+
+    def value_of(rel: str, argument: str) -> str | None:
+        literal = re.fullmatch(r'\s*"([A-Z][A-Z0-9_]*)"\s*', argument)
+        return literal.group(1) if literal else resolve_env_argument(repo, rel, argument, declared)
+
+    found: dict[str, str] = {}
+    for name, index in sorted(backed):
+        function = targets[name]
+        param = function.params[index][0]
+        mask = masks[function.rel]
+        for match in re.finditer(rf"(?<![\w.:]){re.escape(param)}\s*\(", body(function)):
+            spans = _rust_split(mask, function.start + match.end())[0]
+            value = value_of(function.rel, codes[function.rel][spans[0][0] : spans[0][1]]) if spans else None
+            if value:
+                line = mask.count("\n", 0, function.start + match.start()) + 1
+                found.setdefault(value, f"{function.rel}:{line} through the env lookup {param}")
+    for name, function in sorted(targets.items()):
+        for index, (param, kind) in enumerate(function.params):
+            if not RUST_STR_TYPE_RE.fullmatch(kind) or not _forwards_to_env(body(function), param) or _rebinds(body(function), param):
+                continue
+            for call in calls.get(name, []):
+                value = value_of(call.rel, call.args[index]) if index < len(call.args) else None
+                if value:
+                    line = masks[call.rel].count("\n", 0, call.offset) + 1
+                    found.setdefault(value, f"{call.rel}:{line} through {name}, which reads the environment")
+    return found
+
+
+def _is_record(site: Site, rel: str) -> bool:
+    """A restructure record or an archived page: it describes the past on purpose."""
+    prefix = "" if site.docs_dir == "." else site.docs_dir + "/"
+    return rel.startswith((f"{prefix}internal/restructure/", f"{prefix}internal/history/"))
 
 
 def _implicit_env(name: str) -> bool:
@@ -4476,7 +4789,12 @@ def cmd_drift(args: argparse.Namespace, report: Report) -> list[str]:
     report.coverage.append(
         CoverageRow("markdown", "partial" if corpus.unreadable else "complete", ", ".join(corpus.unreadable) or f"{len(corpus.docs)} files")
     )
-    scope = select_scope(corpus, args.scope)
+    records = set() if args.include_records else {r for r in corpus.docs if _is_record(site, r)}
+    scope = select_scope(corpus, args.scope) - records
+    if records:
+        report.coverage.append(
+            CoverageRow("records", "complete", f"{len(records)} restructure and history records not read; --include-records reads them")
+        )
     binaries = project_binaries(repo)
     # Definitions in the code
     makefiles = {r: None for r in repo.files if PurePosixPath(r).name in ("Makefile", "GNUmakefile", "makefile") and not _is_test_path(r)}
@@ -4608,6 +4926,7 @@ def cmd_drift(args: argparse.Namespace, report: Report) -> list[str]:
                     make_confidence,
                     add,
                 )
+    lookups: dict[str, str] | None = None
     for name, (rel, number) in sorted(documented_env.items()):
         if name in readers or name in mentioned or _implicit_env(name):
             continue
@@ -4624,6 +4943,21 @@ def cmd_drift(args: argparse.Namespace, report: Report) -> list[str]:
                     suggestion="check the key it maps to against the config type the loader fills",
                 )
             )
+            continue
+        if lookups is None:
+            lookups = rust_env_lookups(repo)
+        if name in lookups:
+            add(
+                Finding(
+                    "env-unknown",
+                    "P3",
+                    "unverified",
+                    rel,
+                    number,
+                    f"{name} is read indirectly, at {lookups[name]}",
+                    suggestion="check that the docs match that read",
+                )
+            )
         else:
             add(
                 Finding(
@@ -4633,10 +4967,11 @@ def cmd_drift(args: argparse.Namespace, report: Report) -> list[str]:
                     rel,
                     number,
                     f"{name} is documented but nothing in the repository reads it",
-                    suggestion="remove it from the docs, or point at the code that reads it",
+                    ["dependencies were not scanned"],
+                    "remove it from the docs, point at the code that reads it, or confirm that a dependency reads it",
                 )
             )
-    all_text = "\n".join("\n".join(d.lines) for d in corpus.docs.values())
+    all_text = "\n".join("\n".join(d.lines) for r, d in corpus.docs.items() if r not in records)
     for name, files in sorted(readers.items()):
         if not _implicit_env(name) and not re.search(rf"(?<![\w]){re.escape(name)}(?![\w])", all_text):
             add(
@@ -4668,7 +5003,7 @@ def cmd_drift(args: argparse.Namespace, report: Report) -> list[str]:
                 )
             )
     if args.base:
-        _base_drift(args.base, repo, corpus, models, flags, readers, add)
+        _base_drift(args.base, repo, corpus, models, flags, readers, add, records)
         # a removed flag still documented is one problem, not also an unknown flag on the same line
         removed = {(f.file, f.line, f.message.split(" ")[0]) for f in report.findings if f.check == "removed-still-documented"}
         report.findings = [f for f in report.findings if not (f.check == "flag-unknown" and (f.file, f.line, _first_flag(f.message)) in removed)]
@@ -4865,6 +5200,7 @@ NOT_A_PATH_RE = re.compile(
 def _check_paths(corpus: Corpus, scope: set[str], repo: Repo, add: Callable[[Finding], None]) -> None:
     basenames = {PurePosixPath(f).name for f in repo.files}
     top_level = {f.split("/", 1)[0] for f in repo.files}
+    known = set(repo.files) | set(repo.all_dirs)
     for rel in sorted(scope):
         doc = corpus.docs[rel]
         base_dir = str(PurePosixPath(rel).parent)
@@ -4880,6 +5216,22 @@ def _check_paths(corpus: Corpus, scope: set[str], repo: Repo, add: Callable[[Fin
                 # a bare file name: a path only when no file of that name exists anywhere
                 if target not in basenames:
                     add(Finding("path-missing", "P3", "unverified", rel, number, f"{span}: no file of that name in the repository"))
+                continue
+            # a span that starts at an existing directory is anchored there: a deeper twin is not what it meant
+            anchored = target.split("/", 1)[0] in top_level or repo.exists(normalize_path(base_dir, target.split("/", 1)[0]) or "")
+            ends = [] if anchored else [p for p in known if p.endswith("/" + target)]
+            if len(ends) == 1:
+                add(
+                    Finding(
+                        "path-missing",
+                        "P3",
+                        "unverified",
+                        rel,
+                        number,
+                        f"{span}: a partial path; the only match is {ends[0]}",
+                        suggestion=f"use {ends[0]}",
+                    )
+                )
                 continue
             first = target.split("/", 1)[0]
             # a renamed top-level directory is drift too: a span that ends in a file name or a / names a path
@@ -5022,6 +5374,7 @@ def _base_drift(
     flags: dict[str, set[str]],
     readers: dict[str, list[str]],
     add: Callable[[Finding], None],
+    records: set[str],
 ) -> None:
     removed: dict[tuple[str, str], str] = {}
     added: dict[tuple[str, str], str] = {}
@@ -5040,6 +5393,8 @@ def _base_drift(
             added.pop(token, None)
     for (kind, value), source in sorted(removed.items()):
         for rel, doc in sorted(corpus.docs.items()):
+            if rel in records:
+                continue
             for number, line in enumerate(doc.lines, 1):
                 pattern = rf"\bmake\b[^\n`]*\s{re.escape(value)}\b" if kind == "make" else rf"(?<![\w-]){re.escape(value)}(?![\w-])"
                 if re.search(pattern, line):
@@ -5054,7 +5409,7 @@ def _base_drift(
                             [f"{source}: removed"],
                         )
                     )
-    all_text = "\n".join("\n".join(d.lines) for d in corpus.docs.values())
+    all_text = "\n".join("\n".join(d.lines) for r, d in corpus.docs.items() if r not in records)
     for (kind, value), source in sorted(added.items()):
         if not re.search(rf"(?<![\w-]){re.escape(value)}(?![\w-])", all_text):
             add(
@@ -7113,6 +7468,7 @@ def build_parser() -> argparse.ArgumentParser:
     drift.add_argument("--base", help="also report tokens removed or added since this commit (read-only git diff)")
     drift.add_argument("--paths", action="store_true", help="also check repository paths quoted in inline code")
     drift.add_argument("--leads", action="store_true", help="also report status claims, hand-maintained counts and stale docs as leads")
+    drift.add_argument("--include-records", action="store_true", help="also read docs/internal/restructure/ and docs/internal/history/")
     drift.add_argument("--allow-partial", action="store_true", help="exit 0/1 even when coverage is incomplete (the summary says PARTIAL)")
     audit = sub.add_parser("site-audit", help="audit zensical.toml or mkdocs.yml for what Zensical ignores, misses or does differently")
     _common(audit)

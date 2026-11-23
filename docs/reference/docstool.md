@@ -149,6 +149,7 @@ Find commands, flags, env vars and paths the docs name that the code no longer h
 | `--base` | `REF` |  | also report tokens removed or added since this commit (read-only git diff) |
 | `--paths` | flag |  | also check repository paths quoted in inline code |
 | `--leads` | flag |  | also report status claims, hand-maintained counts and stale docs as leads |
+| `--include-records` | flag |  | also read docs/internal/restructure/ and docs/internal/history/ |
 | `--allow-partial` | flag |  | exit 0/1 even when coverage is incomplete (the summary says PARTIAL) |
 
 Common options: `--root`, `--format`, `--out`, `--max`, `--fail-on`.
