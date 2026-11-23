@@ -789,3 +789,69 @@ def test_a_reviewed_mapping_covers_a_block_with_a_reference_edit(tmp_path: Path)
     code, report = docstool_json(repo, "plan", "verify")
     assert code == 1
     assert {"block-unaccounted", "mapping-unreviewed"} <= {f["check"] for f in report["findings"]}
+
+
+def split_repo(tmp_path: Path, **extra: Any) -> Path:
+    repo = make_repo("clean", tmp_path)
+    (repo / "docs" / "mixed.md").write_text("# Mixed\n\nIntro.\n\n## Old notes\n\nHistory text.\n", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "mixed")
+    split = {"from": "docs/mixed.md", "heading": "Old notes", "to": "docs/internal/history/old-notes.md", **extra}
+    write_plan(repo, {"keep": [{"paths": ["docs/"]}], "split": [split]}, ["docs/mixed.md"])
+    return repo
+
+
+def test_a_split_can_write_a_status_line(tmp_path: Path) -> None:
+    repo = split_repo(tmp_path, status="Historical notes, superseded by the guide.")
+    approve(repo)
+    code, report = docstool_json(repo, "plan", "apply", "--write")
+    assert code == 0, report["findings"]
+    moved = (repo / "docs/internal/history/old-notes.md").read_text(encoding="utf-8")
+    assert moved == "# Old notes\n\n> **Status:** Historical notes, superseded by the guide.\n\nHistory text.\n"
+    assert "Status" not in (repo / "docs/mixed.md").read_text(encoding="utf-8")
+    code, report = docstool_json(repo, "plan", "verify")
+    assert not {"block-unaccounted"} & {f["check"] for f in report["findings"]}
+
+
+def test_a_split_without_status_writes_none(tmp_path: Path) -> None:
+    repo = split_repo(tmp_path)
+    approve(repo)
+    assert docstool_json(repo, "plan", "apply", "--write")[0] == 0
+    assert "Status" not in (repo / "docs/internal/history/old-notes.md").read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("status", ["", "   ", 3])
+def test_a_split_refuses_a_blank_or_non_string_status(tmp_path: Path, status: Any) -> None:
+    repo = split_repo(tmp_path, status=status)
+    code, report = docstool_json(repo, "plan", "validate")
+    assert code == 1
+    assert any(f["check"] == "plan-entry" and "status" in f["message"] for f in report["findings"])
+
+
+@pytest.mark.parametrize(
+    ("section", "expected"),
+    [
+        ("## Old notes\nHistory text.\n", "# Old notes\n\n> **Status:** Old.\n\nHistory text.\n"),
+        ("Old notes\n---\n\n```sh\n# install deps\n```\n", "Old notes\n---\n\n> **Status:** Old.\n\n```sh\n# install deps\n```\n"),
+        ("Old notes\n---\n\nHistory text.\n", "Old notes\n---\n\n> **Status:** Old.\n\nHistory text.\n"),
+        (" ## Old notes\nHistory text.\n", " ## Old notes\n\n> **Status:** Old.\n\nHistory text.\n"),
+    ],
+)
+def test_a_split_status_sits_under_the_real_title(tmp_path: Path, section: str, expected: str) -> None:
+    repo = make_repo("clean", tmp_path)
+    (repo / "docs" / "mixed.md").write_text(f"# Mixed\n\nIntro.\n\n{section}", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "mixed")
+    split = {"from": "docs/mixed.md", "heading": "Old notes", "to": "docs/internal/history/old-notes.md", "status": "Old."}
+    write_plan(repo, {"keep": [{"paths": ["docs/"]}], "split": [split]}, ["docs/mixed.md"])
+    approve(repo)
+    code, report = docstool_json(repo, "plan", "apply", "--write")
+    assert code == 0, report["findings"]
+    assert (repo / "docs/internal/history/old-notes.md").read_text(encoding="utf-8") == expected
+
+
+def test_an_archive_status_skips_a_fenced_comment_and_front_matter() -> None:
+    module = load_module("docstool_status", DOCSTOOL)
+    text = "---\ntitle: x\n# yaml comment\n---\n\nIntro.\n\n```sh\n# not a title\n```\n"
+    assert module._status_line(text, "Old.") == "---\ntitle: x\n# yaml comment\n---\n> **Status:** Old.\n\n\nIntro.\n\n```sh\n# not a title\n```\n"
+    assert module._status_line("Title\n===\nBody.\n", "Old.") == "Title\n===\n\n> **Status:** Old.\n\nBody.\n"

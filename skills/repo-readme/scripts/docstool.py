@@ -5817,6 +5817,8 @@ def _validate_entries(context: PlanContext, couplings: list[dict[str, Any]]) -> 
             matches = [h for h in corpus.docs[source].headings if h.text == heading] if source in corpus.docs else []
             if len(matches) != 1:
                 error("plan-entry", f"split {source}: heading {heading!r} occurs {len(matches)} times; it must occur once")
+        if "status" in entry and not (isinstance(entry["status"], str) and entry["status"].strip()):
+            error("plan-entry", f"split {source}: status must be a non-empty string when present")
         claim(target, "split target")
     for entry in plan.entries("merge"):
         sources, into = _paths_of(entry, "from"), str(entry.get("into", ""))
@@ -6111,7 +6113,19 @@ def _rewrite_one(
     return prefix + rebuilt + ("#" + new_fragment if new_fragment else hash_mark)
 
 
-def _status_line(text: str, status: str, width: int = 100) -> str:
+def _title_end(lines: list[str], start: int) -> int | None:
+    """The index of the last line of a title that opens at start (an ATX line or a setext underline)."""
+    if ATX_RE.match(lines[start]):
+        return start
+    for index in range(start + 1, len(lines)):
+        if not lines[index].strip():
+            return None
+        if re.fullmatch(r" {0,3}(?:=+|-+)[ \t]*", lines[index]):
+            return index
+    return None
+
+
+def _status_line(text: str, status: str, width: int = 100, title_at: int | None = None) -> str:
     """The text with a status quote under its title, wrapped to the repository's line width."""
     lines = text.split("\n")
     # a wrapped line must not start like a list item, a heading or a quote: that would be structure
@@ -6124,11 +6138,27 @@ def _status_line(text: str, status: str, width: int = 100) -> str:
     else:
         wrapped = [f"**Status:** {status}"]
     note = "\n".join(f"> {part}" for part in wrapped)
-    for index, line in enumerate(lines):
-        heading = ATX_RE.match(line)
-        if heading and len(heading.group(1)) == 1:
-            return "\n".join([*lines[: index + 1], "", note, *lines[index + 1 :]])
-    return "\n".join([note, "", *lines])
+    body = 0
+    if lines[0].strip() == "---":
+        body = next((i + 1 for i in range(1, len(lines)) if lines[i].strip() in ("---", "...")), 0)
+    end = _title_end(lines, title_at) if title_at is not None else None
+    if end is None:
+        fence: tuple[str, int] | None = None
+        for index in range(body, len(lines)):
+            fence, in_code = _fence_step(fence, lines[index])
+            if in_code or not lines[index].strip():
+                continue
+            heading = ATX_RE.match(lines[index])
+            underline = index + 1 < len(lines) and re.fullmatch(r" {0,3}=+[ \t]*", lines[index + 1])
+            if (heading and len(heading.group(1)) == 1) or (not heading and underline):
+                end = index + 1 if underline and not heading else index
+                break
+    if end is None:
+        return "\n".join([*lines[:body], note, "", *lines[body:]])
+    rest = lines[end + 1 :]
+    # a line directly under the quote would be its lazy continuation in CommonMark
+    gap = [""] if rest and rest[0].strip() else []
+    return "\n".join([*lines[: end + 1], "", note, *gap, *rest])
 
 
 def _section_bounds(doc: MarkdownDoc, heading: str) -> tuple[int, int, int]:
@@ -6172,6 +6202,7 @@ def preflight(context: PlanContext) -> tuple[list[dict[str, Any]], list[tuple[st
             if site.config and site.published(source) and site.published(landing):
                 redirects.append((site.docs_rel(source), site.docs_rel(landing)))
     splits = []
+    split_status: dict[str, str] = {}
     for entry in plan.entries("split"):
         source, heading, target = str(entry["from"]), str(entry["heading"]), str(entry["to"])
         doc = corpus.docs[source]
@@ -6180,6 +6211,8 @@ def preflight(context: PlanContext) -> tuple[list[dict[str, Any]], list[tuple[st
         for h in section_headings:
             anchor_map[(source, h.gh_slug.lower())] = (target, h.gh_slug)
         splits.append((source, heading, target, first, end, level, {h.gh_slug.lower() for h in section_headings}))
+        if "status" in entry:
+            split_status[target] = str(entry["status"])
         if site.config and site.published(source) and site.kind == "zensical":
             for h in section_headings:
                 redirects.append((f"{site.docs_rel(source)}#{h.site_slug}", f"{site.docs_rel(target)}#{h.site_slug}"))
@@ -6210,6 +6243,8 @@ def preflight(context: PlanContext) -> tuple[list[dict[str, Any]], list[tuple[st
             moved_text = _rewrite_links(
                 moved_text, str(PurePosixPath(rel).parent), str(PurePosixPath(target).parent), rel, target, path_map, {}, inner
             )
+            if target in split_status:
+                moved_text = _status_line(moved_text, split_status[target], wrap_width, title_at=0)
             tree.write(target, moved_text.encode())
             text = remaining
         rewritten = _rewrite_links(text, str(PurePosixPath(rel).parent), str(PurePosixPath(new_rel).parent), rel, new_rel, path_map, anchor_map)
