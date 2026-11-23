@@ -116,12 +116,12 @@ Validate, approve, apply, resume, roll back or verify a restructure plan.
 
 | Option | Values | Default | What it does |
 | --- | --- | --- | --- |
-| `action` | `validate`, `approve`, `apply`, `resume`, `rollback`, `verify` |  | what to do with the plan (see below) |
+| `action` | `validate`, `approve`, `apply`, `resume`, `rollback`, `verify`, `mappings` |  | what to do with the plan (see below) |
 | `--plan` | `PATH` | `docs/internal/restructure/plan.toml` | the plan file |
 | `--write` | flag |  | apply: write the changes (the default is a dry run) |
 | `--by` | `NAME` |  | approve: who approves (gate G9) |
 | `--mappings` | flag |  | approve: write review receipts for mappings.toml instead of the plan approval |
-| `--urls` | `PATH` |  | verify: also check a saved URL baseline against --built |
+| `--urls` | `PATH` |  | verify, mappings: also check a saved URL baseline (a site's needs --built) |
 | `--built` | `DIR` |  | verify --urls: the new site-build output |
 
 Common options: `--root`, `--format`, `--out`, `--max`, `--fail-on`.

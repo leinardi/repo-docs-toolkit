@@ -41,6 +41,7 @@ run incomplete (exit 3) instead of clean.
 from __future__ import annotations
 
 import argparse
+import difflib
 import hashlib
 import html
 import io
@@ -200,6 +201,7 @@ class Report:
     coverage: list[CoverageRow] = field(default_factory=list)
     findings: list[Finding] = field(default_factory=list)
     data: dict[str, Any] = field(default_factory=dict)
+    text_max: int = 50  # entries a text renderer lists before it says how many more there are
 
     def add(self, finding: Finding) -> None:
         self.findings.append(finding)
@@ -6005,6 +6007,10 @@ class PlanContext:
             )
         )
         self.plan = load_plan(self.repo, _plan_rel(self.repo, str(args.plan)))
+        # what verify found, for the mappings scaffold
+        self.baseline: list[dict[str, Any]] | None = None
+        self.unmatched: list[int] = []  # baseline positions with no block left, one per occurrence
+        self.github_lost: list[tuple[str, bool, list[str]]] = []  # (path, whole page, anchors)
 
     def couplings(self) -> list[dict[str, Any]]:
         if not hasattr(self, "_couplings"):
@@ -6709,7 +6715,8 @@ def preflight(context: PlanContext) -> tuple[list[dict[str, Any]], list[tuple[st
     redirects: list[tuple[str, str]] = []
     status_of: dict[str, str] = {}
     # a status line wraps where the repository's Markdown lint does, else at its usual width
-    wrap_width = tooling_census(repo).get("markdown_wrap") or house_style(corpus)["wrap_p95"] or 100
+    lint_wrap = tooling_census(repo).get("markdown_wrap")
+    wrap_width = lint_wrap or house_style(corpus)["wrap_p95"] or 100
     for kind in ("move", "archive"):
         for entry in plan.entries(kind):
             source, target = str(entry["from"]), str(entry["to"])
@@ -6788,7 +6795,44 @@ def preflight(context: PlanContext) -> tuple[list[dict[str, Any]], list[tuple[st
         tree.write(str(entry["path"]), None)
     if redirects and site.config:
         tree.write(site.config, _append_redirects(tree.text(site.config), site, redirects).encode())
+    if lint_wrap:
+        origin = {**{target: source for source, target in path_map.items()}, **{s[2]: s[0] for s in splits}}
+        warnings = _wrap_warnings(tree, lint_wrap, origin)
+        if warnings:
+            context.report.data["wrap_warnings"] = warnings
     return tree.operations(), redirects
+
+
+def _md013_long(line: str, limit: int) -> bool:
+    """markdownlint 0.40.0 MD013 with its defaults: the last word may cross the limit if it starts within it."""
+    if re.match(r" {0,3}\[[^\]]+\]:", line):
+        return False  # a link reference definition
+    if re.fullmatch(r"[\s>*+-]*(?:\d+[.)]\s*)?", re.sub(r"!?\[[^\]]*\]\([^)]*\)|<[^>\s]+>", "", line)):
+        return False  # nothing but links
+    return len(re.sub(r"\S*$", "#", line, count=1)) > limit
+
+
+def _wrap_warnings(tree: VirtualTree, limit: int, origin: dict[str, str]) -> list[dict[str, Any]]:
+    """Lines the plan pushes past the markdownlint limit that were within it before; code is exempt."""
+    out = []
+    for op in tree.operations():
+        rel = op["path"]
+        if op["data"] is None or not rel.endswith(MARKDOWN_EXTENSIONS):
+            continue
+        before = [line.rstrip("\r") for line in (tree._disk(origin.get(rel, rel)) or b"").decode("utf-8", "replace").split("\n")]
+        after = [line.rstrip("\r") for line in op["data"].decode("utf-8").split("\n")]
+        previous: dict[int, str] = {}
+        for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, before, after, autojunk=False).get_opcodes():
+            if tag in ("equal", "replace"):
+                for offset in range(min(i2 - i1, j2 - j1)):
+                    previous[j1 + offset] = before[i1 + offset]
+        fence: tuple[str, int] | None = None
+        for index, line in enumerate(after):
+            fence, in_code = _fence_step(fence, line)
+            if in_code or not _md013_long(line, limit) or (index in previous and _md013_long(previous[index], limit)):
+                continue
+            out.append({"path": rel, "line": index + 1, "length": len(line), "limit": limit})
+    return out
 
 
 def _append_redirects(text: str, site: Site, redirects: list[tuple[str, str]]) -> str:
@@ -7006,6 +7050,9 @@ class _Refused(Exception):
 
 def cmd_plan(args: argparse.Namespace, report: Report) -> list[str]:
     action = args.action
+    if action == "mappings" and args.out:
+        raise UsageError("plan mappings prints to stdout only, so it can never overwrite a plan artifact")
+    report.text_max = args.max
     context = PlanContext(args, report)
     required = ["config", "nav", "exclude_docs", "redirects", "markdown"]
     art = _plan_art(context)
@@ -7015,6 +7062,12 @@ def cmd_plan(args: argparse.Namespace, report: Report) -> list[str]:
             return []
         if action == "verify":
             return _verify(context, args)
+        if action == "mappings":
+            needed = [r for r in _verify(context, args) if r != "github_urls" or args.urls]
+            report.findings = []  # a skeleton is not a verdict: plan verify is
+            if context.baseline is not None:
+                report.data["mappings_toml"] = _mappings_scaffold(context, args)
+            return needed
         if action == "approve" and args.mappings:
             _approve_mappings(context, args)
             return ["conservation_baseline"]
@@ -7170,12 +7223,20 @@ def _load_mappings(context: PlanContext) -> list[dict[str, Any]]:
     path = context.repo.root / context.plan.artifact(MAPPINGS_NAME)
     if not path.is_file():
         return []
-    data = tomllib.loads(path.read_text(encoding="utf-8"))
+    try:
+        data = tomllib.loads(path.read_text(encoding="utf-8"))
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as error:
+        raise UsageError(f"{context.plan.artifact(MAPPINGS_NAME)}: {error}") from error
     out = []
     for kind in MAPPING_TYPES:
-        for entry in data.get(kind, []) or []:
-            if isinstance(entry, dict):
-                out.append({"kind": kind, **entry})
+        entries = data.get(kind, [])
+        if not isinstance(entries, list) or not all(isinstance(entry, dict) for entry in entries):
+            raise UsageError(f"{context.plan.artifact(MAPPINGS_NAME)}: {kind} must be an array of tables")
+        for entry in entries:
+            blocks = entry.get("blocks", [])
+            if not isinstance(blocks, list) or not all(isinstance(h, str) for h in blocks):
+                raise UsageError(f"{context.plan.artifact(MAPPINGS_NAME)}: mapping {entry.get('id', '?')}: blocks must be a list of hashes")
+        out += [{"kind": kind, **entry} for entry in entries]
     return out
 
 
@@ -7276,6 +7337,15 @@ def _github_loss_keys(entry: dict[str, Any]) -> set[tuple[str, str]]:
     return {(path, str(a)) for a in entry.get("anchors", [])} | ({(path, "")} if entry.get("page") else set())
 
 
+def _github_loss_named(entry: dict[str, Any]) -> set[tuple[str, str]]:
+    """The (path, fragment) pairs an entry names, reviewed or not: a saved skeleton is not listed twice."""
+    path, anchors = entry.get("path"), entry.get("anchors", [])
+    if not isinstance(path, str):
+        return set()
+    named = {(path, a) for a in anchors if isinstance(a, str)} if isinstance(anchors, list) else set()
+    return named | ({(path, "")} if entry.get("page") is True else set())
+
+
 def _compare_github(context: PlanContext, table: dict[str, Any], accepted: set[tuple[str, str]]) -> CoverageRow:
     """Every old GitHub path and fragment must exist at its original path, or be an accepted loss."""
     kept = 0
@@ -7283,6 +7353,7 @@ def _compare_github(context: PlanContext, table: dict[str, Any], accepted: set[t
         doc = context.corpus.docs.get(rel)
         if doc is None:
             if (rel, "") not in accepted:
+                context.github_lost.append((rel, True, list(anchors)))
                 context.report.add(
                     Finding(
                         "github-url-lost",
@@ -7300,6 +7371,7 @@ def _compare_github(context: PlanContext, table: dict[str, Any], accepted: set[t
         gone = [a for a in anchors if a.lower() not in have and (rel, a) not in accepted]
         kept += len(anchors) - len(gone)
         if gone:
+            context.github_lost.append((rel, False, gone))
             context.report.add(
                 Finding(
                     "github-url-lost",
@@ -7314,14 +7386,98 @@ def _compare_github(context: PlanContext, table: dict[str, Any], accepted: set[t
     return CoverageRow("github_urls", "complete", f"{len(table)} paths compared at their original location, {kept} anchors kept or accepted")
 
 
+def _toml_string(value: str) -> str:
+    # JSON escapes are valid TOML; DEL is the one control character JSON leaves raw
+    return json.dumps(value, ensure_ascii=False).replace(chr(0x7F), "\\" + "u007F")
+
+
+def _toml_comment(value: str) -> str:
+    return "".join(c if c.isprintable() else " " for c in value)[:80]
+
+
+def _mappings_scaffold(context: PlanContext, args: argparse.Namespace) -> str:
+    """A mappings.toml skeleton: one entry per unmatched occurrence no existing entry covers yet."""
+    baseline = context.baseline or []
+    existing = _load_mappings(context)
+    taken = Counter(h for entry in existing if entry["kind"] != "github_loss" for h in entry.get("blocks", []))
+    ids = {str(entry.get("id")) for entry in existing}
+    named = {key for entry in existing if entry["kind"] == "github_loss" for key in _github_loss_named(entry)}
+    number = 0
+
+    def next_id() -> str:
+        nonlocal number
+        number += 1
+        while f"m{number}" in ids:
+            number += 1
+        return f"m{number}"
+
+    out = [
+        "# plan mappings: a skeleton for mappings.toml. It is not a verification.",
+        "# Fill in every to and reason, then have the owner review it.",
+    ]
+    if not args.urls:
+        out.append("# GitHub URLs were not compared: pass --urls to include them.")
+    entries = 0
+    for position in context.unmatched:
+        block = baseline[position]
+        if taken[block["hash"]] > 0:
+            taken[block["hash"]] -= 1
+            continue
+        entries += 1
+        out += [
+            "",
+            f"# {_toml_comment(str(block['file']))}:{block['line']} {_toml_comment(str(block['type']))}: {_toml_comment(str(block['text']))}",
+            "# Or make this a [[dropped]] entry with a proof.",
+            "[[rewritten]]",
+            f"id = {_toml_string(next_id())}",
+            f"blocks = [{_toml_string(block['hash'])}]",
+            'to = ""',
+        ]
+    for rel, page, anchors in context.github_lost:
+        remaining = [a for a in anchors if (rel, a) not in named]
+        if (page and (rel, "") in named) or (not page and not remaining):
+            continue
+        entries += 1
+        out += [
+            "",
+            f"# the GitHub URL of {_toml_comment(rel)} is lost",
+            "[[github_loss]]",
+            f"id = {_toml_string(next_id())}",
+            f"path = {_toml_string(rel)}",
+        ]
+        out.append("page = true" if page else "anchors = [" + ", ".join(_toml_string(a) for a in remaining) + "]")
+        out.append('reason = ""')
+    if not entries:
+        out += ["", "# Nothing to map."]
+    return "\n".join(out) + "\n"
+
+
+def _baseline_entry_problem(entry: Any) -> str | None:
+    """Why a blocks.json entry cannot be trusted, or None: a damaged baseline must not look complete."""
+    if not isinstance(entry, dict):
+        return "not an object"
+    for key, kind in (("file", str), ("line", int), ("type", str), ("depth", int), ("heading_path", list), ("hash", str), ("text", str)):
+        value = entry.get(key)
+        if not isinstance(value, kind) or isinstance(value, bool):
+            return f"{key} is missing or malformed"
+    if not entry["hash"] or not all(isinstance(h, str) for h in entry["heading_path"]):
+        return "hash or heading_path is malformed"
+    return None
+
+
 def _load_baseline(context: PlanContext) -> list[dict[str, Any]] | None:
     rel = context.plan.meta.get("blocks")
     data = _read_json(context.repo.root / str(rel)) if isinstance(rel, str) else None
     if not isinstance(data, dict) or not isinstance(data.get("blocks"), list):
         context.report.coverage.append(CoverageRow("conservation_baseline", "failed", f"{rel}: missing or unreadable"))
         return None
+    for index, entry in enumerate(data["blocks"]):
+        problem = _baseline_entry_problem(entry)
+        if problem:
+            context.report.coverage.append(CoverageRow("conservation_baseline", "failed", f"{rel}: block {index}: {problem}"))
+            return None
     context.report.coverage.append(CoverageRow("conservation_baseline", "complete", f"{rel}: {len(data['blocks'])} blocks"))
-    return [b for b in data["blocks"] if isinstance(b, dict)]
+    return list(data["blocks"])
 
 
 def _verify(context: PlanContext, args: argparse.Namespace) -> list[str]:
@@ -7330,6 +7486,7 @@ def _verify(context: PlanContext, args: argparse.Namespace) -> list[str]:
     baseline = _load_baseline(context)
     if baseline is None:
         return required
+    context.baseline = baseline
     current = [(rel, b, _block_hash(b)) for rel in sorted(corpus.docs) for b in corpus.docs[rel].blocks]
     occurrences: dict[str, list[int]] = defaultdict(list)
     for index, (_rel, _block, digest) in enumerate(current):
@@ -7394,6 +7551,8 @@ def _verify(context: PlanContext, args: argparse.Namespace) -> list[str]:
             # of identical copies (a table copied into a spike, a repeated warning), the one still
             # in its section is the one this block became
             free.sort(key=lambda i: not _place_kept(context.plan, block, current[i][0], current[i][1].heading_path))
+        if not free:
+            context.unmatched.append(position)
         if free:
             used.add(free[0])
             matched.append(free[0])
@@ -7411,7 +7570,8 @@ def _verify(context: PlanContext, args: argparse.Namespace) -> list[str]:
                     block["file"],
                     block["line"],
                     f"{block['type']} not found after the restructure: {block['text'][:100]!r}",
-                    suggestion="restore it, or record a rewritten/dropped mapping and have it reviewed",
+                    [f"block hash: {block['hash']}"],
+                    "restore it, or record a rewritten/dropped mapping and have it reviewed (plan mappings prints a skeleton)",
                 )
             )
     unaccounted = sum(1 for f in report.findings if f.check == "block-unaccounted")
@@ -7606,12 +7766,12 @@ def build_parser() -> argparse.ArgumentParser:
     build.add_argument("--generator-cmd", help=argparse.SUPPRESS)
     plan = sub.add_parser("plan", help="validate, approve, apply, resume, roll back or verify a restructure plan")
     _common(plan)
-    plan.add_argument("action", choices=("validate", "approve", "apply", "resume", "rollback", "verify"))
+    plan.add_argument("action", choices=("validate", "approve", "apply", "resume", "rollback", "verify", "mappings"))
     plan.add_argument("--plan", default="docs/internal/restructure/plan.toml", help="the plan file (default docs/internal/restructure/plan.toml)")
     plan.add_argument("--write", action="store_true", help="apply: write the changes (the default is a dry run)")
     plan.add_argument("--by", help="approve: who approves (gate G9)")
     plan.add_argument("--mappings", action="store_true", help="approve: write review receipts for mappings.toml instead of the plan approval")
-    plan.add_argument("--urls", help="verify: also check a saved URL baseline against --built")
+    plan.add_argument("--urls", help="verify, mappings: also check a saved URL baseline (a site's needs --built)")
     plan.add_argument("--built", help="verify --urls: the new site-build output")
     drift = sub.add_parser("drift", help="find commands, flags, env vars and paths the docs name that the code no longer has")
     _common(drift)
@@ -7669,6 +7829,15 @@ def render_plan_text(report: Report) -> str:
     held = report.data.get("held_labels") or []
     if held:
         out += [f"Link labels that spell an old path, left for you ({len(held)}):"] + [f"  {h}" for h in held]
+    warnings = report.data.get("wrap_warnings") or []
+    if warnings:
+        out.append(
+            f"Wrap warnings: apply pushes {len(warnings)} lines past the markdownlint line_length"
+            " (MD013 defaults; its strict, stern, tables and headings options are not read):"
+        )
+        out += [f"  {w['path']}:{w['line']} ({w['length']} > {w['limit']})" for w in warnings[: report.text_max]]
+        if len(warnings) > report.text_max:
+            out.append(f"  ... {len(warnings) - report.text_max} more (raise --max or use --format json)")
     return "\n".join(out) + "\n\n"
 
 
@@ -7686,6 +7855,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         required = COMMANDS[args.command](args, report)
         code, incomplete = finalize(report, required, args.fail_on, getattr(args, "allow_partial", False))
+        scaffold = args.command == "plan" and args.action == "mappings"
+        if scaffold and incomplete:
+            report.data.pop("mappings_toml", None)
         if args.format == "json":
             output = render_json(report, incomplete)
         elif args.command == "slug":
@@ -7695,9 +7867,14 @@ def main(argv: list[str] | None = None) -> int:
                 + "\n"
                 for r in report.data["slugs"]
             )
+        elif scaffold and "mappings_toml" in report.data:
+            output = report.data["mappings_toml"]  # stdout is the TOML itself, with no report around it
         else:
             extra = TEXT_RENDERERS[args.command](report) if args.command in TEXT_RENDERERS else ""
             output = extra + render_text(report, incomplete, args.max)
+        if scaffold and args.format == "text" and "mappings_toml" not in report.data:
+            sys.stderr.write(output)  # stdout stays empty, so a redirect cannot capture a report as TOML
+            return code
         if getattr(args, "out", None):
             _write_output(Path(args.out), output)
         else:

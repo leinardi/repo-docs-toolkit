@@ -29,6 +29,7 @@ from __future__ import annotations
 import hashlib
 import json
 import subprocess
+import tomllib
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
@@ -1196,3 +1197,202 @@ def test_a_moved_page_with_a_label_in_a_split_section_uses_the_new_directory(tmp
     assert "[../guide/new.md](../guide/new.md)" in (repo / "docs" / "archive" / "part.md").read_text(encoding="utf-8")
     code, report = docstool_json(repo, "plan", "verify")
     assert code == 0, report["findings"]
+
+
+def scaffold(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    return run_script(DOCSTOOL, "plan", "mappings", "--root", str(repo), *args)
+
+
+def repeated_repo(tmp_path: Path) -> Path:
+    repo = make_repo("clean", tmp_path)
+    (repo / "docs" / "same.md").write_text("# Same\n\nSame text.\n\nMiddle.\n\nSame text.\n", encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "same")
+    write_plan(repo, {"keep": [{"paths": ["docs/"]}]})
+    return repo
+
+
+def test_block_unaccounted_names_the_hash(tmp_path: Path) -> None:
+    repo = repeated_repo(tmp_path)
+    blocks = json.loads((repo / ART / "blocks.json").read_text(encoding="utf-8"))["blocks"]
+    digest = next(b["hash"] for b in blocks if b["text"] == "Middle.")
+    (repo / "docs" / "same.md").write_text("# Same\n\nSame text.\n\nSame text.\n", encoding="utf-8")
+    _, report = docstool_json(repo, "plan", "verify")
+    finding = next(f for f in report["findings"] if f["check"] == "block-unaccounted")
+    assert f"block hash: {digest}" in finding["evidence"]
+
+
+def test_the_default_scaffold_output_is_toml_and_cannot_be_approved_unfilled(tmp_path: Path) -> None:
+    repo = repeated_repo(tmp_path)
+    (repo / "docs" / "same.md").write_text("# Same\n\nSame text.\n\nSame text.\n", encoding="utf-8")
+    result = scaffold(repo)
+    assert result.returncode == 0, result.stderr
+    data = tomllib.loads(result.stdout)
+    assert [e["to"] for e in data["rewritten"]] == [""]
+    assert not result.stdout.startswith("docstool")
+    (repo / ART / "mappings.toml").write_text(result.stdout, encoding="utf-8")
+    code, report = docstool_json(repo, "plan", "approve", "--mappings", "--by", "Owner")
+    assert code == 1
+    assert "mapping-invalid" in {f["check"] for f in report["findings"]}
+    assert not (repo / ART / "review-receipts.json").exists()
+
+
+def test_the_scaffold_keeps_a_second_missing_copy_of_a_mapped_hash(tmp_path: Path) -> None:
+    repo = repeated_repo(tmp_path)
+    blocks = json.loads((repo / ART / "blocks.json").read_text(encoding="utf-8"))["blocks"]
+    digest = next(b["hash"] for b in blocks if b["text"] == "Same text.")
+    (repo / "docs" / "same.md").write_text("# Same\n\nMiddle.\n", encoding="utf-8")
+    assert [e["blocks"] for e in tomllib.loads(scaffold(repo).stdout)["rewritten"]] == [[digest], [digest]]
+    (repo / ART / "mappings.toml").write_text(f'[[rewritten]]\nid = "m1"\nblocks = ["{digest}"]\nto = "docs/same.md"\n', encoding="utf-8")
+    entries = tomllib.loads(scaffold(repo).stdout)["rewritten"]
+    assert [e["blocks"] for e in entries] == [[digest]]
+    assert entries[0]["id"] != "m1"
+
+
+@pytest.mark.parametrize("damage", [lambda b: b.append(3), lambda b: b[0].pop("hash"), lambda b: b[0].update(line="x")])
+def test_a_damaged_baseline_gives_no_scaffold(tmp_path: Path, damage: Callable[[list[Any]], None]) -> None:
+    repo = repeated_repo(tmp_path)
+    path = repo / ART / "blocks.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    damage(data["blocks"])
+    path.write_text(json.dumps(data), encoding="utf-8")
+    result = scaffold(repo)
+    assert result.returncode == 3
+    assert result.stdout == ""
+    assert "conservation_baseline" in result.stderr
+    assert docstool_code(repo, "plan", "verify") == 3
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        b"rewritten = [1]\n",
+        b'[[rewritten]]\nid = "m1"\nblocks = 1\n',
+        b'[[rewritten]]\nid = "m1"\nblocks = "abc"\n',
+        b'[[rewritten]]\nid = "m1"\nblocks = [["a"]]\n',
+        b"# \xff not utf-8\n",
+    ],
+)
+def test_malformed_mappings_are_refused(tmp_path: Path, content: bytes) -> None:
+    repo = repeated_repo(tmp_path)
+    (repo / ART / "mappings.toml").write_bytes(content)
+    assert scaffold(repo).returncode == 2
+    assert docstool_code(repo, "plan", "verify") == 2
+
+
+@pytest.mark.parametrize("name", ["plan.toml", "blocks.json", "mappings.toml", "review-receipts.json", "new.toml"])
+def test_the_scaffold_never_writes_a_file(tmp_path: Path, name: str) -> None:
+    repo = repeated_repo(tmp_path)
+    (repo / ART / "mappings.toml").write_text("", encoding="utf-8")
+    (repo / ART / "review-receipts.json").write_text('{"receipts": []}', encoding="utf-8")
+    before = {p.name: p.read_bytes() for p in (repo / ART).iterdir()}
+    result = scaffold(repo, "--out", str(repo / ART / name))
+    assert result.returncode == 2
+    assert result.stdout == ""
+    assert {p.name: p.read_bytes() for p in (repo / ART).iterdir()} == before
+
+
+def test_the_scaffold_as_json(tmp_path: Path) -> None:
+    repo = repeated_repo(tmp_path)
+    (repo / "docs" / "same.md").write_text("# Same\n\nSame text.\n\nSame text.\n", encoding="utf-8")
+    code, report = docstool_json(repo, "plan", "mappings")
+    assert code == 0
+    assert report["findings"] == []
+    assert len(tomllib.loads(report["data"]["mappings_toml"])["rewritten"]) == 1
+
+
+def test_the_scaffold_lists_github_losses_with_urls(tmp_path: Path) -> None:
+    repo = no_site_repo(tmp_path)
+    page = repo / "docs" / "old.md"
+    page.write_text(page.read_text(encoding="utf-8").replace("## Details", "## More"), encoding="utf-8")
+    assert "GitHub URLs were not compared" in scaffold(repo).stdout
+    result = scaffold(repo, "--urls", f"{ART}/urls.json")
+    assert result.returncode == 0, result.stderr
+    losses = tomllib.loads(result.stdout)["github_loss"]
+    assert [(e["path"], e["anchors"], e["reason"]) for e in losses] == [("docs/old.md", ["details"], "")]
+    (repo / ART / "mappings.toml").write_text(result.stdout, encoding="utf-8")
+    assert docstool_json(repo, "plan", "approve", "--mappings", "--by", "Owner")[0] == 1
+    assert "github_loss" not in tomllib.loads(scaffold(repo, "--urls", f"{ART}/urls.json").stdout)
+
+
+def test_a_scaffold_comment_stays_on_one_line(tmp_path: Path) -> None:
+    repo = make_repo("clean", tmp_path)
+    (repo / "docs" / "code.md").write_text('# Code\n\n```sh\nfirst\n[[rewritten]]\nid = "x"\n```\n', encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "code")
+    write_plan(repo, {"keep": [{"paths": ["docs/"]}]})
+    (repo / "docs" / "code.md").write_text("# Code\n", encoding="utf-8")
+    entries = tomllib.loads(scaffold(repo).stdout)["rewritten"]
+    assert len(entries) == 1
+    assert entries[0]["id"] == "m1"
+
+
+def wrap_repo(tmp_path: Path, limit: int = 50, page: bytes | None = None) -> Path:
+    repo = make_repo("clean", tmp_path)
+    (repo / ".markdownlint.yaml").write_text(f"MD013:\n  line_length: {limit}\n", encoding="utf-8")
+    (repo / "docs" / "old.md").write_text("# Old\n\nBody.\n", encoding="utf-8")
+    long_before = "An old line that was already much longer than the limit, before this plan."
+    (repo / "docs" / "page.md").write_text(
+        f"# Page\n\nSee the [old page](old.md) for it all.\n\n[old page](old.md) is here and also more.\n\n{long_before}\n\n[a](old.md)\n",
+        encoding="utf-8",
+    )
+    if page is not None:
+        (repo / "docs" / "page.md").write_bytes(page)
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "wrap")
+    target = "docs/guide/some/deeply/nested/place/new.md"
+    write_plan(repo, {"keep": [{"paths": ["docs/"]}], "move": [{"from": "docs/old.md", "to": target}]}, ["docs/old.md", "docs/page.md"])
+    return repo
+
+
+def test_the_default_dry_run_shows_wrap_warnings(tmp_path: Path) -> None:
+    repo = wrap_repo(tmp_path)
+    result = run_script(DOCSTOOL, "plan", "apply", "--root", str(repo))
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Wrap warnings: apply pushes 2 lines past the markdownlint line_length (MD013 defaults" in result.stdout
+    assert "docs/page.md:3 (" in result.stdout
+    assert "docs/page.md:5 (" in result.stdout
+    assert "docs/page.md:7 (" not in result.stdout
+    assert "docs/page.md:9 (" not in result.stdout
+    capped = run_script(DOCSTOOL, "plan", "apply", "--root", str(repo), "--max", "1")
+    assert "... 1 more (raise --max or use --format json)" in capped.stdout
+    code, report = docstool_json(repo, "plan", "apply")
+    assert code == 0
+    assert len(report["data"]["wrap_warnings"]) == 2
+
+
+def wrap_lines(repo: Path) -> list[int]:
+    code, report = docstool_json(repo, "plan", "apply")
+    assert code == 0, report["findings"]
+    return [w["line"] for w in report["data"].get("wrap_warnings", [])]
+
+
+def test_wrap_warnings_follow_md013(tmp_path: Path) -> None:
+    page = (
+        "# Page\n\n"
+        "A line already well past the limit before [old page](old.md) and more.\n\n"
+        "See the [old page](old.md) for it all.\n\n"
+        "Short words then the last token [x](old.md)\n\n"
+        "[old page](old.md) [old page](old.md)\n\n"
+        "[ref]: old.md\n"
+    )
+    assert wrap_lines(wrap_repo(tmp_path, page=page.encode())) == [5]
+
+
+def test_wrap_warnings_read_crlf_files(tmp_path: Path) -> None:
+    module = load_module("docstool_wrap", DOCSTOOL)
+    (tmp_path / "page.md").write_bytes(b"```sh\r\ncode\r\n```\r\n\r\nSee the [old page](old.md) for it all.\r\n")
+    tree = module.VirtualTree(tmp_path)
+    tree.write("page.md", b"```sh\r\ncode\r\n```\r\n\r\nSee the [old page](guide/some/deeply/nested/new.md) for it all.\r\n")
+    assert [w["line"] for w in module._wrap_warnings(tree, 50, {})] == [5]
+
+
+def test_no_wrap_warnings_without_a_lint_limit(tmp_path: Path) -> None:
+    repo = wrap_repo(tmp_path)
+    (repo / ".markdownlint.yaml").unlink()
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "no lint")
+    target = "docs/guide/some/deeply/nested/place/new.md"
+    (repo / ART / "blocks.json").unlink()
+    write_plan(repo, {"keep": [{"paths": ["docs/"]}], "move": [{"from": "docs/old.md", "to": target}]}, ["docs/old.md", "docs/page.md"])
+    assert "Wrap warnings" not in run_script(DOCSTOOL, "plan", "apply", "--root", str(repo)).stdout
