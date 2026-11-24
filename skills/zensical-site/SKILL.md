@@ -129,7 +129,7 @@ the repo-docs skill's restructure mode; this skill takes over once the content i
 | Gate | When |
 | --- | --- |
 | Z1 | Switching the generator or the deployment |
-| Z2 | Pages source, custom domain or DNS: settings only the user changes |
+| Z2 | Pages source, the `github-pages` environment, custom domain or DNS: settings only the user changes |
 | Z3 | Choosing a brand colour when the project has none, or changing one that fails `contrast` |
 | Z4 | Replacing what an unsupported plugin or a hook did |
 | Z5 | Changing URLs or anchors: `use_directory_urls`, the layout of `docs/`, the slug style (`toc.slugify`) |
