@@ -45,6 +45,26 @@
     grid-row: 1 / span 2;
     align-self: center;
   }
+
+  /* No showcase (a service whose compose file is too long to show): the hero and a narrower
+     install block are centred above the cards instead of leaving the right half empty. */
+  .rdt-home:not(:has(> .rdt-showcase)) > .rdt-hero {
+    text-align: center;
+  }
+
+  .md-typeset .rdt-home:not(:has(> .rdt-showcase)) .rdt-hero__logo,
+  .md-typeset .rdt-home:not(:has(> .rdt-showcase)) .rdt-hero__tagline {
+    margin-inline: auto;
+  }
+
+  .md-typeset .rdt-home:not(:has(> .rdt-showcase)) .rdt-hero__actions {
+    justify-content: center;
+  }
+
+  .rdt-home:not(:has(> .rdt-showcase)) > .rdt-install {
+    justify-self: center;
+    width: min(100%, 36rem);
+  }
 }
 
 /* Hero */

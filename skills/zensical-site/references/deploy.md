@@ -13,7 +13,12 @@ shipped workflow builds every pull request with `--strict` and deploys the defau
   so Zensical comes from the committed `uv.lock` ([config.md](config.md) covers the project);
 - uploads `site/` and deploys it with GitHub's Pages actions, in a separate job that alone has
   `pages: write` and `id-token: write`;
-- pins every action to a full commit SHA, with the tag in a comment.
+- pins every action to a full commit SHA, with the tag in a comment;
+- runs in one concurrency group per workflow and ref, with `cancel-in-progress` only for pull
+  requests: a newer push to a pull request cancels its running build, while on `main` a running
+  deployment is not cancelled by this policy. GitHub keeps at most one pending run per group, so
+  a run waiting behind a deployment can be replaced by a newer one ("Control the concurrency of
+  workflows and jobs" in GitHub's Actions docs).
 
 Before you copy it, check against the repository:
 
@@ -36,9 +41,24 @@ Before you copy it, check against the repository:
 Enabling Pages is a repository setting, gate Z2: tell the user, do not change it yourself.
 
 1. Settings, Pages, Source: **GitHub Actions**. Until then the deploy job fails.
-2. For a custom domain: add `docs/CNAME` with the domain (Zensical copies it to the site root),
+2. Before the first run, look for a `github-pages` environment under Settings, Environments. The
+   deploy job names `environment: github-pages`, and running a workflow that references an
+   environment that does not exist creates it, with no protection rules or secrets; only one
+   created by an implicit Pages build (a branch or folder source) gets that branch as a rule
+   ("Managing environments for deployment" in GitHub's Actions docs).
+   - **It is there**, for example from an earlier branch-based Pages site. If the repository
+     manages its environments as code, import the existing environment, with its deployment
+     branch policy, rather than declaring it in the same change. An environment created by a
+     branch-based build has that source branch as its rule (same page), and only branches that
+     match the rule can deploy to it ("Deployments and environments" in the Actions reference): a
+     rule naming `gh-pages` has to allow `main` before this workflow can deploy.
+   - **It is not there.** The first run creates it with no rules. When the repository needs a
+     deployment-branch rule (only `main` deploys), create the environment with that rule first,
+     in the UI (Settings, Environments, New environment, Deployment branches and tags) or in code,
+     then run the workflow.
+3. For a custom domain: add `docs/CNAME` with the domain (Zensical copies it to the site root),
    set `site_url` to it, and set the domain in the Pages settings with DNS at the registrar.
-3. After the first deployment, open the live site and check the homepage, one deep page, search
+4. After the first deployment, open the live site and check the homepage, one deep page, search
    and a redirect, if any.
 
 ## Replacing an older deployment

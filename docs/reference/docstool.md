@@ -54,6 +54,8 @@ read-only git commands. It writes only:
   (`plan approve --mappings`);
 - the files a plan declares, with its journal, staging directory and log under
   `docs/internal/restructure/` (`plan apply --write`, `plan resume`, `plan rollback`);
+- the plan's `[meta]` table, its block baseline and, when `[meta]` names one, its inventory file
+  (`plan rebase --write`);
 - the output directory of `site-build` and the stamp inside it.
 
 `site-build` is the one command that runs another program: the site generator, which can load
@@ -115,13 +117,14 @@ refuses output whose inputs have changed since.
 
 ## plan
 
-Validate, approve, apply, resume, roll back or verify a restructure plan.
+Validate, approve, apply, resume, roll back, verify or rebase a restructure plan.
 
 | Option | Values | Default | What it does |
 | --- | --- | --- | --- |
-| `action` | `validate`, `approve`, `apply`, `resume`, `rollback`, `verify`, `mappings` |  | what to do with the plan (see below) |
+| `action` | `validate`, `approve`, `apply`, `resume`, `rollback`, `verify`, `mappings`, `rebase` |  | what to do with the plan (see below) |
 | `--plan` | `PATH` | `docs/internal/restructure/plan.toml` | the plan file |
-| `--write` | flag |  | apply: write the changes (the default is a dry run) |
+| `--write` | flag |  | apply, rebase: write the changes (the default is a dry run) |
+| `--onto` | `REF` |  | rebase: the fetched upstream ref (under `refs/remotes/`) that `HEAD` is checked out at |
 | `--by` | `NAME` |  | approve: who approves (gate G9) |
 | `--mappings` | flag |  | approve: write review receipts for mappings.toml instead of the plan approval |
 | `--urls` | `PATH` |  | verify, mappings: also check a saved URL baseline (a site's needs --built) |
@@ -140,6 +143,7 @@ The actions, in the order a restructure uses them:
 | `rollback` | Undoes an interrupted apply |
 | `mappings` | Prints a `mappings.toml` skeleton to stdout for what is still unaccounted for; it writes no file and refuses `--out` |
 | `verify` | Checks that every block of the baseline is accounted for, that every mapping has a valid receipt and, with `--urls`, that old URLs still resolve: site routes with `--built`, GitHub paths and anchors for a baseline with no site routes |
+| `rebase` | Moves an approved but unapplied plan onto a newer upstream commit when upstream changed the docs first: keeps every decision, recomputes `base_commit`, the block baseline, the inventory and the source hashes from `--onto`, validates the result and reports what upstream changed; with `--write`, writes them. The approval becomes stale, so the owner approves again |
 
 The file format is in [The plan format](plan-format.md).
 

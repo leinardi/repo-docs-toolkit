@@ -60,7 +60,8 @@ result they qualify is "partially verified", whatever the exit code.
    and features that do nothing. Every change ends with `site-audit` and `check` as well.
 4. **Keep the native UI.** Header, search, navigation tabs, palette toggle and footer stay the
    theme's. Customise through config, `extra_css` and the landing page, not by replacing
-   partials.
+   partials. The one other template allowed is an `overrides/main.html` that fills only
+   `extrahead` (icons, manifest, `theme-color`; [config.md](references/config.md)).
 5. **The landing page is configured, never edited.** `home.html` and `home.css` are copied as
    shipped; a project sets front matter and one brand colour
    ([landing-page.md](references/landing-page.md)).
@@ -100,7 +101,8 @@ the repo-docs skill's restructure mode; this skill takes over once the content i
    `zensical.mk` in uv mode.
 6. `site-audit`, `check` and `contrast` clean; `site-build` passes.
 7. The Pages workflow ([deploy.md](references/deploy.md)); the user sets the Pages source (Z2).
-8. Screenshots at 1440, 768 and 390 pixels, light and dark, reviewed by the user.
+8. `scripts/screenshots.py` at 1440, 768 and 390 pixels, light and dark, reviewed by the user
+   ([landing-page.md](references/landing-page.md), Step 6).
 
 ## Checklist: migrate
 
@@ -120,14 +122,15 @@ the repo-docs skill's restructure mode; this skill takes over once the content i
 2. Copy `home.html`, `home.css` and `brand.css` as shipped.
 3. Write `docs/index.md` from the example, every claim from the repository.
 4. Brand colour in `brand.css`; `contrast` passes for both schemes.
-5. Build, `check`, and the manual review at three widths in both schemes.
+5. Build, `check`, then `scripts/screenshots.py` and the manual review at three widths in both
+   schemes.
 
 ## Stop and ask
 
 | Gate | When |
 | --- | --- |
 | Z1 | Switching the generator or the deployment |
-| Z2 | Pages source, custom domain or DNS: settings only the user changes |
+| Z2 | Pages source, the `github-pages` environment, custom domain or DNS: settings only the user changes |
 | Z3 | Choosing a brand colour when the project has none, or changing one that fails `contrast` |
 | Z4 | Replacing what an unsupported plugin or a hook did |
 | Z5 | Changing URLs or anchors: `use_directory_urls`, the layout of `docs/`, the slug style (`toc.slugify`) |

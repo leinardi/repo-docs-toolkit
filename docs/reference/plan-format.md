@@ -12,6 +12,7 @@ A restructure is driven by `docs/internal/restructure/plan.toml`. docstool reads
 | `docs_dir` | The site's docs directory, usually `"docs"` |
 | `site_config` | `"zensical.toml"`, `"mkdocs.yml"`, or left out when there is no site |
 | `blocks` | The block baseline written by `docstool inventory --blocks` |
+| `inventory` | Optional: an inventory report (`inventory --format json --out`) kept with the plan |
 | `[meta.sources]` | `"path" = "<sha256>"` for every file the plan moves, splits, merges, deletes or edits, the site config and the blocks baseline |
 
 ## Entries
@@ -37,8 +38,21 @@ Every doc under the docs directory must be covered by some entry.
 ## `[approval]`
 
 `docstool plan approve --by <name>` writes this table once `plan validate` passes: the plan's
-SHA-256 (computed without the `[approval]` table), who approved it and when. `plan apply --write`
-refuses when the plan, or any file in `[meta.sources]`, has changed since.
+SHA-256 (computed without the `[approval]` table), the SHA-256 of its decisions (every table but
+`[meta]` and `[approval]`), who approved it and when. `plan apply --write` refuses when the
+plan, or any file in `[meta.sources]`, has changed since.
+
+## Rebasing on a newer upstream
+
+When upstream changes the docs before an approved restructure is merged, the plan is moved, not
+the applied commits. On a checkout of the fetched upstream ref, with the plan artifacts brought
+over, `docstool plan rebase --onto origin/main` keeps every decision and rewrites only `[meta]`:
+`base_commit` becomes the upstream commit, and the block baseline, the inventory and every
+`[meta.sources]` hash are recomputed from it. It refuses, writing nothing, unless the ref is under
+`refs/remotes/`, `HEAD` is that commit, the tree is clean apart from the plan artifacts, the plan
+was not applied in this tree, the old `base_commit` is an ancestor of the ref, and no file a
+`[[reference]]` entry edits changed upstream. It reports what upstream changed, block by block,
+and whether the decisions still match the approved ones. Without `--write` it is a dry run.
 
 ## Mappings
 

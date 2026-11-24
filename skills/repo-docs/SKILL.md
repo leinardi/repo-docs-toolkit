@@ -154,6 +154,10 @@ A restructure is staged and approved, never improvised:
 6. **Verify**: new build, URL baseline, mappings reviewed by the owner, `docstool plan verify`,
    drift and the repository's own checks.
 
+When upstream changed the docs first, never `git rebase` an applied restructure: check out the
+upstream ref and move the plan with `docstool plan rebase --onto <ref>`, then approve, apply and
+verify again.
+
 The run is not done while any stage has an open item. Details:
 [restructure.md](references/restructure.md); a starting plan:
 [assets/restructure-plan.example.toml](assets/restructure-plan.example.toml).

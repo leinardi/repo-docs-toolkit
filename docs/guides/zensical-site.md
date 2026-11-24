@@ -52,6 +52,11 @@ The page needs no JavaScript: the install tabs fall back to stacked blocks. This
 page is built that way; its front matter is described in
 [Landing page front matter](../reference/front-matter.md).
 
+The skill leaves the final look to you. Its screenshot script,
+`skills/zensical-site/scripts/screenshots.py` (Playwright, run through `uv`), serves the built
+site on 127.0.0.1 and takes full-page screenshots of the homepage at 1440, 768 and 390 pixels in
+both schemes, and fails when the page is wider than the window.
+
 The skill's references cover the details:
 [config][zensical-site-config],
 [migrate][zensical-site-migrate],

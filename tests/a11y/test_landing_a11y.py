@@ -353,6 +353,40 @@ def test_works_without_javascript(browser: Browser, served: dict[str, str], name
         assert page.locator(".rdt-install .tabbed-block").nth(index).is_visible()
 
 
+# Where the hero and the install block sit, relative to the page column: the gap on each side.
+LAYOUT_JS = """
+() => {
+  const home = document.querySelector('.rdt-home').getBoundingClientRect();
+  const gaps = (selector) => {
+    const box = document.querySelector(selector).getBoundingClientRect();
+    return { left: box.left - home.left, right: home.right - box.right, width: box.width };
+  };
+  return {
+    align: getComputedStyle(document.querySelector('.rdt-hero')).textAlign,
+    tagline: gaps('.rdt-hero__tagline'),
+    install: gaps('.rdt-install'),
+    rem: parseFloat(getComputedStyle(document.documentElement).fontSize),
+  };
+}
+"""
+
+
+@pytest.mark.parametrize("name", LANDING_EXAMPLES)
+def test_without_a_showcase_the_hero_is_centred_on_wide_screens(browser: Browser, served: dict[str, str], name: str) -> None:
+    page = open_page(browser, served[name])
+    page.locator(".rdt-showcase").evaluate("(el) => el.remove()")
+    layout = page.evaluate(LAYOUT_JS)
+    assert layout["align"] == "center", layout
+    for part in ("tagline", "install"):
+        assert abs(layout[part]["left"] - layout[part]["right"]) <= 1, (part, layout)
+    assert layout["install"]["width"] <= 36 * layout["rem"] + 1, layout
+    # Below the two-column width the page keeps its single left-aligned column.
+    page.set_viewport_size({"width": 768, "height": 900})
+    narrow = page.evaluate(LAYOUT_JS)
+    assert narrow["align"] in ("start", "left"), narrow
+    assert abs(narrow["install"]["left"]) <= 1, narrow
+
+
 @pytest.mark.parametrize("scheme", SCHEMES)
 @pytest.mark.parametrize("name", LANDING_EXAMPLES)
 def test_phone_width_has_no_overflow(browser: Browser, served: dict[str, str], name: str, scheme: str) -> None:

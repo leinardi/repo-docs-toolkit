@@ -13,6 +13,7 @@ runs in order; none is skipped for a small job, which simply gets a short plan.
 - Stage 4: Plan and approval
 - Stage 5: Apply
 - Stage 6: Verify
+- When upstream changes the docs before you merge
 - The plan format
 - Mappings and review receipts
 - Recovery
@@ -25,9 +26,9 @@ Everything the restructure produces lives in `docs/internal/restructure/`:
 
 | File | Written by | Holds |
 | --- | --- | --- |
-| `blocks.json` | `inventory --blocks` | The content-conservation baseline |
+| `blocks.json` | `inventory --blocks`; `plan rebase --write` | The content-conservation baseline |
 | `urls.json` | `check --save-baseline` | Routes, redirects and anchors of the old site |
-| `plan.toml` | You; `plan approve` adds `[approval]` | What will be executed |
+| `plan.toml` | You; `plan approve` adds `[approval]`; `plan rebase --write` rewrites `[meta]` | What will be executed |
 | `report.md` | You | Classification, the new layout, decisions, open questions |
 | `mappings.toml` | You, after apply | Blocks rewritten or dropped on purpose |
 | `review-receipts.json` | `plan approve --mappings` | The owner's review of each mapping |
@@ -236,6 +237,45 @@ ask the owner what to keep (rule 3, G5). By default, commit `report.md`, `plan.t
 `mappings.toml` and `review-receipts.json`; the machine baselines (`blocks.json`, `urls.json`,
 `apply-log.json`) only served the run, and the owner may drop them. Remove nothing without that
 answer.
+
+## When upstream changes the docs before you merge
+
+Upstream changed the docs after the plan was approved, or after you applied it on a branch. Never
+`git rebase` or cherry-pick an applied restructure onto the new upstream: docstool cannot prove
+which commit was upstream after a replay, and a replay can lose content upstream added, which
+the old baseline never recorded. Apply the same plan again on the new upstream instead:
+
+1. Copy `plan.toml`, `report.md` and `mappings.toml` (when there is one) to `<scratch>`. Leave
+   `apply-log.json`, the journal and the old baselines behind.
+2. Fetch, and put the pull request branch on the upstream ref itself:
+   `git switch -C <branch> origin/main`. That discards the branch's applied commits: ask the user
+   first. (`git switch --detach origin/main` tries the rebase without touching the branch.)
+3. Copy the artifacts back into `docs/internal/restructure/`, then run a dry run:
+
+   ```sh
+   python3 -I <skill-dir>/scripts/docstool.py plan rebase --root <repo> --onto origin/main
+   ```
+
+   It refuses, writing nothing, unless `--onto` is a fetched branch under `refs/remotes/`, HEAD is
+   that commit, the tree is clean apart from the plan artifacts, the plan was not applied in this
+   tree, and the old `base_commit` is an ancestor of it. A file a `[[reference]]` entry edits
+   that changed upstream is refused too, since its line number cannot be carried over: remove the
+   entry, rebase, then add it back with the line as it is now. Anything upstream broke in the plan
+   (a split heading that is gone, a target that now exists) is reported the way `plan validate`
+   reports it.
+4. Show the owner `data.upstream`: per file, the blocks upstream added, removed and reworded.
+   `data.decisions` says whether the plan's decisions are the ones approved; when it is not
+   "unchanged since the approval", the owner reviews the whole plan again, not only the delta.
+5. `plan rebase --onto origin/main --write` rewrites `[meta]` (`base_commit`, every source hash),
+   `blocks.json` and the inventory file `[meta]` names. Everything upstream added or moved is
+   now in the baseline that `plan verify` checks.
+6. Save the URL baseline again (Stage 1's `site-build --ref HEAD` and `check --save-baseline`):
+   `urls.json` describes the old upstream, and rebase does not touch it.
+7. The approval is now stale: approve again (G9), then apply and verify as in Stages 5 and 6, and
+   commit the result on the pull request branch (from a detached HEAD, `git switch -C <branch>`
+   first).
+   Mappings carried over keep their receipts while their blocks and destinations still match; the
+   others show up as `receipt-invalid` or `mapping-unreviewed` and are reviewed again.
 
 ## The plan format
 

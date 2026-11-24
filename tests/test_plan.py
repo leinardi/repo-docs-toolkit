@@ -1396,3 +1396,347 @@ def test_no_wrap_warnings_without_a_lint_limit(tmp_path: Path) -> None:
     (repo / ART / "blocks.json").unlink()
     write_plan(repo, {"keep": [{"paths": ["docs/"]}], "move": [{"from": "docs/old.md", "to": target}]}, ["docs/old.md", "docs/page.md"])
     assert "Wrap warnings" not in run_script(DOCSTOOL, "plan", "apply", "--root", str(repo)).stdout
+
+
+# --- plan rebase: the same plan on a newer upstream ---------------------------------------------
+
+
+def remote_pair(tmp_path: Path, extra: dict[str, str] | None = None) -> tuple[Path, Path]:
+    """A work repository with docs/flash.md (and extra files), and the bare origin it fetches."""
+    repo = make_repo("clean", tmp_path)
+    (repo / "docs" / "flash.md").write_text(CONSERVE, encoding="utf-8")
+    for rel, text in (extra or {}).items():
+        (repo / rel).write_text(text, encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "flash")
+    remote = tmp_path / "origin.git"
+    git(tmp_path, "clone", "-q", "--bare", str(repo), str(remote))
+    git(repo, "remote", "add", "origin", str(remote))
+    git(repo, "fetch", "-q", "origin")
+    return repo, remote
+
+
+def push_upstream(tmp_path: Path, remote: Path, change: Callable[[Path], object], reset: bool = False) -> None:
+    """Someone else changes the docs upstream; with reset, on a history that drops the last commit."""
+    upstream = tmp_path / "upstream"
+    if not upstream.exists():
+        git(tmp_path, "clone", "-q", str(remote), str(upstream))
+    if reset:
+        git(upstream, "reset", "-q", "--hard", "HEAD~1")
+    change(upstream)
+    git(upstream, "add", "-A")
+    git(upstream, "commit", "-q", "-m", "upstream edit")
+    git(upstream, "push", "-q", "--force", "origin", "main")
+
+
+def to_upstream(repo: Path) -> None:
+    """Drop the local work: the tree becomes origin/main, with the untracked plan artifacts kept."""
+    git(repo, "fetch", "-q", "origin")
+    git(repo, "switch", "-q", "--detach", "origin/main")
+
+
+def everything(repo: Path) -> dict[str, str]:
+    """Every file under the repository, .git included: a dry run must leave all of them alone."""
+    return {p.relative_to(repo).as_posix(): sha(p) for p in sorted(repo.rglob("*")) if p.is_file()}
+
+
+def rebase(repo: Path, *args: str, onto: str = "origin/main") -> tuple[int, dict[str, Any]]:
+    return docstool_json(repo, "plan", "rebase", "--onto", onto, *args)
+
+
+def refusals(report: dict[str, Any]) -> list[str]:
+    return [f["message"] for f in report["findings"] if f["check"] == "plan-rebase"]
+
+
+def reword_and_add(upstream: Path) -> None:
+    path = upstream / "docs" / "flash.md"
+    text = path.read_text(encoding="utf-8")
+    text = text.replace("Never flash over USB hubs.", "Never flash through a USB hub.")
+    text = text.replace("## Other\n", "## Other\n\nCharge the battery to half first.\n")
+    path.write_text(text, encoding="utf-8")
+
+
+def approved_upstream_plan(tmp_path: Path, extra: dict[str, str] | None = None, **plan: Any) -> tuple[Path, Path]:
+    """An approved, unapplied plan written on the old base; upstream has since reworded and added."""
+    repo, remote = remote_pair(tmp_path, extra)
+    write_plan(repo, plan.get("entries", {"keep": [{"paths": ["docs/"]}]}), plan.get("sources"))
+    approve(repo)
+    push_upstream(tmp_path, remote, reword_and_add)
+    to_upstream(repo)
+    return repo, remote
+
+
+def test_rebase_carries_the_plan_onto_upstream_and_protects_what_upstream_added(tmp_path: Path) -> None:
+    repo, _ = approved_upstream_plan(tmp_path)
+    before = everything(repo)
+    code, report = rebase(repo)
+    assert code == 0, report["findings"]
+    assert everything(repo) == before, "the dry run wrote something"
+    assert report["data"]["state"].startswith("dry run")
+    [delta] = report["data"]["upstream"]
+    assert delta["file"] == "docs/flash.md"
+    assert delta["plan_source"] is False  # covered by keep: protected by the baseline, not moved
+    assert [r["new"]["text"] for r in delta["reworded"]] == ["Never flash through a USB hub."]
+    assert [b["text"] for b in delta["added"]] == ["Charge the battery to half first."]
+    assert delta["removed"] == []
+    assert report["data"]["decisions"] == "unchanged since the approval"
+    assert report["data"]["writes"] == sorted([f"{ART}/blocks.json", f"{ART}/plan.toml"])
+    text = run_script(DOCSTOOL, "plan", "rebase", "--onto", "origin/main", "--root", str(repo)).stdout
+    assert "docs/flash.md (not in the plan's sources): 1 added, 0 removed, 1 reworded" in text, text
+    assert "  + line " in text and "Charge the battery to half first." in text, text
+    assert "decisions: unchanged since the approval" in text, text
+
+    code, report = rebase(repo, "--write")
+    assert code == 0, report["findings"]
+    assert report["data"]["approval"] == "stale"
+    meta = tomllib.loads((repo / ART / "plan.toml").read_text(encoding="utf-8"))["meta"]
+    assert meta["base_commit"] == head(repo)
+    assert meta["sources"][f"{ART}/blocks.json"] == sha(repo / ART / "blocks.json")
+    blocks = json.loads((repo / ART / "blocks.json").read_text(encoding="utf-8"))["blocks"]
+    assert any(b["text"] == "Charge the battery to half first." for b in blocks)
+    assert docstool_json(repo, "plan", "validate")[0] == 0
+    approve(repo)
+    assert docstool_json(repo, "plan", "apply", "--write")[0] == 0
+    code, report = docstool_json(repo, "plan", "verify")
+    assert code == 0, report["findings"]
+    # A replay of the old restructure that loses the paragraph upstream added is caught.
+    edit(repo, "Charge the battery to half first.\n\n", "")
+    code, report = docstool_json(repo, "plan", "verify")
+    assert code == 1
+    assert "block-unaccounted" in {f["check"] for f in report["findings"]}
+
+
+def _local_branch(repo: Path) -> str:
+    git(repo, "branch", "-q", "upstream-copy", "origin/main")
+    return "upstream-copy"
+
+
+def _commit(repo: Path) -> str:
+    return head(repo)
+
+
+def _intermediate_commit(repo: Path) -> str:
+    # touches neither the docs layout nor the plan artifacts, and is still not upstream
+    (repo / "NOTES.txt").write_text("local\n", encoding="utf-8")
+    git(repo, "add", "NOTES.txt")
+    git(repo, "commit", "-q", "-m", "local")
+    return "origin/main"
+
+
+def _old_base(repo: Path) -> str:
+    git(repo, "switch", "-q", "--detach", "HEAD@{1}")
+    return "origin/main"
+
+
+def _dirty(repo: Path) -> str:
+    (repo / "docs" / "guide.md").write_text("# Guide\n\nEdited locally.\n", encoding="utf-8")
+    return "origin/main"
+
+
+def _applied(repo: Path) -> str:
+    (repo / ART / "apply-log.json").write_text("{}\n", encoding="utf-8")
+    return "origin/main"
+
+
+@pytest.mark.parametrize(
+    ("prepare", "says"),
+    [
+        (_local_branch, "refs/heads/upstream-copy, not a fetched upstream branch"),
+        (_commit, "is a commit, not a fetched upstream branch"),
+        (_intermediate_commit, "is not origin/main"),
+        (_old_base, "is not origin/main"),
+        (_dirty, "docs/guide.md: the working tree is not clean"),
+        (_applied, "apply-log.json exists"),
+    ],
+)
+def test_rebase_refuses_and_writes_nothing(tmp_path: Path, prepare: Callable[[Path], str], says: str) -> None:
+    repo, _ = approved_upstream_plan(tmp_path)
+    onto = prepare(repo)
+    before = everything(repo)
+    code, report = rebase(repo, "--write", onto=onto)
+    assert code == 1
+    assert any(says in message for message in refusals(report)), refusals(report)
+    assert everything(repo) == before
+
+
+def test_rebase_refuses_a_base_that_upstream_rewrote_away(tmp_path: Path) -> None:
+    repo, remote = remote_pair(tmp_path)
+    write_plan(repo, {"keep": [{"paths": ["docs/"]}]})
+    push_upstream(tmp_path, remote, lambda upstream: (upstream / "docs" / "new.md").write_text("# New\n", encoding="utf-8"), reset=True)
+    to_upstream(repo)
+    before = everything(repo)
+    code, report = rebase(repo, "--write")
+    assert code == 1
+    assert any("is not an ancestor of origin/main" in message for message in refusals(report)), refusals(report)
+    assert everything(repo) == before
+
+
+def test_rebase_refuses_a_reference_edit_whose_file_changed_upstream(tmp_path: Path) -> None:
+    notes = {"NOTES.md": "# Notes\n\nRead old/path before you start.\n"}
+    entries: dict[str, list[dict[str, Any]]] = {
+        "keep": [{"paths": ["docs/"]}],
+        "reference": [{"file": "NOTES.md", "line": 3, "old": "old/path", "new": "new/path"}],
+    }
+    repo, remote = remote_pair(tmp_path, notes)
+    write_plan(repo, entries, ["NOTES.md"])
+    approve(repo)
+
+    def insert(upstream: Path) -> None:
+        path = upstream / "NOTES.md"
+        path.write_text("<!-- moved -->\n" + path.read_text(encoding="utf-8"), encoding="utf-8")
+
+    push_upstream(tmp_path, remote, insert)
+    to_upstream(repo)
+    before = everything(repo)
+    code, report = rebase(repo, "--write")
+    assert code == 1
+    [message] = refusals(report)
+    assert message.startswith("[[reference]] #1 edits NOTES.md at line 3"), message
+    assert everything(repo) == before
+
+
+def test_rebase_reports_decisions_edited_after_the_approval(tmp_path: Path) -> None:
+    repo, _ = approved_upstream_plan(tmp_path)
+    plan = repo / ART / "plan.toml"
+    plan.write_text(plan.read_text(encoding="utf-8").replace('paths = ["docs/"]', 'paths = ["docs/", "docs/internal/"]'), encoding="utf-8")
+    code, report = rebase(repo)
+    assert code == 1
+    assert report["data"]["decisions"] == "changed since the approval"
+    assert report["data"]["decisions_sha256"] != report["data"]["approved_decisions_sha256"]
+    assert "plan-decisions" in {f["check"] for f in report["findings"]}
+    assert not refusals(report)
+
+
+def _move_within(upstream: Path) -> None:
+    path = upstream / "docs" / "flash.md"
+    text = path.read_text(encoding="utf-8").replace("!!! warning\n    Back up the device first.\n\n", "")
+    path.write_text(text.replace("## Other\n\n", "## Other\n\n!!! warning\n    Back up the device first.\n\n"), encoding="utf-8")
+
+
+def _move_across(upstream: Path) -> None:
+    path = upstream / "docs" / "flash.md"
+    path.write_text(path.read_text(encoding="utf-8").replace("!!! warning\n    Back up the device first.\n\n", ""), encoding="utf-8")
+    (upstream / "docs" / "safety.md").write_text("# Safety\n\n!!! warning\n    Back up the device first.\n", encoding="utf-8")
+
+
+@pytest.mark.parametrize("move", [_move_within, _move_across])
+def test_a_warning_upstream_moved_is_protected_where_it_now_is(tmp_path: Path, move: Callable[[Path], None]) -> None:
+    repo, remote = remote_pair(tmp_path)
+    write_plan(repo, {"keep": [{"paths": ["docs/"]}]})
+    approve(repo)
+    push_upstream(tmp_path, remote, move)
+    to_upstream(repo)
+    assert rebase(repo, "--write")[0] == 0
+    approve(repo)
+    assert docstool_json(repo, "plan", "apply", "--write")[0] == 0
+    code, report = docstool_json(repo, "plan", "verify")
+    assert code == 0, report["findings"]
+    # a re-apply that drops the warning from its new place
+    page = repo / "docs" / ("flash.md" if move is _move_within else "safety.md")
+    page.write_text(page.read_text(encoding="utf-8").replace("!!! warning\n    Back up the device first.\n", ""), encoding="utf-8")
+    code, report = docstool_json(repo, "plan", "verify")
+    assert code == 1
+    assert "block-unaccounted" in {f["check"] for f in report["findings"]}
+
+
+def test_rebase_reports_what_upstream_broke_in_the_plan_and_writes_nothing(tmp_path: Path) -> None:
+    mixed = {"docs/mixed.md": "# Mixed\n\nIntro.\n\n## Old notes\n\nHistory text.\n"}
+    split = {"from": "docs/mixed.md", "heading": "Old notes", "to": "docs/internal/history/old-notes.md", "status": "Superseded."}
+    repo, remote = remote_pair(tmp_path, mixed)
+    write_plan(repo, {"keep": [{"paths": ["docs/"]}], "split": [split]}, ["docs/mixed.md"])
+    approve(repo)
+
+    def rename_heading(upstream: Path) -> None:
+        path = upstream / "docs" / "mixed.md"
+        path.write_text(path.read_text(encoding="utf-8").replace("## Old notes", "## Earlier notes"), encoding="utf-8")
+
+    push_upstream(tmp_path, remote, rename_heading)
+    to_upstream(repo)
+    before = everything(repo)
+    code, report = rebase(repo, "--write")
+    assert code == 1
+    assert not refusals(report)
+    assert any(f["severity"] == "Blocking" and "Old notes" in f["message"] for f in report["findings"]), report["findings"]
+    assert "does not validate" in report["data"]["state"]
+    [delta] = report["data"]["upstream"]
+    assert delta["plan_source"] is True
+    assert everything(repo) == before
+
+
+def test_rebase_rewrites_the_inventory_the_plan_names(tmp_path: Path) -> None:
+    repo, remote = remote_pair(tmp_path)
+    inventory = f"{ART}/inventory.json"
+    (repo / ART).mkdir(parents=True)
+    assert run_script(DOCSTOOL, "inventory", "--root", str(repo), "--format", "json", "--out", str(repo / inventory)).returncode in (0, 1)
+    write_plan(repo, {"keep": [{"paths": ["docs/"]}]}, [inventory], {"inventory": inventory})
+    approve(repo)
+    push_upstream(tmp_path, remote, lambda upstream: (upstream / "docs" / "safety.md").write_text("# Safety\n\nUnplug first.\n", encoding="utf-8"))
+    to_upstream(repo)
+    assert "docs/safety.md" not in json.loads((repo / inventory).read_text(encoding="utf-8"))["data"]["files"]
+    code, report = rebase(repo, "--write")
+    assert code == 0, report["findings"]
+    assert sorted(report["data"]["writes"]) == sorted([f"{ART}/blocks.json", inventory, f"{ART}/plan.toml"])
+    written = (repo / inventory).read_text(encoding="utf-8")
+    assert "docs/safety.md" in json.loads(written)["data"]["files"]
+    # byte for byte what inventory --format json writes for the same tree
+    assert written == run_script(DOCSTOOL, "inventory", "--root", str(repo), "--format", "json").stdout
+    meta = tomllib.loads((repo / ART / "plan.toml").read_text(encoding="utf-8"))["meta"]
+    assert meta["sources"][inventory] == sha(repo / inventory)
+    code, report = docstool_json(repo, "plan", "validate")
+    assert code == 0, report["findings"]
+
+
+def test_rebase_refuses_to_write_a_partial_inventory(tmp_path: Path) -> None:
+    repo, remote = remote_pair(tmp_path)
+    inventory = f"{ART}/inventory.json"
+    (repo / ART).mkdir(parents=True)
+    run_script(DOCSTOOL, "inventory", "--root", str(repo), "--format", "json", "--out", str(repo / inventory))
+    write_plan(repo, {"keep": [{"paths": ["docs/"]}]}, [inventory], {"inventory": inventory})
+    push_upstream(tmp_path, remote, lambda upstream: (upstream / "docs" / "latin1.md").write_bytes(b"# Caf\xe9\n"))
+    to_upstream(repo)
+    before = everything(repo)
+    code, report = rebase(repo, "--write")
+    assert code == 3  # the unreadable page leaves the markdown coverage incomplete: never clean
+    assert any("is incomplete (" in message and "markdown" in message for message in refusals(report)), refusals(report)
+    assert everything(repo) == before
+
+
+def test_an_unrelated_removal_and_addition_are_not_a_rewording(tmp_path: Path) -> None:
+    repo, remote = remote_pair(tmp_path)
+    write_plan(repo, {"keep": [{"paths": ["docs/"]}]})
+
+    def replace(upstream: Path) -> None:
+        path = upstream / "docs" / "flash.md"
+        path.write_text(
+            path.read_text(encoding="utf-8").replace("Never flash over USB hubs.", "Firmware images live in the releases page."), encoding="utf-8"
+        )
+
+    push_upstream(tmp_path, remote, replace)
+    to_upstream(repo)
+    code, report = rebase(repo)
+    assert code == 0, report["findings"]
+    [delta] = report["data"]["upstream"]
+    assert delta["reworded"] == []
+    assert [b["text"] for b in delta["removed"]] == ["Never flash over USB hubs."]
+    assert [b["text"] for b in delta["added"]] == ["Firmware images live in the releases page."]
+
+
+@pytest.mark.parametrize("command", ["rebase", "approve"])
+def test_a_planted_temp_symlink_is_never_written_through(tmp_path: Path, command: str) -> None:
+    repo, _ = approved_upstream_plan(tmp_path)
+    outside = tmp_path / "outside.txt"
+    outside.write_text("precious\n", encoding="utf-8")
+    if command == "rebase":
+        (repo / ART / "blocks.json.tmp").symlink_to(outside)
+        code = docstool_code(repo, "plan", "rebase", "--onto", "origin/main", "--write")
+    else:
+        (repo / ART / "plan.toml.tmp").symlink_to(outside)
+        code = docstool_code(repo, "plan", "approve", "--by", "Owner")
+    assert code == 2
+    assert outside.read_text(encoding="utf-8") == "precious\n"
+
+
+def test_rebase_needs_onto_and_onto_needs_rebase(tmp_path: Path) -> None:
+    repo, _ = approved_upstream_plan(tmp_path)
+    assert docstool_code(repo, "plan", "rebase") == 2
+    assert docstool_code(repo, "plan", "validate", "--onto", "origin/main") == 2

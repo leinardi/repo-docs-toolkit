@@ -169,3 +169,98 @@ def test_the_template_builds_with_a_redirect(tmp_path: Path) -> None:
     assert '"guide/new-page/#old":"guide/new-page/#install"' in (site / "redirect.json").read_text(encoding="utf-8").replace(" ", "")
     home = (site / "index.html").read_text(encoding="utf-8")
     assert 'class="admonition note"' in home
+
+
+COMPOSE = """# --8<-- [start:service]
+services:
+  app:
+    image: example/demo:1.0
+# --8<-- [end:service]
+volumes:
+  data: {}
+"""
+
+
+def build_with_snippet(root: Path, compose: str, section: str) -> subprocess.CompletedProcess[str]:
+    """A site from the filled template whose homepage includes a section of compose.yaml."""
+    zensical = shutil.which("zensical")
+    require_or_skip(zensical is not None, "zensical", "DOCSTOOL_REQUIRE_ZENSICAL")
+    assert zensical is not None
+    root.mkdir()
+    (root / "zensical.toml").write_text(filled_template(), encoding="utf-8")
+    shutil.copytree(ZENSICAL_SITE / "assets" / "overrides", root / "overrides")
+    (root / "docs" / "stylesheets").mkdir(parents=True)
+    for css in ("home.css", "brand.css"):
+        shutil.copy2(ZENSICAL_SITE / "assets" / "stylesheets" / css, root / "docs" / "stylesheets" / css)
+    (root / "compose.yaml").write_text(compose, encoding="utf-8")
+    (root / "docs" / "index.md").write_text(f'# Demo\n\n```yaml\n--8<-- "compose.yaml:{section}"\n```\n', encoding="utf-8")
+    return subprocess.run([zensical, "build", "--strict", "--clean"], cwd=root, capture_output=True, text=True, check=False)
+
+
+@pytest.mark.zensical
+def test_a_snippet_section_shows_only_its_part_of_the_file(tmp_path: Path) -> None:
+    # landing-page.md, Step 3: a long compose file is shown through a snippet section.
+    result = build_with_snippet(tmp_path / "ok", COMPOSE, "service")
+    assert result.returncode == 0, result.stdout + result.stderr
+    home = (tmp_path / "ok" / "site" / "index.html").read_text(encoding="utf-8")
+    assert "example/demo:1.0" in home
+    assert "volumes" not in home
+    assert "[start:service]" not in home and "[end:service]" not in home
+
+
+@pytest.mark.zensical
+def test_a_missing_snippet_section_fails_the_strict_build(tmp_path: Path) -> None:
+    result = build_with_snippet(tmp_path / "missing", COMPOSE, "web")
+    assert result.returncode != 0
+    assert "could not be located" in result.stdout + result.stderr
+
+
+@pytest.mark.zensical
+def test_a_lost_end_marker_is_not_caught_by_the_build(tmp_path: Path) -> None:
+    # Why landing-page.md says to look at the excerpt after formatting: the build still passes
+    # and the excerpt runs to the end of the file.
+    result = build_with_snippet(tmp_path / "no-end", COMPOSE.replace("# --8<-- [end:service]\n", ""), "service")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "volumes" in (tmp_path / "no-end" / "site" / "index.html").read_text(encoding="utf-8")
+
+
+EXTRAHEAD = """{% extends "base.html" %}
+{% block extrahead %}
+  <link rel="apple-touch-icon" href="{{ 'assets/apple-touch-icon.png' | url }}">
+  <link rel="manifest" href="{{ 'site.webmanifest' | url }}">
+  <meta name="theme-color" content="#0f766e" media="(prefers-color-scheme: light)">
+{% endblock %}
+"""
+
+
+@pytest.mark.zensical
+def test_an_extrahead_only_main_html_reaches_the_homepage_and_deep_pages(tmp_path: Path) -> None:
+    # config.md: overrides/main.html that fills only extrahead adds icons and theme-color to every
+    # page, the landing page included (home.html extends main.html), with paths that resolve.
+    zensical = shutil.which("zensical")
+    require_or_skip(zensical is not None, "zensical", "DOCSTOOL_REQUIRE_ZENSICAL")
+    assert zensical is not None
+    (tmp_path / "zensical.toml").write_text(filled_template(), encoding="utf-8")
+    shutil.copytree(ZENSICAL_SITE / "assets" / "overrides", tmp_path / "overrides")
+    (tmp_path / "overrides" / "main.html").write_text(EXTRAHEAD, encoding="utf-8")
+    docs = tmp_path / "docs"
+    (docs / "stylesheets").mkdir(parents=True)
+    for css in ("home.css", "brand.css"):
+        shutil.copy2(ZENSICAL_SITE / "assets" / "stylesheets" / css, docs / "stylesheets" / css)
+    (docs / "assets").mkdir()
+    (docs / "assets" / "apple-touch-icon.png").write_bytes(b"\x89PNG")
+    (docs / "site.webmanifest").write_text("{}", encoding="utf-8")
+    (docs / "index.md").write_text("---\ntemplate: home.html\nhide: [navigation, toc]\nhome:\n  tagline: Demo\n---\n\nBody\n", encoding="utf-8")
+    (docs / "guide" / "deep").mkdir(parents=True)
+    (docs / "guide" / "deep" / "page.md").write_text("# Deep\n\nText\n", encoding="utf-8")
+    result = subprocess.run([zensical, "build", "--strict", "--clean"], cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert result.returncode == 0, result.stdout + result.stderr
+    site = tmp_path / "site"
+    for rel in ("index.html", "guide/deep/page/index.html"):
+        page = Page(site / rel)
+        links = {attrs["rel"]: attrs["href"] for tag, attrs in page.tags if tag == "link" and attrs.get("rel") in ("apple-touch-icon", "manifest")}
+        assert set(links) == {"apple-touch-icon", "manifest"}, rel
+        for href in links.values():
+            assert (site / rel).parent.joinpath(href).resolve().is_file(), (rel, href)
+        assert [attrs for tag, attrs in page.tags if tag == "meta" and attrs.get("name") == "theme-color"], rel
+    assert Page(site / "index.html").with_class("rdt-home")
