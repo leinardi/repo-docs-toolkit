@@ -2906,6 +2906,11 @@ def block_baseline(corpus: Corpus) -> list[dict[str, Any]]:
     return out
 
 
+def blocks_json(corpus: Corpus) -> str:
+    """The inventory --blocks file: the block baseline of every Markdown file in the corpus."""
+    return json.dumps({"tool": "docstool", "version": __version__, "blocks": block_baseline(corpus)}, ensure_ascii=False, indent=0) + "\n"
+
+
 def cmd_inventory(args: argparse.Namespace, report: Report) -> list[str]:
     repo = Repo(Path(args.root))
     site = load_site(repo, report)
@@ -2976,10 +2981,7 @@ def cmd_inventory(args: argparse.Namespace, report: Report) -> list[str]:
         }
     )
     if args.blocks:
-        _write_output(
-            _root_path(args, args.blocks),
-            json.dumps({"tool": "docstool", "version": __version__, "blocks": block_baseline(corpus)}, ensure_ascii=False, indent=0) + "\n",
-        )
+        _write_output(_root_path(args, args.blocks), blocks_json(corpus))
         report.data["blocks_written"] = str(args.blocks)
     return ["config", "nav", "exclude_docs", "markdown", "couplings"]
 
@@ -5930,6 +5932,12 @@ def plan_digest(text: str) -> str:
     return sha256_bytes(text.rstrip().encode() + b"\n")
 
 
+def decisions_digest(data: dict[str, Any]) -> str:
+    """SHA-256 of the plan's decisions: every table but [meta] (inputs and hashes) and [approval]."""
+    decisions = {key: value for key, value in data.items() if key not in ("meta", "approval")}
+    return sha256_bytes(json.dumps(decisions, sort_keys=True, default=str, ensure_ascii=False).encode())
+
+
 def _fsync_write(path: Path, data: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "wb") as handle:
@@ -6011,6 +6019,11 @@ class PlanContext:
         self.baseline: list[dict[str, Any]] | None = None
         self.unmatched: list[int] = []  # baseline positions with no block left, one per occurrence
         self.github_lost: list[tuple[str, bool, list[str]]] = []  # (path, whole page, anchors)
+        # plan rebase: the hashes artifacts will have once written, so a dry run validates them unwritten
+        self.pending: dict[str, str] = {}
+
+    def source_hash(self, rel: str) -> str | None:
+        return self.pending[rel] if rel in self.pending else file_sha256(self.repo.root / rel)
 
     def couplings(self) -> list[dict[str, Any]]:
         if not hasattr(self, "_couplings"):
@@ -6104,7 +6117,7 @@ def validate_plan(context: PlanContext) -> None:
         error("plan-base", f"HEAD does not descend from base_commit {base}")
     hashes: dict[str, Any] = meta["sources"] if isinstance(meta.get("sources"), dict) else {}
     for rel in sorted(plan_sources(context)):
-        current = file_sha256(repo.root / rel)
+        current = context.source_hash(rel)
         if rel not in hashes:
             error(
                 "plan-stale",
@@ -6118,7 +6131,7 @@ def validate_plan(context: PlanContext) -> None:
         problem = _path_problem(repo, rel)
         if problem:
             error("plan-path", f"[meta.sources] {rel}: {problem}")
-        elif hashes[rel] != file_sha256(repo.root / rel):
+        elif hashes[rel] != context.source_hash(rel):
             error("plan-stale", f"{rel} changed since the plan was written (hash differs)", rel)
     rows = {r.input: r for r in context.report.coverage}
     for name in ("config", "nav", "exclude_docs", "redirects", "markdown"):
@@ -7050,6 +7063,8 @@ class _Refused(Exception):
 
 def cmd_plan(args: argparse.Namespace, report: Report) -> list[str]:
     action = args.action
+    if (action == "rebase") != bool(args.onto):
+        raise UsageError("plan rebase needs --onto REF, and --onto belongs to plan rebase only")
     if action == "mappings" and args.out:
         raise UsageError("plan mappings prints to stdout only, so it can never overwrite a plan artifact")
     report.text_max = args.max
@@ -7060,6 +7075,9 @@ def cmd_plan(args: argparse.Namespace, report: Report) -> list[str]:
         if action in ("resume", "rollback"):
             _recover(context, action)
             return []
+        if action == "rebase":
+            _rebase(context, args)
+            return [*required, "couplings"]
         if action == "verify":
             return _verify(context, args)
         if action == "mappings":
@@ -7127,7 +7145,12 @@ def _write_approval(context: PlanContext, by: str) -> None:
         text = text[: match.start()] + (rest[following.start() :] if following else "")
     digest = plan_digest(text)
     stamp = datetime.now(UTC).date().isoformat()
-    text = text.rstrip("\n") + f"\n\n[approval]\nplan_sha256 = {json.dumps(digest)}\napproved_by = {json.dumps(by)}\ndate = {json.dumps(stamp)}\n"
+    decisions = decisions_digest(plan.data)
+    text = (
+        text.rstrip("\n")
+        + f"\n\n[approval]\nplan_sha256 = {json.dumps(digest)}\ndecisions_sha256 = {json.dumps(decisions)}\n"
+        + f"approved_by = {json.dumps(by)}\ndate = {json.dumps(stamp)}\n"
+    )
     path = context.repo.root / plan.rel
     temporary = path.with_name(path.name + ".tmp")
     _fsync_write(temporary, text.encode())
@@ -7135,6 +7158,278 @@ def _write_approval(context: PlanContext, by: str) -> None:
     context.report.data["state"] = f"approved by {by}"
     context.report.data["approval"] = "approved"
     context.report.data["plan_sha256"] = digest
+
+
+# --- rebase: the same plan on a newer upstream -----------------------------------------------------
+
+
+def inventory_json(root: Path) -> tuple[str, list[str]]:
+    """What inventory --format json writes for the tree at root (plan rebase refreshes [meta] inventory),
+    and the required inputs it could not analyse completely."""
+    report = Report(command="inventory", root=str(root.resolve()))
+    required = cmd_inventory(build_parser().parse_args(["inventory", "--root", str(root), "--format", "json"]), report)
+    _, incomplete = finalize(report, required, "P3", False)
+    return render_json(report, incomplete), incomplete
+
+
+def _atomic_write(path: Path, data: bytes) -> None:
+    temporary = path.with_name(path.name + ".tmp")
+    _fsync_write(temporary, data)
+    os.replace(temporary, path)
+    _fsync_dir(path.parent)
+
+
+def _table_span(lines: list[str], header: re.Pattern[str]) -> tuple[int, int] | None:
+    """The lines of one TOML table: its header line and the lines up to the next table header."""
+    start = next((i for i, line in enumerate(lines) if header.match(line)), None)
+    if start is None:
+        return None
+    end = next((i for i in range(start + 1, len(lines)) if re.match(r"\s*\[", lines[i])), len(lines))
+    return start, end
+
+
+def _rewrite_meta(text: str, base: str, sources: dict[str, str]) -> str | None:
+    """The plan text with base_commit and the [meta.sources] table replaced; every other byte kept."""
+    lines = text.splitlines(keepends=True)
+    meta = _table_span(lines, re.compile(r"\[meta\][ \t]*(#.*)?$"))
+    if meta is None:
+        return None
+    base_lines = [i for i in range(*meta) if re.match(r"base_commit\s*=", lines[i])]
+    if len(base_lines) != 1:
+        return None
+    lines[base_lines[0]] = f"base_commit = {json.dumps(base)}\n"
+    span = _table_span(lines, re.compile(r"\[meta\.sources\][ \t]*(#.*)?$"))
+    if span is None:
+        return None
+    body = [f"{json.dumps(rel)} = {json.dumps(digest)}\n" for rel, digest in sorted(sources.items())]
+    if span[1] < len(lines):
+        body.append("\n")
+    lines[span[0] + 1 : span[1]] = body
+    return "".join(lines)
+
+
+# How alike (difflib ratio) a removed and an added block must be for the upstream delta to call the
+# pair a rewording rather than a removal and an unrelated addition.
+REWORD_SIMILARITY = 0.6
+
+
+def _describe_block(block: Block) -> dict[str, Any]:
+    text = " ".join(block.text.split())
+    return {"line": block.line, "type": block.type, "heading_path": block.heading_path, "text": text[:160] + ("..." if len(text) > 160 else "")}
+
+
+def _upstream_delta(context: PlanContext, base: str, onto: str) -> tuple[list[dict[str, Any]], list[str]]:
+    """What upstream changed between the old base and onto: for each changed plan source and
+    Markdown file, the blocks added, removed and reworded; and the other changed paths under the
+    docs directory."""
+    root, meta = context.repo.root, context.plan.meta
+    listing = git(root, "diff", "--name-only", "-z", "--no-renames", base, onto, "--")
+    changed = [name for name in (listing or "").split("\0") if name]
+    artifacts = {meta.get("blocks"), meta.get("inventory")}
+    sources = plan_sources(context) - artifacts
+    delta: list[dict[str, Any]] = []
+    for rel in changed:
+        markdown = rel.lower().endswith(MARKDOWN_EXTENSIONS)
+        if rel not in sources and not markdown:
+            continue
+        entry: dict[str, Any] = {"file": rel, "plan_source": rel in sources, "added": [], "removed": [], "reworded": []}
+        if markdown:
+            old_text = git(root, "show", f"{base}:{rel}")
+            old = _parse_like_corpus(context, rel, old_text).blocks if old_text is not None else []
+            new = context.corpus.docs[rel].blocks if rel in context.corpus.docs else []
+            surplus_old = Counter(_block_hash(b) for b in old) - Counter(_block_hash(b) for b in new)
+            surplus_new = Counter(_block_hash(b) for b in new) - Counter(_block_hash(b) for b in old)
+            removed, added = [], []
+            for block in old:
+                if surplus_old[_block_hash(block)] > 0:
+                    surplus_old[_block_hash(block)] -= 1
+                    removed.append(block)
+            for block in new:
+                if surplus_new[_block_hash(block)] > 0:
+                    surplus_new[_block_hash(block)] -= 1
+                    added.append(block)
+            # a removed and an added block of the same type under the same heading, with mostly the
+            # same text: a rewording; anything less alike stays a removal and an addition
+            for old_block in list(removed):
+                scores = [
+                    (difflib.SequenceMatcher(None, _conservation_text(old_block), _conservation_text(b)).ratio(), i)
+                    for i, b in enumerate(added)
+                    if b.type == old_block.type and b.heading_path == old_block.heading_path
+                ]
+                best = max(scores, default=(0.0, -1))
+                twin = best[1] if best[0] >= REWORD_SIMILARITY else None
+                if twin is not None:
+                    entry["reworded"].append({"old": _describe_block(old_block), "new": _describe_block(added.pop(twin))})
+                    removed.remove(old_block)
+            entry["added"] = [_describe_block(b) for b in added]
+            entry["removed"] = [_describe_block(b) for b in removed]
+        delta.append(entry)
+    docs = context.site.docs_dir
+    reported = {entry["file"] for entry in delta}
+    others = [rel for rel in changed if rel not in reported and rel not in artifacts and rel.startswith(docs.rstrip("/") + "/")]
+    return delta, others
+
+
+def _rebase(context: PlanContext, args: argparse.Namespace) -> None:
+    """plan rebase --onto REF: the same decisions on a fetched upstream commit, with every input
+    (base_commit, the block baseline, the inventory, the source hashes) recomputed from it."""
+    repo, plan, report = context.repo, context.plan, context.report
+    root = repo.root
+
+    def refuse(message: str, file: str = "", suggestion: str = "") -> None:
+        context.error("plan-rebase", message, file, suggestion=suggestion)
+
+    onto = str(args.onto)
+    if not repo.is_git:
+        raise UsageError("plan rebase needs a git repository")
+    if not onto or onto.startswith("-"):
+        raise UsageError(f"--onto {onto!r} is not a ref")
+    report.data["onto"] = onto
+    onto_commit = (git(root, "rev-parse", "--verify", "--quiet", onto + "^{commit}") or "").strip()
+    full_name = (git(root, "rev-parse", "--symbolic-full-name", onto) or "").strip()
+    head = (git(root, "rev-parse", "--verify", "--quiet", "HEAD^{commit}") or "").strip()
+    if not onto_commit:
+        refuse(f"--onto {onto} is not a commit in this repository", suggestion="git fetch the upstream first")
+    elif not full_name.startswith("refs/remotes/"):
+        refuse(
+            f"--onto {onto} is {full_name or 'a commit'}, not a fetched upstream branch under refs/remotes/",
+            suggestion="pass the remote-tracking branch, such as origin/main",
+        )
+    elif head != onto_commit:
+        refuse(
+            f"HEAD ({head[:12] or 'no commit'}) is not {onto} ({onto_commit[:12]}): the tree must be the upstream commit itself,"
+            " with nothing replayed or committed on top",
+            suggestion=f"drop the applied commits and check out {onto}, then bring the plan artifacts over",
+        )
+    meta = plan.meta
+    artifacts = [plan.directory] if plan.directory != "." else [plan.rel]
+    artifacts += [str(meta[key]) for key in ("blocks", "inventory") if isinstance(meta.get(key), str) and meta[key]]
+    status = git(root, "--no-optional-locks", "status", "--porcelain", "--untracked-files=all", "--", ".", *[f":(exclude){a}" for a in artifacts])
+    if status is None:
+        refuse("git status failed, so the tree cannot be shown to be clean")
+    else:
+        dirty = [line for line in status.split("\n") if line.strip()]
+        for line in dirty[:20]:
+            refuse(f"{line[3:]}: the working tree is not clean (only the plan's artifacts may differ from {onto})", line[3:])
+        if len(dirty) > 20:
+            refuse(f"... and {len(dirty) - 20} more paths that are not clean")
+    art = _plan_art(context)
+    for name in (JOURNAL_NAME, LOG_NAME):
+        if (art / name).exists():
+            refuse(
+                f"{plan.artifact(name)} exists: the plan was applied in this tree, or an apply was interrupted",
+                plan.artifact(name),
+                suggestion="rebase the unapplied plan: check out the upstream ref and bring over only plan.toml, report.md and mappings.toml",
+            )
+    base = meta.get("base_commit")
+    base_commit = ""
+    if isinstance(base, str) and base and not base.startswith("-"):
+        base_commit = (git(root, "rev-parse", "--verify", "--quiet", base + "^{commit}") or "").strip()
+    if not base_commit:
+        refuse(f"[meta] base_commit {base!r} is not a commit in this repository", suggestion="git fetch the history the plan was written on")
+    elif onto_commit and git(root, "merge-base", "--is-ancestor", base_commit, onto_commit) is None:
+        refuse(f"[meta] base_commit {base_commit[:12]} is not an ancestor of {onto}: the plan was written on another history")
+    if base_commit and onto_commit:
+        for index, entry in enumerate(plan.entries("reference"), 1):
+            for rel in _paths_of(entry, "file"):
+                changed = git(root, "diff", "--name-only", base_commit, onto_commit, "--", rel)
+                if changed is None or changed.strip():
+                    refuse(
+                        f"[[reference]] #{index} edits {rel} at line {entry.get('line')}, and {rel} changed upstream: its line number"
+                        " cannot be carried over",
+                        rel,
+                        suggestion="remove the entry, run plan rebase, then add it back with the line as it is now",
+                    )
+    current = decisions_digest(plan.data)
+    approval = plan.data.get("approval") if isinstance(plan.data.get("approval"), dict) else None
+    approved = approval.get("decisions_sha256") if approval else None
+    report.data["decisions_sha256"] = current
+    if approval is None:
+        report.data["decisions"] = "never approved"
+    elif _approval_state(plan) == "valid" or approved == current:
+        report.data["decisions"] = "unchanged since the approval"
+        report.data["approved_decisions_sha256"] = current
+    elif approved is None:
+        report.data["decisions"] = "unknown: the plan changed since an approval that recorded no decisions_sha256"
+    else:
+        report.data["decisions"] = "changed since the approval"
+        report.data["approved_decisions_sha256"] = str(approved)
+        report.add(
+            Finding(
+                "plan-decisions",
+                "P1",
+                "verified",
+                plan.rel,
+                0,
+                "the plan's decisions changed since the approval: the next approval reviews the whole plan, not only the upstream delta",
+            )
+        )
+    outputs: dict[str, bytes] = {}
+    for key in ("blocks", "inventory"):
+        value = meta.get(key)
+        if value is None and key == "inventory":
+            continue
+        problem = _path_problem(repo, value) if isinstance(value, str) and value else "must name a file"
+        if problem:
+            refuse(f"[meta] {key} {value!r}: {problem}")
+        else:
+            outputs[str(value)] = b""
+    if any(f.severity == "Blocking" for f in report.findings):
+        report.data["state"] = "not rebased: the preconditions fail; nothing written"
+        return
+    for rel in outputs:
+        if rel == meta["blocks"]:
+            outputs[rel] = blocks_json(context.corpus).encode()
+            continue
+        inventory, incomplete = inventory_json(root)
+        if incomplete:
+            refuse(f"the inventory of {onto} is incomplete ({', '.join(incomplete)}): a partial inventory is never written", rel)
+            report.data["state"] = "not rebased: nothing written"
+            return
+        outputs[rel] = inventory.encode()
+    context.pending = {rel: sha256_bytes(data) for rel, data in outputs.items()}
+    old_sources = meta["sources"] if isinstance(meta.get("sources"), dict) else {}
+    sources: dict[str, str] = {}
+    for rel in sorted(set(old_sources) | plan_sources(context)):
+        digest = context.source_hash(rel)
+        if digest:
+            sources[rel] = digest
+    report.data["base_commit"] = onto_commit
+    report.data["upstream"], report.data["upstream_other"] = _upstream_delta(context, base_commit, onto_commit)
+    text = _rewrite_meta(plan.text, onto_commit, sources)
+    try:
+        data = tomllib.loads(text) if text is not None else None
+    except tomllib.TOMLDecodeError:
+        data = None
+    expected = {**meta, "base_commit": onto_commit, "sources": sources}
+    if (
+        text is None
+        or data is None
+        or data.get("meta") != expected
+        or decisions_digest(data) != current
+        or data.get("approval") != plan.data.get("approval")
+    ):
+        report.data["sources"] = sources
+        refuse(
+            "[meta] could not be rewritten in place (it needs a [meta] table with one base_commit line and a [meta.sources] table)",
+            suggestion="set base_commit and [meta.sources] by hand to the values in this report's data",
+        )
+        report.data["state"] = "not rebased: nothing written"
+        return
+    context.plan = Plan(plan.rel, text, data, plan.directory)
+    validate_plan(context)
+    if any(f.severity == "Blocking" for f in report.findings):
+        report.data["state"] = "not rebased: the plan does not validate on the new upstream; nothing written"
+        return
+    report.data["writes"] = sorted([*outputs, plan.rel])
+    if not args.write:
+        report.data["state"] = "dry run: nothing written (pass --write to rebase)"
+        return
+    for rel, payload in outputs.items():
+        _atomic_write(root / rel, payload)
+    _atomic_write(root / plan.rel, text.encode())
+    report.data["approval"] = _approval_state(context.plan)
+    report.data["state"] = f"rebased onto {onto} ({onto_commit[:12]}); the approval is {report.data['approval']}: approve again"
 
 
 def _recover(context: PlanContext, action: str) -> None:
@@ -7764,11 +8059,12 @@ def build_parser() -> argparse.ArgumentParser:
     build.add_argument("--ref", help="build this commit from git archive instead of the working tree")
     build.add_argument("--generator", choices=("zensical", "mkdocs"), help="default: zensical for zensical.toml, mkdocs for mkdocs.yml")
     build.add_argument("--generator-cmd", help=argparse.SUPPRESS)
-    plan = sub.add_parser("plan", help="validate, approve, apply, resume, roll back or verify a restructure plan")
+    plan = sub.add_parser("plan", help="validate, approve, apply, resume, roll back, verify or rebase a restructure plan")
     _common(plan)
-    plan.add_argument("action", choices=("validate", "approve", "apply", "resume", "rollback", "verify", "mappings"))
+    plan.add_argument("action", choices=("validate", "approve", "apply", "resume", "rollback", "verify", "mappings", "rebase"))
     plan.add_argument("--plan", default="docs/internal/restructure/plan.toml", help="the plan file (default docs/internal/restructure/plan.toml)")
-    plan.add_argument("--write", action="store_true", help="apply: write the changes (the default is a dry run)")
+    plan.add_argument("--write", action="store_true", help="apply, rebase: write the changes (the default is a dry run)")
+    plan.add_argument("--onto", help="rebase: the fetched upstream ref (under refs/remotes/) that HEAD is checked out at")
     plan.add_argument("--by", help="approve: who approves (gate G9)")
     plan.add_argument("--mappings", action="store_true", help="approve: write review receipts for mappings.toml instead of the plan approval")
     plan.add_argument("--urls", help="verify, mappings: also check a saved URL baseline (a site's needs --built)")
@@ -7817,8 +8113,31 @@ COMMANDS = {
 }
 
 
+def render_rebase_text(report: Report) -> str:
+    """What upstream changed in the plan's sources since the old base, for the owner's review."""
+    upstream = report.data.get("upstream")
+    if not isinstance(upstream, list):
+        return ""
+    out = [f"Upstream changes since the plan's base ({len(upstream)} files):"]
+    for entry in upstream:
+        role = "plan source" if entry["plan_source"] else "not in the plan's sources"
+        out.append(f"  {entry['file']} ({role}): {len(entry['added'])} added, {len(entry['removed'])} removed, {len(entry['reworded'])} reworded")
+        out += [f"    + line {b['line']} {b['type']}: {b['text']}" for b in entry["added"][: report.text_max]]
+        out += [f"    - line {b['line']} {b['type']}: {b['text']}" for b in entry["removed"][: report.text_max]]
+        out += [
+            f"    ~ line {r['new']['line']} {r['new']['type']}: {r['old']['text']} -> {r['new']['text']}"
+            for r in entry["reworded"][: report.text_max]
+        ]
+    others = report.data.get("upstream_other") or []
+    if others:
+        out += [f"Other changed paths under the docs directory ({len(others)}), protected by the new baseline:"] + [f"  {p}" for p in others]
+    return "\n".join(out) + "\n\n"
+
+
 def render_plan_text(report: Report) -> str:
     """The operation list of an apply (dry run or written) and the redirects it adds."""
+    if "upstream" in report.data:
+        return render_rebase_text(report)
     operations = report.data.get("operations")
     if not isinstance(operations, list):
         return ""
