@@ -22,10 +22,11 @@ permissions:
 env:
   DOCS_UV_PROJECT: tools/docs
 
-# One deployment at a time; a newer push waits for the running one instead of cancelling it.
+# One run per workflow and ref. A newer push cancels a running pull request build. A deployment in
+# progress is not cancelled by this policy, but a pending run can be replaced by a newer one.
 concurrency:
-  group: pages-${{ github.ref }}
-  cancel-in-progress: false
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   build:

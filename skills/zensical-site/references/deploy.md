@@ -13,7 +13,12 @@ shipped workflow builds every pull request with `--strict` and deploys the defau
   so Zensical comes from the committed `uv.lock` ([config.md](config.md) covers the project);
 - uploads `site/` and deploys it with GitHub's Pages actions, in a separate job that alone has
   `pages: write` and `id-token: write`;
-- pins every action to a full commit SHA, with the tag in a comment.
+- pins every action to a full commit SHA, with the tag in a comment;
+- runs in one concurrency group per workflow and ref, with `cancel-in-progress` only for pull
+  requests: a newer push to a pull request cancels its running build, while on `main` a running
+  deployment is not cancelled by this policy. GitHub keeps at most one pending run per group, so
+  a run waiting behind a deployment can be replaced by a newer one ("Control the concurrency of
+  workflows and jobs" in GitHub's Actions docs).
 
 Before you copy it, check against the repository:
 
