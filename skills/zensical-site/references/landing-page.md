@@ -40,7 +40,7 @@ toggle stay the theme's. Every rule in `home.css` is scoped to the homepage wrap
 | A command-line tool | `landing-examples/cli` | A terminal session (`console` block) | Tabs: one per package manager |
 | A desktop app (GTK, Flatpak) | `landing-examples/gtk-app` | A light and a dark screenshot | One `flatpak install` block; Flathub as the primary button |
 | A library | `landing-examples/library` | A short code example | Tabs or one block |
-| A service | `landing-examples/cli` | The compose file, included with `--8<--` | One block |
+| A service | `landing-examples/cli` | The compose file, or an excerpt of it through a snippet section | One block |
 
 Each example is a complete site that builds with `--strict` (`tests/test_landing_build.py` in
 the toolkit builds all three).
@@ -62,9 +62,10 @@ gate applies):
   secondary (GitHub, the guide or the API reference). Each `link` is a page path relative to the
   site root (`getting-started/`) or a full URL.
 - **Showcase**: real output. A terminal session is copied from a real run, a screenshot is of
-  the real app, a code example runs against the current API. Never draw a mock-up. When there is
-  nothing short enough to show (a service whose compose file is long), drop the showcase and its
-  wrapper: on wide screens the hero and the install block are then centred above the cards.
+  the real app, a code example runs against the current API. Never draw a mock-up. A long file (a
+  service's compose file) is shown as an excerpt through a snippet section (below). When there
+  is nothing short enough to show, drop the showcase and its wrapper: on wide screens the hero
+  and the install block are then centred above the cards.
 - **Install**: the commands from the project's own install docs, at most four tabs. A service
   pulls its compose file in with `--8<-- "compose.yaml"` instead of copying it.
 - **Features**: four cards, 15 to 25 words each, each one a capability the code has. Icons are
@@ -73,6 +74,37 @@ gate applies):
 Keep the `<div class="rdt-showcase" markdown>` and `<div class="rdt-install" markdown>`
 wrappers: the layout places the showcase beside the hero on wide screens by these classes. A blank
 line after the opening tag and before the closing one is required.
+
+### A long file: show a section of it
+
+A snippet section includes part of a repository file, so the excerpt stays the file's own text.
+Mark the part in the file with two comments:
+
+```yaml
+# --8<-- [start:service]
+services:
+  app:
+    image: ghcr.io/<owner>/<repo>:<tag>
+    ports: ["8080:8080"]
+# --8<-- [end:service]
+volumes:
+  data: {}
+```
+
+and include the section by name in the showcase:
+
+````markdown
+```yaml
+--8<-- "compose.yaml:service"
+```
+````
+
+The marker lines do not appear on the page. With the template's `check_paths = true`, a section
+name the file does not have fails the build; a missing end marker does not: the excerpt then runs
+to the end of the file (checked on Zensical 0.1.3 with pymdown-extensions 13.1.2). Formatters and
+linters see the markers as ordinary comments and can move or delete them. Put the end marker
+before the next top-level key, and after formatting the file rebuild with `--strict` and look at
+the excerpt on the built page.
 
 ## Step 4: Set the brand colour
 

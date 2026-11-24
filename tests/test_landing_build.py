@@ -169,3 +169,56 @@ def test_the_template_builds_with_a_redirect(tmp_path: Path) -> None:
     assert '"guide/new-page/#old":"guide/new-page/#install"' in (site / "redirect.json").read_text(encoding="utf-8").replace(" ", "")
     home = (site / "index.html").read_text(encoding="utf-8")
     assert 'class="admonition note"' in home
+
+
+COMPOSE = """# --8<-- [start:service]
+services:
+  app:
+    image: example/demo:1.0
+# --8<-- [end:service]
+volumes:
+  data: {}
+"""
+
+
+def build_with_snippet(root: Path, compose: str, section: str) -> subprocess.CompletedProcess[str]:
+    """A site from the filled template whose homepage includes a section of compose.yaml."""
+    zensical = shutil.which("zensical")
+    require_or_skip(zensical is not None, "zensical", "DOCSTOOL_REQUIRE_ZENSICAL")
+    assert zensical is not None
+    root.mkdir()
+    (root / "zensical.toml").write_text(filled_template(), encoding="utf-8")
+    shutil.copytree(ZENSICAL_SITE / "assets" / "overrides", root / "overrides")
+    (root / "docs" / "stylesheets").mkdir(parents=True)
+    for css in ("home.css", "brand.css"):
+        shutil.copy2(ZENSICAL_SITE / "assets" / "stylesheets" / css, root / "docs" / "stylesheets" / css)
+    (root / "compose.yaml").write_text(compose, encoding="utf-8")
+    (root / "docs" / "index.md").write_text(f'# Demo\n\n```yaml\n--8<-- "compose.yaml:{section}"\n```\n', encoding="utf-8")
+    return subprocess.run([zensical, "build", "--strict", "--clean"], cwd=root, capture_output=True, text=True, check=False)
+
+
+@pytest.mark.zensical
+def test_a_snippet_section_shows_only_its_part_of_the_file(tmp_path: Path) -> None:
+    # landing-page.md, Step 3: a long compose file is shown through a snippet section.
+    result = build_with_snippet(tmp_path / "ok", COMPOSE, "service")
+    assert result.returncode == 0, result.stdout + result.stderr
+    home = (tmp_path / "ok" / "site" / "index.html").read_text(encoding="utf-8")
+    assert "example/demo:1.0" in home
+    assert "volumes" not in home
+    assert "[start:service]" not in home and "[end:service]" not in home
+
+
+@pytest.mark.zensical
+def test_a_missing_snippet_section_fails_the_strict_build(tmp_path: Path) -> None:
+    result = build_with_snippet(tmp_path / "missing", COMPOSE, "web")
+    assert result.returncode != 0
+    assert "could not be located" in result.stdout + result.stderr
+
+
+@pytest.mark.zensical
+def test_a_lost_end_marker_is_not_caught_by_the_build(tmp_path: Path) -> None:
+    # Why landing-page.md says to look at the excerpt after formatting: the build still passes
+    # and the excerpt runs to the end of the file.
+    result = build_with_snippet(tmp_path / "no-end", COMPOSE.replace("# --8<-- [end:service]\n", ""), "service")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "volumes" in (tmp_path / "no-end" / "site" / "index.html").read_text(encoding="utf-8")
