@@ -100,9 +100,25 @@ hidden, the tabs, search and palette toggle present, and no hero on any other pa
 ## Step 6: The manual review
 
 The toolkit's automated tests cover contrast, keyboard order, reduced motion, rendering without
-JavaScript and phone width for its own examples; a project's page still needs a person. Take
-screenshots at 1440, 768 and 390 pixels wide, in the light and the dark scheme, and ask the user
-to review them for:
+JavaScript and phone width for its own examples; a project's page still needs a person. Take the
+screenshots with the bundled script, from the Step 5 build:
+
+```sh
+uv run --no-project --with playwright==1.65.2 \
+  python3 -I <skill-dir>/scripts/screenshots.py <scratch>/site <scratch>/shots --prefix /<repo>/
+```
+
+`--prefix` is the path of `site_url` (`/` for a site at the root of its domain). The script
+serves the build on 127.0.0.1 and writes six full-page PNGs into `<scratch>/shots`:
+`home-<scheme>-<width>.png` at 1440, 768 and 390 pixels, in the light and the dark scheme. It
+refuses an output directory inside the build, which would break the `site-build` stamp. It needs
+Playwright's Chromium once (`uv run --no-project --with playwright==1.65.2 playwright install
+chromium`), or `--browser <path>` to a local Chrome or Chromium. The browser is told to load
+nothing but the served site (no fonts or scripts from other origins, no service workers); this is
+not a network sandbox. Exit 1 means the page is wider than the window at a width and scheme it
+names: fix that first. Exit 3 means the browser failed (Chromium not installed, a wrong
+`--browser`, a page that timed out), not the page; exit 2 is a wrong argument or a homepage that
+did not load under `--prefix`. Then ask the user to review the six images for:
 
 - the layout at each width: nothing cut off, the showcase beside the hero only on wide screens;
 - both schemes: the accent readable, the screenshots or logo matching the scheme;

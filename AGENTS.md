@@ -36,7 +36,10 @@ breaks a reference.
    runs only read-only git commands against the repository (`site-build` may create a git
    repository inside its own temporary staging directory, borrowing the objects, for plugins
    that read history), and writes only the paths its command documents. An input it cannot
-   analyse is reported as incomplete coverage (exit 3), never as clean.
+   analyse is reported as incomplete coverage (exit 3), never as clean. These rules are
+   docstool's: `skills/zensical-site/scripts/screenshots.py` needs Playwright and writes only its
+   output directory. Its browser is told to load nothing but the site it serves on 127.0.0.1; this
+   is not a network sandbox.
 3. **The copies of docstool.py never drift.** Edit `skills/repo-docs/scripts/docstool.py`, then run
    `make sync-vendored`. The `check-vendored` hook and `tests/test_vendored.py` fail on any
    difference. The same holds for `docs/stylesheets/home.css`, the site's copy of the shipped
@@ -56,6 +59,7 @@ breaks a reference.
 | `skills/*/SKILL.md` | Skill entry points (YAML frontmatter + Markdown). |
 | `skills/*/references/*.md` | Topic references loaded on demand. |
 | `skills/repo-docs/scripts/docstool.py` | The canonical checker; copied into the other skills. |
+| `skills/zensical-site/scripts/screenshots.py` | The landing page's review screenshots (Playwright); not vendored. |
 | `scripts/sync-vendored.py` | Writes (`make sync-vendored`) and checks (`--check`) the copies. |
 | `scripts/sync_pins.py` | `make sync-pins`: copies the `requirements-dev.txt` pins into `.pre-commit-config.yaml`; `tests/test_pins.py` fails on drift. |
 | `tests/` | pytest suite: docstool, the vendored copies, the skill lint, the release bump. |

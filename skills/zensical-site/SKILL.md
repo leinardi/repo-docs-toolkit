@@ -100,7 +100,8 @@ the repo-docs skill's restructure mode; this skill takes over once the content i
    `zensical.mk` in uv mode.
 6. `site-audit`, `check` and `contrast` clean; `site-build` passes.
 7. The Pages workflow ([deploy.md](references/deploy.md)); the user sets the Pages source (Z2).
-8. Screenshots at 1440, 768 and 390 pixels, light and dark, reviewed by the user.
+8. `scripts/screenshots.py` at 1440, 768 and 390 pixels, light and dark, reviewed by the user
+   ([landing-page.md](references/landing-page.md), Step 6).
 
 ## Checklist: migrate
 
@@ -120,7 +121,8 @@ the repo-docs skill's restructure mode; this skill takes over once the content i
 2. Copy `home.html`, `home.css` and `brand.css` as shipped.
 3. Write `docs/index.md` from the example, every claim from the repository.
 4. Brand colour in `brand.css`; `contrast` passes for both schemes.
-5. Build, `check`, and the manual review at three widths in both schemes.
+5. Build, `check`, then `scripts/screenshots.py` and the manual review at three widths in both
+   schemes.
 
 ## Stop and ask
 
