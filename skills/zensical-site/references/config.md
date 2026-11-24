@@ -74,6 +74,26 @@ Zensical also skips dotfiles, dot-directories and a top-level `templates/` direc
   one grey fill) reads on both schemes; copy it into `docs/assets/`, since the site cannot serve
   files outside `docs/`. The full-colour icon belongs in the landing hero (`home.logo`).
   Checked on 0.1.3: the build writes `<link rel="icon">` and the header `<img>` from them.
+- `favicon` writes only `<link rel="icon">`. For an apple-touch icon, a web manifest or
+  `theme-color`, add `overrides/main.html` (in the `custom_dir` the landing page already needs)
+  that extends `base.html` and fills only the `extrahead` block:
+
+  ```jinja
+  {% extends "base.html" %}
+  {% block extrahead %}
+    <link rel="apple-touch-icon" href="{{ 'assets/apple-touch-icon.png' | url }}">
+    <link rel="manifest" href="{{ 'site.webmanifest' | url }}">
+    <meta name="theme-color" content="#0f766e" media="(prefers-color-scheme: light)">
+    <meta name="theme-color" content="#2dd4bf" media="(prefers-color-scheme: dark)">
+  {% endblock %}
+  ```
+
+  The paths are relative to `docs/`, and the files live there. The `url` filter makes each one
+  relative to the page, so it works on deep pages (`../../assets/...`); the 404 page gets the
+  path of `site_url` instead. `home.html` extends `main.html`, so the homepage gets the tags
+  too. Use the brand colours from `brand.css` for `theme-color`. Nothing else goes in this file:
+  every other block stays the theme's. Checked on 0.1.3, where the theme's own `main.html` only
+  extends `base.html`.
 - Fonts load from Google Fonts by default (the built page links `fonts.googleapis.com`).
   `font = false` under `[project.theme]` uses the reader's system fonts instead; offer it when
   the project cares about third-party requests.

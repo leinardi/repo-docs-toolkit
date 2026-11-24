@@ -60,7 +60,8 @@ result they qualify is "partially verified", whatever the exit code.
    and features that do nothing. Every change ends with `site-audit` and `check` as well.
 4. **Keep the native UI.** Header, search, navigation tabs, palette toggle and footer stay the
    theme's. Customise through config, `extra_css` and the landing page, not by replacing
-   partials.
+   partials. The one other template allowed is an `overrides/main.html` that fills only
+   `extrahead` (icons, manifest, `theme-color`; [config.md](references/config.md)).
 5. **The landing page is configured, never edited.** `home.html` and `home.css` are copied as
    shipped; a project sets front matter and one brand colour
    ([landing-page.md](references/landing-page.md)).
