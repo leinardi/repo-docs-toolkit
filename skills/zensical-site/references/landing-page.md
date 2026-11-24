@@ -62,7 +62,9 @@ gate applies):
   secondary (GitHub, the guide or the API reference). Each `link` is a page path relative to the
   site root (`getting-started/`) or a full URL.
 - **Showcase**: real output. A terminal session is copied from a real run, a screenshot is of
-  the real app, a code example runs against the current API. Never draw a mock-up.
+  the real app, a code example runs against the current API. Never draw a mock-up. When there is
+  nothing short enough to show (a service whose compose file is long), drop the showcase and its
+  wrapper: on wide screens the hero and the install block are then centred above the cards.
 - **Install**: the commands from the project's own install docs, at most four tabs. A service
   pulls its compose file in with `--8<-- "compose.yaml"` instead of copying it.
 - **Features**: four cards, 15 to 25 words each, each one a capability the code has. Icons are
