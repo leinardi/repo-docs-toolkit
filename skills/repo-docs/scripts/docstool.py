@@ -5940,7 +5940,16 @@ def decisions_digest(data: dict[str, Any]) -> str:
 
 def _fsync_write(path: Path, data: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "wb") as handle:
+    # never through a symlink: a planted plan.toml.tmp or blocks.json.tmp link must not redirect the
+    # write outside the repository (O_NOFOLLOW refuses it with ELOOP; the check covers its absence)
+    if path.is_symlink():
+        raise UsageError(f"refusing to write through a symlink: {path}")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+    try:
+        descriptor = os.open(path, flags, 0o666)
+    except OSError as error:
+        raise UsageError(f"refusing to write {path}: {error.strerror}") from error
+    with os.fdopen(descriptor, "wb") as handle:
         handle.write(data)
         handle.flush()
         os.fsync(handle.fileno())

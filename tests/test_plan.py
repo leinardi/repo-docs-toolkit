@@ -1721,6 +1721,21 @@ def test_an_unrelated_removal_and_addition_are_not_a_rewording(tmp_path: Path) -
     assert [b["text"] for b in delta["added"]] == ["Firmware images live in the releases page."]
 
 
+@pytest.mark.parametrize("command", ["rebase", "approve"])
+def test_a_planted_temp_symlink_is_never_written_through(tmp_path: Path, command: str) -> None:
+    repo, _ = approved_upstream_plan(tmp_path)
+    outside = tmp_path / "outside.txt"
+    outside.write_text("precious\n", encoding="utf-8")
+    if command == "rebase":
+        (repo / ART / "blocks.json.tmp").symlink_to(outside)
+        code = docstool_code(repo, "plan", "rebase", "--onto", "origin/main", "--write")
+    else:
+        (repo / ART / "plan.toml.tmp").symlink_to(outside)
+        code = docstool_code(repo, "plan", "approve", "--by", "Owner")
+    assert code == 2
+    assert outside.read_text(encoding="utf-8") == "precious\n"
+
+
 def test_rebase_needs_onto_and_onto_needs_rebase(tmp_path: Path) -> None:
     repo, _ = approved_upstream_plan(tmp_path)
     assert docstool_code(repo, "plan", "rebase") == 2
